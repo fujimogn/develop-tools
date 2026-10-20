@@ -20,6 +20,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # island-secrets の test が書いた .env を実物の Bun に読ませる。
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
       - run: cargo test --locked
       - name: Release の一覧を workspace の binary target と照合
         run: |
@@ -35,10 +39,10 @@ jobs:
             printf '%s\n' "$missing" >&2
             exit 1
           fi
-      - run: TEST_SHELL=bash bash tests/resolve.sh
+      - run: TEST_SHELL="$(command -v bash)" bash tests/resolve.sh
       - run: sh tests/release-tag.sh
       - run: sh tests/release-notes.sh
       - run: sh tests/release-contracts.sh
       - name: dash で resolver を検査
         if: runner.os == 'Linux'
-        run: TEST_SHELL=dash dash tests/resolve.sh
+        run: TEST_SHELL="$(command -v dash)" dash tests/resolve.sh

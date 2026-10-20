@@ -1,8 +1,8 @@
 //! spec「`$` を含む値」: 核が書いた `.env` を **Bun の dotenv（実物）** で読み戻すと元の値になる。
 //!
 //! Rust 側の parser は Bun の規則を写したもので、写し間違いは Rust の往復テストでは見つからない。
-//! ここは実物の Bun に読ませる。`bun` は `bin/verify` の前提（CI も setup-bun 済み）なので、
-//! 見つからなければ skip せずに落とす。
+//! ここは実物の Bun に読ませる。skip すると Bun が無い環境で緑になり写し間違いを見逃すので、
+//! `bun` が見つからなければ落とす。CI は `.bun-version` の版を setup-bun で入れる。
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -71,7 +71,7 @@ fn bun_reads_back_every_value_the_core_writes() {
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", dir.path())
         .output()
-        .expect("bun が見つかりません（bin/verify と同じく with-dev-env から実行してください）");
+        .expect("bun が見つかりません（この test は Bun の dotenv で読み戻すので、.bun-version の版の bun を PATH に置いてください）");
     assert!(
         output.status.success(),
         "{}",

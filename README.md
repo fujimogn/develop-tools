@@ -80,14 +80,14 @@ The Release version follows [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Development
 
-Each binary belongs to one crate under [`crates/`](./crates/), and every crate is a member of the workspace in this directory. Run the tests from this directory:
+Each binary belongs to one crate under [`crates/`](./crates/), and every crate is a member of the workspace in this directory. Run the tests from this directory. `cargo test` needs [Bun](https://bun.sh) (the version in [`.bun-version`](./.bun-version)) on `PATH`: one test reads a generated `.env` back with Bun's own dotenv parser and fails when `bun` is missing.
 
 ```sh
 cargo test --locked
 sh tests/release-tag.sh
 sh tests/release-notes.sh
 sh tests/release-contracts.sh
-TEST_SHELL=bash bash tests/resolve.sh
+TEST_SHELL="$(command -v bash)" bash tests/resolve.sh
 ```
 
 ## License

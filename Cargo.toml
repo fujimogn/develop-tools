@@ -9,7 +9,7 @@ members = ["crates/develop-tools-core", "crates/develop-release", "crates/develo
 # （tools/develop-health/tests/toolchain_contracts.rs が照合する）。tools の build では feature が
 # 統合されるので、食い違っても tools 側では気付けず、公開の build でだけ挙動が変わる。
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"

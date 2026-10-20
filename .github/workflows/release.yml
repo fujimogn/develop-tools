@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: main を取得して tag と版を照合
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          sh scripts/check-release-tag.sh "$RELEASE_TAG"
+          # Release の本文になる CHANGELOG の節が無い tag は build の前に止める。
+          sh scripts/release-notes.sh "$RELEASE_TAG" > /dev/null
+
+  build:
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo test --locked
+      - run: TEST_SHELL=bash bash tests/resolve.sh
+      - run: cargo build --release --locked --workspace --bins
+      - name: resolver 用 asset を作る
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "$RELEASE_TARGET"
+          # 作成と中身の照合は同じ配列。一覧の正しさは test job が cargo metadata と見る。
+          jq -e '.binaries | type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9_-]+$")) and (length == (unique | length))' config/release-binaries.json > /dev/null
+          binaries=()
+          while IFS= read -r binary; do
+            binaries+=("$binary")
+          done < <(jq -r '.binaries[]' config/release-binaries.json)
+          test "${#binaries[@]}" -gt 0
+          asset="develop-tools-${RELEASE_TAG}-${RELEASE_TARGET}.tar.gz"
+          COPYFILE_DISABLE=1 tar -czf "$asset" -C target/release "${binaries[@]}"
+          expected=$(printf '%s\n' "${binaries[@]}" | sort)
+          actual=$(tar -tzf "$asset" | sort)
+          test "$actual" = "$expected"
+          tar -tvzf "$asset" | awk '{ if ($1 !~ /^-/) exit 1; count++ } END { if (count == 0) exit 1 }'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            develop-tools-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          merge-multiple: true
+      - name: SHA256SUMS を作って Release に載せる
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          assets=(develop-tools-"$RELEASE_TAG"-*.tar.gz)
+          expected=$(awk '/^[[:space:]]+matrix:/ { in_matrix = 1; next } in_matrix && /^[[:space:]]+runs-on:/ { exit } in_matrix && /^[[:space:]]+target:/ { count++ } END { print count + 0 }' .github/workflows/release.yml)
+          test "$expected" -gt 0
+          test "${#assets[@]}" -eq "$expected"
+          sha256sum "${assets[@]}" > SHA256SUMS
+          sh scripts/release-notes.sh "$RELEASE_TAG" > release-notes.md
+          gh release create "$RELEASE_TAG" "${assets[@]}" SHA256SUMS --verify-tag --title "$RELEASE_TAG" --notes-file release-notes.md

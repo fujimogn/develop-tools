@@ -1,0 +1,11 @@
+{
+  "binaries": [
+    "develop-docs-check",
+    "check-staged-docs",
+    "check-staged-adr",
+    "develop-secrets",
+    "release",
+    "check-release-version",
+    "archive-changelog"
+  ]
+}

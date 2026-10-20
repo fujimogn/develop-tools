@@ -1,0 +1,17 @@
+[package]
+name = "develop-adr"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "ADR の正本形式の判定。develop-sync (migrate-legacy-adrs) と develop-health (check-project-integrity) が共有する"
+license.workspace = true
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+sha2 = { workspace = true }
+
+[lints]
+workspace = true

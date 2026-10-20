@@ -1,0 +1,37 @@
+[package]
+name = "develop-staged"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "staged された TODO.md / CHANGELOG.md / ADR の pre-commit 検査と CHANGELOG の退避"
+license.workspace = true
+publish = false
+
+[dependencies]
+develop-adr = { path = "../develop-adr" }
+# 公開する最小部分だけに依存する。名前は移す前の import をそのまま通すために残す。
+develop-core = { package = "develop-tools-core", path = "../develop-tools-core" }
+island-docs = { path = "../island-docs" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "archive-changelog"
+path = "src/bin/archive-changelog.rs"
+test = false
+
+[[bin]]
+name = "check-staged-adr"
+path = "src/bin/check-staged-adr.rs"
+test = false
+
+[[bin]]
+name = "check-staged-docs"
+path = "src/bin/check-staged-docs.rs"
+test = false

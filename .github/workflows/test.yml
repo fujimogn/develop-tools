@@ -1,0 +1,44 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo test --locked
+      - name: Release の一覧を workspace の binary target と照合
+        run: |
+          set -euo pipefail
+          jq -e '.binaries | type == "array" and length > 0 and all(.[]; type == "string" and test("^[A-Za-z0-9_-]+$")) and (length == (unique | length))' config/release-binaries.json > /dev/null
+          metadata=$(cargo metadata --format-version 1 --no-deps --locked)
+          actual=$(jq -r '. as $metadata | .packages[] | select(.id as $id | $metadata.workspace_members | index($id)) | .targets[] | select(.kind | index("bin")) | .name' <<< "$metadata" | sort)
+          expected=$(jq -r '.binaries[]' config/release-binaries.json | sort)
+          # 一覧 ⊆ workspace の bin。crate を移すと増える release-notes 等は一覧に無くても通す。
+          missing=$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual"))
+          if [ -n "$missing" ]; then
+            echo "一覧にあって workspace の bin に無い名前:" >&2
+            printf '%s\n' "$missing" >&2
+            exit 1
+          fi
+      - run: TEST_SHELL=bash bash tests/resolve.sh
+      - run: sh tests/release-tag.sh
+      - run: sh tests/release-notes.sh
+      - run: sh tests/release-contracts.sh
+      - name: dash で resolver を検査
+        if: runner.os == 'Linux'
+        run: TEST_SHELL=dash dash tests/resolve.sh

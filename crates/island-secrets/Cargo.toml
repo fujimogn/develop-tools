@@ -1,0 +1,29 @@
+[package]
+name = "island-secrets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "島共通の secret 注入の核 (op read / service account の事前確認 / 0600 の atomic writer / .env の merge・quote・parser)"
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "develop-secrets"
+path = "src/main.rs"
+
+[lib]
+doctest = false
+
+[dependencies]
+develop-tools-core = { path = "../develop-tools-core" }
+# 一時 file 名の乱数。同じ directory に他人が先回りで link を置けないよう、推測できない名前にする。
+getrandom = { workspace = true }
+# `O_NOFOLLOW`（Linux と macOS で値が違う）。
+libc = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

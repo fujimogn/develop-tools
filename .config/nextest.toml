@@ -1,0 +1,10 @@
+# test runner（cargo-nextest）の設定。CI は NEXTEST_PROFILE=ci を渡すので、ci profile が無いと
+# nextest が profile を解決できずに落ちる。値は開発元の tools/ の設定と同じにする（開発元の test が照合する）。
+
+[profile.default]
+fail-fast = true
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[profile.ci]
+# 1 回の run で失敗をすべて並べる。
+fail-fast = false

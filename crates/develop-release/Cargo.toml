@@ -1,0 +1,42 @@
+[package]
+name = "develop-release"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "repo の版数を 1 箇所で動かし、tag との一致を push 前に守る"
+license.workspace = true
+publish = false
+
+# 版を上げる側と、上がったことを確かめる側を分ける。後者は lefthook から走るので
+# 引数を取らず、前者は人が明示的に叩く。
+[[bin]]
+name = "release"
+path = "src/bin/release.rs"
+test = false
+
+[[bin]]
+name = "release-tarball"
+path = "src/bin/release-tarball.rs"
+test = false
+
+[[bin]]
+name = "check-release-version"
+path = "src/bin/check-release-version.rs"
+test = false
+
+[[bin]]
+name = "release-notes"
+path = "src/bin/release-notes.rs"
+test = false
+
+[dependencies]
+develop-tools-core = { path = "../develop-tools-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

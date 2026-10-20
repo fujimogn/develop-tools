@@ -1,0 +1,19 @@
+[package]
+name = "develop-tools-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "develop tools が共有する最小の土台 (git 起動の衛生 / 管理区画 / 版の宣言 / CLI help)"
+license.workspace = true
+publish = false
+
+[dependencies]
+# managed_block が区画の本文を marker の hash と照合する
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

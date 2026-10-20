@@ -1,0 +1,38 @@
+# 公開する CLI の workspace。版の正本はここ（design §11.1）。tools/ の crate は path でここの crate に依存する。
+# 1 つの workspace にまとめないのは、member の下に [workspace] があると cargo が拒むため。
+[workspace]
+resolver = "2"
+# glob にしない（`version_files.rs` が拒み、版の bump が使えなくなる）。
+members = ["crates/develop-tools-core", "crates/develop-release", "crates/develop-adr", "crates/island-docs", "crates/island-secrets", "crates/develop-staged"]
+
+# [workspace.dependencies]・[workspace.lints]・[profile.*] は tools/Cargo.toml と同じ値にする
+# （tools/develop-health/tests/toolchain_contracts.rs が照合する）。tools の build では feature が
+# 統合されるので、食い違っても tools 側では気付けず、公開の build でだけ挙動が変わる。
+[workspace.package]
+version = "0.6.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+getrandom = "0.4"
+libc = "0.2.190"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.11"
+toml = "1"
+# `preserve_order` は必須。`--json` の出力の順序は読む側から見える契約。
+serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[profile.release]
+strip = true
+
+[profile.dev]
+debug = "line-tables-only"

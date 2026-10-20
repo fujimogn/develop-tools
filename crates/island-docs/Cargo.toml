@@ -1,0 +1,28 @@
+[package]
+name = "island-docs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "島共通の docs 検査 (link / anchor / 容量上限 / 入口・索引 / ADR / OpenSpec / TODO・CHANGELOG / 絵文字 / 退役語)。定数は島の 1 か所だけから読む"
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "develop-docs-check"
+path = "src/main.rs"
+
+[lib]
+doctest = false
+
+[dependencies]
+# 公開する最小部分だけに依存する。名前は移す前の import をそのまま通すために残す。
+develop-core = { package = "develop-tools-core", path = "../develop-tools-core" }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

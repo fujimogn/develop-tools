@@ -34,6 +34,13 @@ enum ServerHook {
     RewriteDevelop,
 }
 
+/// release tag の作り方。`release` は宣言があると注釈付き tag に本文を入れる。
+#[derive(Clone, Copy)]
+enum TagKind {
+    Lightweight,
+    Annotated,
+}
+
 fn git_wrapper(git_bin: &Path) -> String {
     format!(
         "#!/bin/sh\nif [ \"${{1-}}\" = push ]; then\n  {{\n    printf 'git'\n    for arg in \"$@\"; do\n      printf ' %s' \"$arg\"\n    done\n    printf '\\n'\n  }} >> \"$RELEASE_PUSH_TEST_LOG\"\nfi\nexec '{git}' \"$@\"\n",
@@ -174,6 +181,15 @@ esac
 }
 
 fn setup(integration: &str, workflow: Workflow, server_hook: ServerHook) -> Repo {
+    setup_tagged(integration, workflow, server_hook, TagKind::Lightweight)
+}
+
+fn setup_tagged(
+    integration: &str,
+    workflow: Workflow,
+    server_hook: ServerHook,
+    tag_kind: TagKind,
+) -> Repo {
     let _lock = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let temp = tempfile::tempdir().unwrap();
     let bare = temp.path().join("bare.git");
@@ -227,7 +243,10 @@ fn setup(integration: &str, workflow: Workflow, server_hook: ServerHook) -> Repo
     if integration != "main" {
         git(&root, &["branch", "-f", "main", "HEAD"]);
     }
-    git(&root, &["tag", "v0.1.1"]);
+    match tag_kind {
+        TagKind::Lightweight => git(&root, &["tag", "v0.1.1"]),
+        TagKind::Annotated => git(&root, &["tag", "-a", "-m", "本文", "v0.1.1"]),
+    };
     let release_sha = git(&root, &["rev-parse", "HEAD"]);
     assert_ne!(release_sha, previous_sha);
 
@@ -374,6 +393,40 @@ fn release_push_checks_each_remote_sha_and_pushes_the_tag_only_after_ci() {
     );
     assert_eq!(remote_sha(&repo.root, "refs/heads/main"), repo.release_sha);
     assert_eq!(remote_sha(&repo.root, "refs/tags/v0.1.1"), repo.release_sha);
+}
+
+#[test]
+fn release_push_finds_an_annotated_tag_by_its_commit_and_checks_the_tag_object() {
+    let repo = setup_tagged(
+        "develop",
+        Workflow::Tracked,
+        ServerHook::None,
+        TagKind::Annotated,
+    );
+    let tag_object = git(&repo.root, &["rev-parse", "refs/tags/v0.1.1"]);
+    assert_ne!(tag_object, repo.release_sha);
+    let output = run_push(&repo, "success", true, &[]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(
+        pushed_refs(&repo),
+        vec![
+            "refs/heads/develop".to_owned(),
+            "refs/heads/main".to_owned(),
+            "refs/tags/v0.1.1".to_owned(),
+        ]
+    );
+    let gh_line = log_text(&repo)
+        .lines()
+        .find(|line| line.starts_with("gh run list"))
+        .unwrap()
+        .to_owned();
+    assert!(gh_line.contains(&repo.release_sha), "{gh_line}");
+    assert_eq!(remote_sha(&repo.root, "refs/tags/v0.1.1"), tag_object);
+    assert_eq!(
+        remote_sha(&repo.root, "refs/tags/v0.1.1^{}"),
+        repo.release_sha
+    );
+    assert!(text(&output.stdout).contains("tag v0.1.1 を push し、遠隔の SHA が一致しました"));
 }
 
 #[test]

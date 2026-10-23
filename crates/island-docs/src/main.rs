@@ -94,12 +94,24 @@ fn main() -> ExitCode {
         }
         Ok(Parsed::CheckLocalVersion) => {
             if let Ok(cwd) = std::env::current_dir() {
-                if let Some(warning) = develop_core::freshness::pinned_version_warning(
-                    // packages/cli へ移す crate なので、配布先でも固定の manifest 名を使う。
-                    &cwd.join(".develop-tools.json"),
-                    env!("CARGO_PKG_VERSION"),
-                ) {
-                    eprintln!("{warning}");
+                // 版の案内は hook を止めない（読めないときも黙る）。置き場が 2 つあるときだけは、
+                // 探索する他の読み手と同じく止める。
+                match develop_core::develop_tools_manifest::locate(&cwd) {
+                    Ok(Some(manifest)) => {
+                        if let Some(warning) = develop_core::freshness::pinned_version_warning(
+                            &cwd.join(manifest),
+                            env!("CARGO_PKG_VERSION"),
+                        ) {
+                            eprintln!("{warning}");
+                        }
+                    }
+                    Err(error)
+                        if error.starts_with(develop_core::develop_tools_manifest::DUPLICATED) =>
+                    {
+                        eprintln!("{NAME}: {error}");
+                        return ExitCode::from(2);
+                    }
+                    Ok(None) | Err(_) => {}
                 }
             }
             return ExitCode::SUCCESS;

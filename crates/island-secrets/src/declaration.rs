@@ -29,6 +29,33 @@ pub struct Entry {
 /// 宣言に `project` が無いときの失敗の符号（横断監査と同じ語）。
 pub const MISSING_PROJECT: &str = "missing-project";
 
+/// 宣言の既定の置き場（repo root からの相対）。
+pub const DEFAULT_PATH: &str = ".config/develop-secrets.jsonc";
+
+/// 台帳に明示値の無い repo で探す宣言の置き場（強い順）。ルート直下と `config/` は移行の間だけ読む。
+const SEARCH_PATHS: [&str; 3] = [
+    DEFAULT_PATH,
+    ".develop-secrets.jsonc",
+    "config/develop-secrets.jsonc",
+];
+
+/// repo root で宣言の置き場を探す。無ければ `None`、2 つ以上あれば失敗にする。
+/// 核は探索せず `--declaration` の path だけを読む。探索は配布と検査の側が使う。
+pub fn find_in_repo(repo_root: &Path) -> Result<Option<&'static str>, String> {
+    let found: Vec<_> = SEARCH_PATHS
+        .into_iter()
+        .filter(|path| repo_root.join(path).is_file())
+        .collect();
+    match found.as_slice() {
+        [] => Ok(None),
+        [path] => Ok(Some(path)),
+        _ => Err(format!(
+            "宣言の置き場が 2 つ以上あります（{}）。1 つにしてください",
+            found.join("・")
+        )),
+    }
+}
+
 pub fn load(path: &Path, repo_root: Option<&Path>, home: &Path) -> Result<Declaration, String> {
     let repo_dir = path
         .parent()

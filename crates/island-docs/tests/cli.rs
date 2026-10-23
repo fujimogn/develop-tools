@@ -1474,6 +1474,47 @@ fn version_flag_prints_this_binary_version() {
     assert!(parse_version(&version)[0] < 100, "{version}");
 }
 
+/// 移した置き場の固定 file も読み、新旧の両方があれば版の案内ではなく置き場の重複として止める。
+#[test]
+fn check_local_version_reads_the_moved_pin_and_stops_on_both() {
+    let local = binary_version();
+    let parsed = parse_version(&local);
+    let newer_pin = format_version([parsed[0], parsed[1], parsed[2] + 1]);
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join(".config")).expect("config dir");
+    std::fs::write(
+        dir.path().join(".config/develop-tools.json"),
+        format!(r#"{{"version":"{newer_pin}"}}"#),
+    )
+    .expect("pin");
+    let out = run(dir.path(), &["--check-local-version"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains(&newer_pin), "{}", stderr(&out));
+
+    std::fs::write(dir.path().join(".develop-tools.json"), "{}").expect("legacy pin");
+    let out = run(dir.path(), &["--check-local-version"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("manifest_duplicated"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// 置き場を調べられない（`.config/` を読めない）だけなら、重複ではないので止めない。
+#[cfg(unix)]
+#[test]
+fn check_local_version_stays_silent_when_the_lookup_cannot_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = dir.path().join(".config");
+    std::fs::create_dir(&config).expect("config dir");
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let out = run(dir.path(), &["--check-local-version"]);
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o755)).expect("restore");
+    assert_silent_success(&out);
+}
+
 /// 古いときだけ警告し、同じ・新しい・版不明・固定 file 不在でも exit 0 のまま止める。
 #[test]
 fn check_local_version_warns_only_when_older_and_never_fails() {

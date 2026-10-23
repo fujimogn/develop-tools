@@ -6,6 +6,7 @@
     "develop-secrets",
     "release",
     "check-release-version",
-    "archive-changelog"
+    "archive-changelog",
+    "release-notes"
   ]
 }

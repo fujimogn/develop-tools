@@ -1,6 +1,15 @@
+use develop_release::release_notes::{
+    AiRuntime, BodySource, DeclaredNotes, NotesPlan, ReleaseBody, annotate_tag, extract_release,
+    prepare_notes, release_body,
+};
+use develop_tools_core::develop_tools_manifest::NotesSource;
+use island_llm::settings::Audience;
+use island_llm::transport::{ApiRequest, ApiResponse, FailureKind, Transport, TransportError};
+use std::cell::Cell;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -427,6 +436,42 @@ fn pushed_tag_whose_commit_declares_another_version_is_rejected() {
 }
 
 #[test]
+fn annotated_head_tag_is_checked_against_the_version_files_and_main() {
+    let dir = child_repo_fixture();
+    let root = dir.path();
+    git(root, &["tag", "-a", "-m", "本文", "v1.2.3"]);
+    let output = check_version(root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("OK (v1.2.3)"));
+
+    git(root, &["tag", "-d", "v1.2.3"]);
+    git(root, &["tag", "-a", "-m", "本文", "v1.2.4"]);
+    let output = check_version(root);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("v1.2.4") && stderr.contains("1.2.3"),
+        "{stderr}"
+    );
+
+    git(root, &["tag", "-d", "v1.2.4"]);
+    git(root, &["checkout", "-qb", "feature"]);
+    commit_version(root, "1.2.4");
+    git(root, &["tag", "-a", "-m", "本文", "v1.2.4"]);
+    let output = check_version(root);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("main に含まれていません"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn pushed_tag_outside_main_is_rejected() {
     let dir = child_repo_fixture();
     let root = dir.path();
@@ -777,6 +822,41 @@ fn release_fast_forwards_main_and_tags_the_develop_commit_without_push() {
     );
     assert!(git(remote.path(), &["tag", "-l"]).is_empty());
     assert!(check_version(root).status.success());
+}
+
+/// tag の ref の更新だけを拒む hook を置き、main を進めた後の tag 作成を失敗させる。
+fn reject_tag_refs(root: &Path) {
+    let hook = root.join(".git/hooks/reference-transaction");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\n[ \"$1\" = prepared ] || exit 0\nwhile read -r old new ref; do\n  case \"$ref\" in refs/tags/*) echo 'tag は拒否' >&2; exit 1 ;; esac\ndone\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn release_reports_how_to_recreate_the_tag_when_main_advanced_without_it() {
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["switch", "-q", "develop"]);
+    let old_main = git(root, &["rev-parse", "main"]);
+    reject_tag_refs(root);
+
+    let output = release(root);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    let released = git(root, &["rev-parse", "develop"]);
+    assert_ne!(released, old_main);
+    assert_eq!(git(root, &["rev-parse", "main"]), released, "{stderr}");
+    assert!(git(root, &["tag", "-l"]).is_empty());
+    assert!(stderr.contains(&old_main), "{stderr}");
+    assert!(
+        stderr.contains(&format!("git tag v0.1.1 {released}")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("release push"), "{stderr}");
 }
 
 #[test]
@@ -1543,6 +1623,32 @@ fn assert_released_v124(root: &Path, output: &Output) {
 
 const UNRELEASED_CHANGELOG: &str = "# CHANGELOG\n\n## 2026-10\n\n- **刻印を足した（2026-10-20、未リリース）**: 本文。\n- **前の版で出した（2026-10-19、v1.2.3 で prod 反映）**: 本文。\n";
 
+const ASUNARO_CHANGELOG_FIXTURE: &str = "# CHANGELOG\n\n## 2026-10\n\n- **session の 1 文化の後の接続と `idle in transaction` を dev で観測した（2026-10-21、dev のみ、未リリース）**: 同時に動く backend の最大は回 A の職員一覧で 1（前回 14）、回 B 全体で 16・13。\n- **REST の冪等の `legacyRequestHash` 分岐を消した（2026-10-21、未リリース）**: 藤井決定で TTL 24 時間を待たずに切替。\n- **TI03 取込で、終了日のある `terminated` 在籍を対象月から外さないようにした（2026-10-21、v0.1.150 で prod 反映）**: 終了日当日まで在籍中とする。\n- **日付の無い項目（未リリース）**: 本文。\n";
+
+#[test]
+fn declared_repo_stamps_asunaro_and_undated_unreleased_titles() {
+    let dir = changelog_fixture(true, Some(ASUNARO_CHANGELOG_FIXTURE));
+    let root = dir.path();
+
+    let output = release(root);
+    assert_released_v124(root, &output);
+    let expected = ASUNARO_CHANGELOG_FIXTURE
+        .replace(
+            "（2026-10-21、dev のみ、未リリース）",
+            "（2026-10-21、dev のみ、v1.2.4 で prod 反映）",
+        )
+        .replace(
+            "（2026-10-21、未リリース）",
+            "（2026-10-21、v1.2.4 で prod 反映）",
+        )
+        .replace("（未リリース）", "（v1.2.4 で prod 反映）");
+    assert_eq!(
+        std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+        expected
+    );
+    assert_eq!(released_files(root), ["CHANGELOG.md", "package.json"]);
+}
+
 #[test]
 fn declared_repo_stamps_dated_unreleased_titles_in_the_version_commit() {
     let dir = changelog_fixture(true, Some(UNRELEASED_CHANGELOG));
@@ -1582,37 +1688,50 @@ fn undeclared_repo_does_not_read_changelog_when_it_is_a_directory() {
 }
 
 #[test]
-fn nested_body_heading_and_undated_markers_are_not_stamped() {
+fn nested_body_heading_and_non_title_markers_are_not_stamped() {
     let untouched = [
         "## 2026-10（2026-10-20、未リリース）",
-        "- **日付の無い括弧（未リリース）**: 本文。",
         "  - **入れ子（2026-10-20、未リリース）**: 本文。",
         "未リリース（2026-10-20、未リリース）",
         "- **題の途中（2026-10-20、未リリース）だけ**: 本文。",
         "- **閉じない太字（2026-10-20、未リリース）",
+    ];
+    let stamped = [
+        "- **題（2026-10-20、未リリース）**: 本文の（2026-10-19、未リリース）は残す。",
         "- **日付でない括弧（段階 C、未リリース）**: 本文。",
         "- **日付で始まらない括弧（段階 C、2026-10-20、未リリース）**: 本文。",
+        "- **日付の無い括弧（未リリース）**: 本文。",
     ];
-    let stamped = "- **題（2026-10-20、未リリース）**: 本文の（2026-10-19、未リリース）は残す。";
-    let changelog = format!("# CHANGELOG\n\n{}\n{stamped}\n", untouched.join("\n"));
+    let changelog = format!(
+        "# CHANGELOG\n\n{}\n{}\n",
+        untouched.join("\n"),
+        stamped.join("\n")
+    );
     let dir = changelog_fixture(true, Some(&changelog));
     let root = dir.path();
 
     let output = release(root);
     assert_released_v124(root, &output);
     let written = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    let expected_stamped = [
+        "- **題（2026-10-20、v1.2.4 で prod 反映）**: 本文の（2026-10-19、未リリース）は残す。",
+        "- **日付でない括弧（段階 C、v1.2.4 で prod 反映）**: 本文。",
+        "- **日付で始まらない括弧（段階 C、2026-10-20、v1.2.4 で prod 反映）**: 本文。",
+        "- **日付の無い括弧（v1.2.4 で prod 反映）**: 本文。",
+    ];
     assert_eq!(
         written,
         format!(
-            "# CHANGELOG\n\n{}\n- **題（2026-10-20、v1.2.4 で prod 反映）**: 本文の（2026-10-19、未リリース）は残す。\n",
-            untouched.join("\n")
+            "# CHANGELOG\n\n{}\n{}\n",
+            untouched.join("\n"),
+            expected_stamped.join("\n")
         )
     );
 }
 
 #[test]
 fn declared_repo_without_unreleased_titles_releases_without_changelog() {
-    let changelog = "# CHANGELOG\n\n## 2026-10\n\n- **前の版で出した（2026-10-19、v1.2.3 で prod 反映）**: 本文。\n- **日付の無い括弧（未リリース）**: 本文。\n";
+    let changelog = "# CHANGELOG\n\n## 2026-10\n\n- **前の版で出した（2026-10-19、v1.2.3 で prod 反映）**: 本文。\n- **日付の無い既刻印（v1.2.3 で prod 反映）**: 本文。\n";
     let dir = changelog_fixture(true, Some(changelog));
     let root = dir.path();
 
@@ -1644,4 +1763,764 @@ fn declared_repo_without_changelog_refuses_before_writing() {
     assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
     assert_eq!(git(root, &["status", "--porcelain"]), "");
     assert!(git(root, &["tag", "--list"]).is_empty());
+}
+
+// ---- release.notes の宣言がある repo の注釈付き tag（design §4・§5） ----
+
+const NOTES_KEY_REF: &str = "op://test-vault/test-item/api-key";
+const NOTES_ITEM: &str =
+    "- **予定を一覧で選べるようにした（2026-10-20、未リリース）**: 利用者が予定を一覧から選べる。";
+
+/// 前 tag v1.2.3 の後に CHANGELOG の月別の項目を 1 つ足した repo。`notes` は `release.notes` の JSON。
+fn notes_fixture(notes: Option<&str>, item: Option<&str>) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("notes-repo");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        "{\n  \"name\": \"notes-repo\",\n  \"version\": \"1.2.3\"\n}\n",
+    )
+    .unwrap();
+    let notes = notes
+        .map(|notes| format!(",\n    \"notes\": {notes}"))
+        .unwrap_or_default();
+    std::fs::write(
+        root.join(".develop-tools.json"),
+        format!(
+            "{{\n  \"release\": {{\n    \"versionFiles\": [{{\"path\":\"package.json\",\"kind\":\"package-json\"}}]{notes}\n  }},\n  \"integrationBranch\": \"develop\"\n}}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(root.join("CHANGELOG.md"), "# CHANGELOG\n\n## 2026-10\n").unwrap();
+    let fixture = git_fixture(dir, root);
+    let root = fixture.path();
+    git(
+        root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:example/notes-repo.git",
+        ],
+    );
+    git(root, &["tag", "v1.2.3"]);
+    git(root, &["switch", "-q", "develop"]);
+    if let Some(item) = item {
+        std::fs::write(
+            root.join("CHANGELOG.md"),
+            format!("# CHANGELOG\n\n## 2026-10\n\n{item}\n"),
+        )
+        .unwrap();
+    } else {
+        std::fs::write(root.join("feature"), "feature\n").unwrap();
+    }
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "feature"]);
+    fixture
+}
+
+const AI_PRIVATE: &str = r#"{"mode":"ai","fallback":"changelog-additions","audience":"private"}"#;
+
+/// 呼ばれた回数を数え、決めた応答を返す。
+struct CountingTransport {
+    reply: Result<ApiResponse, TransportError>,
+    calls: Cell<usize>,
+}
+
+impl CountingTransport {
+    fn json(value: serde_json::Value) -> Self {
+        let text = value.to_string();
+        let body = serde_json::json!({
+            "content": [{"type": "text", "text": text}],
+            "usage": {"input_tokens": 10, "output_tokens": 3},
+        });
+        Self::with(Ok(ApiResponse {
+            status: 200,
+            request_id: Some("req_fixture".to_owned()),
+            body: body.to_string(),
+        }))
+    }
+
+    fn with(reply: Result<ApiResponse, TransportError>) -> Self {
+        Self {
+            reply,
+            calls: Cell::new(0),
+        }
+    }
+}
+
+impl Transport for CountingTransport {
+    fn send(&self, request: &ApiRequest<'_>) -> Result<ApiResponse, TransportError> {
+        self.calls.set(self.calls.get() + 1);
+        assert_eq!(request.api_key.expose(), "test-api-key");
+        self.reply.clone()
+    }
+}
+
+/// 偽の `op` は test binary で 1 回だけ書く（別の test の fork と書き込みが競合して ETXTBSY になるため）。
+fn fake_op() -> &'static Path {
+    static FAKE_OP: OnceLock<tempfile::TempDir> = OnceLock::new();
+    FAKE_OP
+        .get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fake-op");
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\n[ \"$1\" = read ] && [ \"$2\" = '{NOTES_KEY_REF}' ] || exit 7\nprintf 'test-api-key'\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        })
+        .path()
+}
+
+/// 環境側の設定と台帳を置く一時の場所。
+struct NotesEnv {
+    temp: tempfile::TempDir,
+}
+
+impl NotesEnv {
+    /// 設定の本文の `@LEDGER@` は、この環境の台帳の絶対 path に置き換える。
+    fn new(settings: Option<&str>) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let env = Self { temp };
+        if let Some(settings) = settings {
+            let ledger = env.ledger().display().to_string();
+            std::fs::write(env.settings(), settings.replace(LEDGER_MARK, &ledger)).unwrap();
+        }
+        env
+    }
+
+    fn settings(&self) -> std::path::PathBuf {
+        self.temp.path().join("llm.json")
+    }
+
+    /// 設定の `usage_ledger` が指す台帳。runtime には置き場を渡さない。
+    fn ledger(&self) -> std::path::PathBuf {
+        self.temp.path().join("state/usage.jsonl")
+    }
+
+    fn ledger_rows(&self) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(self.ledger())
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn runtime<'a>(&self, transport: &'a dyn Transport) -> AiRuntime<'a> {
+        AiRuntime {
+            home: self.temp.path().join("home"),
+            op_program: fake_op().join("fake-op"),
+            op_service_account_token: Some("test-token".to_owned()),
+            transport,
+        }
+    }
+}
+
+const LEDGER_MARK: &str = "@LEDGER@";
+
+fn full_settings() -> String {
+    format!(
+        r#"{{"anthropic_api_key_ref":"{NOTES_KEY_REF}","forbidden_terms":["社内語"],"internal_names":["secret-repo"],"usage_ledger":"{LEDGER_MARK}"}}"#
+    )
+}
+
+fn body_for(
+    fixture: &Fixture,
+    plan: NotesPlan,
+    env: &NotesEnv,
+    transport: &CountingTransport,
+) -> ReleaseBody {
+    let extract = extract_release(fixture.path(), "HEAD", "v1.2.4", None).unwrap();
+    release_body(
+        &extract,
+        plan,
+        false,
+        &env.settings(),
+        &env.runtime(transport),
+    )
+}
+
+fn fallback_text(fixture: &Fixture) -> String {
+    extract_release(fixture.path(), "HEAD", "v1.2.4", None)
+        .unwrap()
+        .render()
+}
+
+fn tag_contents(root: &Path, tag: &str) -> String {
+    let out = develop_tools_core::git(root)
+        .args(["tag", "-l", "--format=%(contents)", tag])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn ai_notes_become_the_annotated_tag_body_after_exactly_one_request() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let env = NotesEnv::new(Some(&full_settings()));
+    let transport = CountingTransport::json(serde_json::json!({
+        "summary": "予定の選び方を改善しました。",
+        "items": [{"text": "予定を一覧から選べるようになりました。", "sources": [1]}],
+    }));
+
+    let body = body_for(
+        &fixture,
+        NotesPlan::Ai {
+            audience: Audience::Private,
+        },
+        &env,
+        &transport,
+    );
+
+    assert_eq!(transport.calls.get(), 1);
+    assert_eq!(
+        body.source,
+        BodySource::Ai {
+            dictionary_missing: false
+        }
+    );
+    let rows = env.ledger_rows();
+    assert_eq!(rows.len(), 1, "設定の usage_ledger の台帳に 1 行: {rows:?}");
+    assert_eq!(rows[0]["purpose"], "release-notes");
+    assert!(
+        body.text.starts_with("予定の選び方を改善しました。\n"),
+        "{}",
+        body.text
+    );
+    assert!(
+        body.text
+            .contains("- 予定を一覧から選べるようになりました。\n")
+    );
+    let root = fixture.path();
+    let head = git(root, &["rev-parse", "HEAD"]);
+    annotate_tag(root, "v1.2.4", &head, &body.text).unwrap();
+    assert_eq!(git(root, &["cat-file", "-t", "v1.2.4"]), "tag");
+    assert_eq!(git(root, &["rev-parse", "v1.2.4^{commit}"]), head);
+    assert_eq!(
+        tag_contents(root, "v1.2.4").trim_end(),
+        body.text.trim_end()
+    );
+}
+
+/// 台帳の欄が無い古い設定では、費用の記録が残らないので送らずに fallback にする。
+#[test]
+fn settings_without_usage_ledger_fall_back_without_sending() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let env = NotesEnv::new(Some(
+        &full_settings().replace(&format!(r#","usage_ledger":"{LEDGER_MARK}""#), ""),
+    ));
+    assert!(
+        !std::fs::read_to_string(env.settings())
+            .unwrap()
+            .contains("usage_ledger")
+    );
+    let transport = CountingTransport::json(serde_json::json!({
+        "summary": "s",
+        "items": [{"text": "t", "sources": [1]}],
+    }));
+
+    let body = body_for(
+        &fixture,
+        NotesPlan::Ai {
+            audience: Audience::Private,
+        },
+        &env,
+        &transport,
+    );
+
+    assert_eq!(transport.calls.get(), 0);
+    assert_eq!(
+        body.source,
+        BodySource::Fallback("usage_unrecorded".to_owned())
+    );
+    assert_eq!(body.text, fallback_text(&fixture));
+    assert!(!env.ledger().exists());
+}
+
+/// API の失敗は再試行せず、送信 1 回で fallback の本文に戻る。
+#[test]
+fn a_failed_request_is_not_retried_and_falls_back() {
+    for (reply, code) in [
+        (
+            Ok(ApiResponse {
+                status: 529,
+                request_id: Some("req_overloaded".to_owned()),
+                body: "{}".to_owned(),
+            }),
+            "api_failed",
+        ),
+        (
+            Err(TransportError {
+                kind: FailureKind::Timeout,
+                request_id: None,
+            }),
+            "api_timeout",
+        ),
+    ] {
+        let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+        let env = NotesEnv::new(Some(&full_settings()));
+        let transport = CountingTransport::with(reply);
+
+        let body = body_for(
+            &fixture,
+            NotesPlan::Ai {
+                audience: Audience::Private,
+            },
+            &env,
+            &transport,
+        );
+
+        assert_eq!(transport.calls.get(), 1, "{code}");
+        assert_eq!(body.source, BodySource::Fallback(code.to_owned()));
+        assert_eq!(body.text, fallback_text(&fixture));
+    }
+}
+
+/// release 側で決める理由 code。推論の前に止まるものは送らない。
+#[test]
+fn each_release_side_reason_falls_back_with_its_code() {
+    let no_dictionary = format!(r#"{{"anthropic_api_key_ref":"{NOTES_KEY_REF}"}}"#);
+    let reply = serde_json::json!({
+        "summary": "改善しました。",
+        "items": [{"text": "予定を選べます。", "sources": [1]}],
+    });
+    let cases: [(Option<&str>, Audience, &str); 4] = [
+        (None, Audience::Private, "key_missing"),
+        (None, Audience::Public, "dictionary_missing"),
+        (Some("{"), Audience::Private, "config_invalid"),
+        (Some(&no_dictionary), Audience::Public, "dictionary_missing"),
+    ];
+    for (settings, audience, code) in cases {
+        let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+        let env = NotesEnv::new(settings);
+        let transport = CountingTransport::json(reply.clone());
+
+        let body = body_for(&fixture, NotesPlan::Ai { audience }, &env, &transport);
+
+        assert_eq!(
+            body.source,
+            BodySource::Fallback(code.to_owned()),
+            "{settings:?}"
+        );
+        assert_eq!(transport.calls.get(), 0, "{code}");
+        assert_eq!(body.text, fallback_text(&fixture));
+    }
+}
+
+#[test]
+fn an_output_that_fails_the_check_falls_back_with_its_location() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let env = NotesEnv::new(Some(&full_settings()));
+    let transport = CountingTransport::json(serde_json::json!({
+        "summary": "改善しました。",
+        "items": [{"text": "詳しくは https://example.com を見てください。", "sources": [1]}],
+    }));
+
+    let body = body_for(
+        &fixture,
+        NotesPlan::Ai {
+            audience: Audience::Private,
+        },
+        &env,
+        &transport,
+    );
+
+    assert_eq!(transport.calls.get(), 1);
+    assert_eq!(
+        body.source,
+        BodySource::Fallback("output_rejected:items.0.text.url".to_owned())
+    );
+    assert_eq!(body.text, fallback_text(&fixture));
+}
+
+/// 抽出が 0 件なら推論しない。
+#[test]
+fn no_changelog_items_skip_the_request() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), None);
+    let env = NotesEnv::new(Some(&full_settings()));
+    let transport = CountingTransport::json(serde_json::json!({}));
+
+    let body = body_for(
+        &fixture,
+        NotesPlan::Ai {
+            audience: Audience::Private,
+        },
+        &env,
+        &transport,
+    );
+
+    assert_eq!(transport.calls.get(), 0);
+    assert_eq!(
+        body.source,
+        BodySource::Fallback("input_rejected".to_owned())
+    );
+}
+
+/// 本番の `release` を空の HOME で走らせる（環境側の設定が無いので API には届かない）。
+fn release_with(root: &Path, args: &[&str]) -> (Output, tempfile::TempDir) {
+    let home = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_release"));
+    develop_tools_core::strip_git_env(&mut command);
+    let output = command
+        .args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", home.path())
+        .env_remove("OP_SERVICE_ACCOUNT_TOKEN")
+        .output()
+        .unwrap();
+    (output, home)
+}
+
+fn assert_annotated_v124(root: &Path, output: &Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let released = git(root, &["rev-parse", "develop"]);
+    assert_eq!(git(root, &["rev-parse", "main"]), released);
+    assert_eq!(git(root, &["cat-file", "-t", "v1.2.4"]), "tag");
+    assert_eq!(git(root, &["rev-parse", "v1.2.4^{commit}"]), released);
+    tag_contents(root, "v1.2.4")
+}
+
+#[test]
+fn no_ai_release_annotates_the_tag_with_the_fallback_body() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let root = fixture.path();
+
+    let (output, home) = release_with(root, &["patch", "--no-ai"]);
+
+    let contents = assert_annotated_v124(root, &output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("本文: --no-ai"), "{stdout}");
+    assert!(
+        contents.contains("予定を一覧で選べるようにした"),
+        "{contents}"
+    );
+    assert!(
+        contents.contains(
+            "[v1.2.3...v1.2.4](https://github.com/example/notes-repo/compare/v1.2.3...v1.2.4)"
+        ),
+        "{contents}"
+    );
+    assert!(stdout.contains(contents.trim_end()), "{stdout}");
+    assert!(!home.path().join(".local").exists());
+}
+
+#[test]
+fn annotated_release_reports_the_body_and_how_to_recreate_the_tag_when_tagging_fails() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let root = fixture.path();
+    let old_main = git(root, &["rev-parse", "main"]);
+    reject_tag_refs(root);
+
+    let (output, _home) = release_with(root, &["patch", "--no-ai"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    let released = git(root, &["rev-parse", "develop"]);
+    assert_eq!(git(root, &["rev-parse", "main"]), released, "{stderr}");
+    assert_eq!(git(root, &["tag", "-l", "v1.2.4"]), "");
+    assert!(stderr.contains(&old_main), "{stderr}");
+    assert!(
+        stderr.contains("git tag -a --cleanup=verbatim -F"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&format!("v1.2.4 {released}")), "{stderr}");
+    assert!(stderr.contains("予定を一覧で選べるようにした"), "{stderr}");
+}
+
+/// 設定の無い環境の AI の宣言は fallback の本文で注釈付き tag を作り、Release を止めない。
+#[test]
+fn ai_release_without_settings_annotates_with_the_fallback_and_its_reason() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let root = fixture.path();
+
+    let (output, _home) = release_with(root, &["patch"]);
+
+    let contents = assert_annotated_v124(root, &output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("本文: fallback（key_missing）"), "{stdout}");
+    assert!(
+        contents.contains("予定を一覧で選べるようにした"),
+        "{contents}"
+    );
+}
+
+#[test]
+fn changelog_mode_release_annotates_without_inference() {
+    let fixture = notes_fixture(Some(r#"{"mode":"changelog-additions"}"#), Some(NOTES_ITEM));
+    let root = fixture.path();
+
+    let (output, _home) = release_with(root, &["patch"]);
+
+    let contents = assert_annotated_v124(root, &output);
+    assert!(
+        contents.contains("予定を一覧で選べるようにした"),
+        "{contents}"
+    );
+}
+
+/// 宣言の無い repo は今どおり軽量 tag。
+#[test]
+fn undeclared_release_keeps_a_lightweight_tag() {
+    let fixture = notes_fixture(None, Some(NOTES_ITEM));
+    let root = fixture.path();
+
+    let (output, _home) = release_with(root, &["patch"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(git(root, &["cat-file", "-t", "v1.2.4"]), "commit");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("本文:"));
+}
+
+/// 書く前に止まるもの: 英語の AI 本文・前 tag 無し・知らない引数。
+#[test]
+fn unsupported_notes_and_arguments_refuse_before_writing() {
+    let english =
+        r#"{"mode":"ai","fallback":"changelog-additions","audience":"private","language":"en"}"#;
+    for (notes, args, expected) in [
+        (Some(english), &["patch"][..], "language"),
+        (Some(AI_PRIVATE), &["patch", "--ai"][..], "--ai"),
+    ] {
+        let fixture = notes_fixture(notes, Some(NOTES_ITEM));
+        let root = fixture.path();
+        let head = git(root, &["rev-parse", "HEAD"]);
+
+        let (output, _home) = release_with(root, args);
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{notes:?}");
+        assert!(stderr.contains(expected), "{stderr}");
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(root, &["status", "--porcelain"]), "");
+        assert_eq!(git(root, &["tag", "--list"]), "v1.2.3");
+    }
+}
+
+#[test]
+fn declared_release_without_a_previous_tag_refuses_before_writing() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let root = fixture.path();
+    git(root, &["tag", "-d", "v1.2.3"]);
+    let head = git(root, &["rev-parse", "HEAD"]);
+
+    let (output, _home) = release_with(root, &["patch", "--no-ai"]);
+
+    assert!(!output.status.success());
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+    assert!(git(root, &["tag", "--list"]).is_empty());
+}
+
+/// private は辞書が無くても推論し、本文の出どころに dictionary_missing を残す。
+#[test]
+fn private_notes_without_a_dictionary_still_use_ai_and_say_so() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let env = NotesEnv::new(Some(&format!(
+        r#"{{"anthropic_api_key_ref":"{NOTES_KEY_REF}","usage_ledger":"{LEDGER_MARK}"}}"#
+    )));
+    let transport = CountingTransport::json(serde_json::json!({
+        "summary": "改善しました。",
+        "items": [{"text": "予定を選べます。", "sources": [1]}],
+    }));
+
+    let body = body_for(
+        &fixture,
+        NotesPlan::Ai {
+            audience: Audience::Private,
+        },
+        &env,
+        &transport,
+    );
+
+    assert_eq!(transport.calls.get(), 1);
+    assert_eq!(
+        body.source,
+        BodySource::Ai {
+            dictionary_missing: true
+        }
+    );
+    assert_eq!(body.source.to_string(), "AI の要約（dictionary_missing）");
+}
+
+// ---- 版の節の抽出（design §10） ----
+
+const SECTION_MODE: &str = r#"{"mode":"changelog-section"}"#;
+const AI_SECTION_PUBLIC: &str =
+    r#"{"mode":"ai","fallback":"changelog-section","audience":"public"}"#;
+
+/// example-repo の形の版の節。1.2.4 の節は要約の段落と 2 つの箇条。
+const SECTION_CHANGELOG: &str = "# Changelog
+
+## Unreleased
+
+## 1.2.4 (2026-10-21)
+
+Lineup lists schedules.
+
+- Feature: **Schedule list** lets people pick a schedule from a list.
+- Fix: **Doctor** reports a starting daemon separately.
+
+## 1.2.3 (2026-10-19)
+
+- Feature: **Older** shipped before.
+";
+
+/// notes_fixture の後に CHANGELOG を版の節の形で commit した repo。
+fn section_fixture(notes: &str, changelog: &str) -> Fixture {
+    let fixture = notes_fixture(Some(notes), None);
+    let root = fixture.path();
+    std::fs::write(root.join("CHANGELOG.md"), changelog).unwrap();
+    git(root, &["add", "CHANGELOG.md"]);
+    git(root, &["commit", "-qm", "changelog"]);
+    fixture
+}
+
+fn assert_section_body(contents: &str) {
+    assert!(
+        contents.starts_with(
+            "変更範囲: [v1.2.3...v1.2.4](https://github.com/example/notes-repo/compare/v1.2.3...v1.2.4)\n\nLineup lists schedules.\n\n- Feature: **Schedule list**"
+        ),
+        "{contents}"
+    );
+    assert!(contents.contains("- Fix: **Doctor**"), "{contents}");
+    assert!(!contents.contains("## 1.2.4"), "{contents}");
+    assert!(!contents.contains("Older"), "{contents}");
+}
+
+#[test]
+fn section_mode_release_annotates_the_tag_with_the_version_section() {
+    let fixture = section_fixture(SECTION_MODE, SECTION_CHANGELOG);
+    let root = fixture.path();
+
+    let (output, _home) = release_with(root, &["patch"]);
+
+    let contents = assert_annotated_v124(root, &output);
+    assert_section_body(&contents);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("本文: CHANGELOG の抽出"), "{stdout}");
+}
+
+/// 公開 repo の AI 宣言は、照合の材料が無ければ版の節に戻して注釈付き tag を作る。
+#[test]
+fn public_ai_release_without_settings_falls_back_to_the_version_section() {
+    let fixture = section_fixture(AI_SECTION_PUBLIC, SECTION_CHANGELOG);
+    let root = fixture.path();
+
+    let (output, home) = release_with(root, &["patch"]);
+
+    let contents = assert_annotated_v124(root, &output);
+    assert_section_body(&contents);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("本文: fallback（"), "{stdout}");
+    assert!(!home.path().join(".local").exists());
+}
+
+/// AI の入力は版の節のトップレベルの箇条。番号は節の箇条を指す。
+#[test]
+fn ai_input_for_a_section_fallback_is_the_section_items() {
+    let fixture = section_fixture(AI_SECTION_PUBLIC, SECTION_CHANGELOG);
+    let root = fixture.path();
+    let env = NotesEnv::new(Some(&full_settings()));
+    let transport = CountingTransport::json(serde_json::json!({
+        "summary": "予定を一覧から選べます。",
+        "items": [
+            {"text": "予定を一覧から選べます。", "sources": [1]},
+            {"text": "起動中の表示を分けました。", "sources": [2]},
+        ],
+    }));
+    let declared = DeclaredNotes {
+        plan: NotesPlan::Ai {
+            audience: Audience::Public,
+        },
+        source: NotesSource::ChangelogSection,
+    };
+    let prepared = prepare_notes(root, declared, "v1.2.4").unwrap();
+    let extract = prepared.extract(root, "HEAD").unwrap();
+    assert_eq!(extract.items.len(), 2, "{:?}", extract.items);
+
+    let body = release_body(
+        &extract,
+        prepared.plan(),
+        false,
+        &env.settings(),
+        &env.runtime(&transport),
+    );
+
+    assert_eq!(transport.calls.get(), 1);
+    assert_eq!(
+        body.source,
+        BodySource::Ai {
+            dictionary_missing: false
+        }
+    );
+    assert!(
+        body.text.ends_with("compare/v1.2.3...v1.2.4)\n"),
+        "{}",
+        body.text
+    );
+}
+
+/// 版の節が使えなければ、AI の宣言でも版 commit と tag を作らずに理由 code で止める。
+#[test]
+fn an_unusable_version_section_refuses_before_writing_with_its_reason() {
+    let missing = "# Changelog\n\n## Unreleased\n\n## 1.2.3 (2026-10-19)\n\n- older\n";
+    let undated = "# Changelog\n\n## 1.2.4\n\n- undated\n";
+    let duplicate = "## 1.2.4 (2026-10-21)\n\n- a\n\n## [1.2.4] - 2026-10-21\n\n- b\n";
+    let empty = "## 1.2.4 (2026-10-21)\n\n## 1.2.3 (2026-10-19)\n\n- older\n";
+    // 行頭が字下げの見出しは見出しではない（読み取りで先頭の空白を落とさない）。
+    let indented = "    ## 1.2.4 (2026-10-21)\n\n- item\n";
+    for notes in [SECTION_MODE, AI_SECTION_PUBLIC] {
+        for (changelog, code) in [
+            (missing, "section_missing"),
+            (indented, "section_missing"),
+            (undated, "section_missing"),
+            (duplicate, "section_duplicate"),
+            (empty, "section_empty"),
+        ] {
+            let fixture = section_fixture(notes, changelog);
+            let root = fixture.path();
+            let head = git(root, &["rev-parse", "HEAD"]);
+
+            let (output, _home) = release_with(root, &["patch", "--no-ai"]);
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{notes} {changelog:?}");
+            assert!(stderr.contains(code), "{stderr}");
+            assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
+            assert_eq!(git(root, &["status", "--porcelain"]), "");
+            assert_eq!(git(root, &["tag", "--list"]), "v1.2.3");
+        }
+    }
+}
+
+/// CHANGELOG.md が無いときも section_missing で止め、message で節が無いのと区別する。
+#[test]
+fn a_missing_changelog_refuses_with_section_missing_and_says_so() {
+    let fixture = notes_fixture(Some(SECTION_MODE), None);
+    let root = fixture.path();
+    git(root, &["rm", "-q", "CHANGELOG.md"]);
+    git(root, &["commit", "-qm", "drop changelog"]);
+    let head = git(root, &["rev-parse", "HEAD"]);
+
+    let (output, _home) = release_with(root, &["patch"]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("section_missing"), "{stderr}");
+    assert!(stderr.contains("CHANGELOG.md がありません"), "{stderr}");
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(root, &["tag", "--list"]), "v1.2.3");
 }

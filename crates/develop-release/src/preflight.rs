@@ -10,9 +10,10 @@
 use crate::ci_runs::{self, ListError, RunFilter, WaitError};
 use crate::push::git_stdout;
 use develop_tools_core::cli_help::Help;
-use develop_tools_core::develop_tools_manifest::{self, Declaration, Platform};
+use develop_tools_core::develop_tools_manifest::{self, Declaration, NotesMode, Platform};
+use island_llm::settings::{self, SettingsError};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DISPATCH_EVENT: &str = "workflow_dispatch";
@@ -38,7 +39,9 @@ where
     N: FnMut() -> Duration,
     S: FnMut(Duration),
 {
-    let workflow = preflight_workflow(&read_declaration(root)?)?;
+    let declaration = read_declaration(root)?;
+    let workflow = preflight_workflow(&declaration)?;
+    report_llm_settings(&declaration);
     let integration = integration_branch(root)?;
     let spec = format!("refs/heads/{integration}");
     let head = git_stdout(root, &["rev-parse", &spec])?;
@@ -112,6 +115,57 @@ where
         run.name, run.database_id, run.url
     );
     Ok(())
+}
+
+/// `release.notes` の `mode` が `ai` の repo で、環境側の設定と各欄の有無を出す（design §2.1）。
+/// 欠けていても `release` は fallback で出せるので、止めずに報告だけする。
+fn report_llm_settings(declaration: &Declaration) {
+    if !declaration
+        .release_notes
+        .as_ref()
+        .is_some_and(|notes| matches!(notes.mode, NotesMode::Ai { .. }))
+    {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        println!("release.notes の環境側の設定: HOME が無いので確かめられません");
+        return;
+    };
+    let path = settings::default_path(&PathBuf::from(home));
+    let mark = |present: bool| if present { "有り" } else { "無し" };
+    let complete = match settings::presence(&path) {
+        Ok(presence) => {
+            println!("release.notes の環境側の設定 {}:", path.display());
+            for (field, present) in [
+                ("anthropic_api_key_ref", presence.key_ref),
+                ("forbidden_terms", presence.forbidden_terms),
+                ("internal_names", presence.internal_names),
+                ("usage_ledger", presence.usage_ledger),
+            ] {
+                println!("  {field}: {}", mark(present));
+            }
+            presence.key_ref
+                && presence.forbidden_terms
+                && presence.internal_names
+                && presence.usage_ledger
+        }
+        Err(SettingsError::Missing) => {
+            println!("release.notes の環境側の設定 {}: 無し", path.display());
+            false
+        }
+        Err(_) => {
+            println!(
+                "release.notes の環境側の設定 {}: 読めません（JSON が不正か、usage_ledger が絶対 path でない）",
+                path.display()
+            );
+            false
+        }
+    };
+    if !complete {
+        println!(
+            "  欠けた欄があると release は fallback の本文になります。環境側の bin/install-tools で書き直してください"
+        );
+    }
 }
 
 /// `release <bump>` が版を書く前の照合。`platforms` が無ければ gh を呼ばずに通す。
@@ -201,8 +255,8 @@ fn platform_problem(platform: Platform, jobs: &[ci_runs::Job]) -> Option<String>
     }
 }
 
-fn read_declaration(root: &Path) -> Result<Declaration, String> {
-    let path = develop_tools_manifest::PATH;
+pub(crate) fn read_declaration(root: &Path) -> Result<Declaration, String> {
+    let path = develop_tools_manifest::locate(root)?.unwrap_or(develop_tools_manifest::PATH);
     let raw = std::fs::read_to_string(root.join(path)).map_err(|err| format!("{path}: {err}"))?;
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|err| format!("{path}: JSON が不正です: {err}"))?;
@@ -211,10 +265,7 @@ fn read_declaration(root: &Path) -> Result<Declaration, String> {
 
 fn preflight_workflow(declaration: &Declaration) -> Result<String, String> {
     declaration.preflight_workflow.clone().ok_or_else(|| {
-        format!(
-            "{} に release.preflightWorkflow がありません",
-            develop_tools_manifest::PATH
-        )
+        "版固定 file（.config/develop-tools.json、移行中は旧い .develop-tools.json）に release.preflightWorkflow がありません".to_owned()
     })
 }
 

@@ -43,7 +43,7 @@ where
     S: FnMut(Duration),
 {
     let integration = develop_tools_core::release_integration_branch(root)?
-        .ok_or(".develop-tools.json から日常統合先を決められません")?;
+        .ok_or("版固定 file から日常統合先を決められません")?;
     let main_branch = develop_tools_core::RELEASE_BRANCH;
     let main_sha = rev_parse(root, &format!("refs/heads/{main_branch}"))?;
     let tag = find_tag(root, &main_sha)?;

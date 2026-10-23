@@ -15,7 +15,7 @@ cleanup() {
   for case_dir in "$root"/*; do
     [ -d "$case_dir" ] || continue
     rm -f "$case_dir"/repo/.develop-tools.json "$case_dir"/repo/.develop-tools-next.json \
-      "$case_dir"/repo/.develop-tools-original.json \
+      "$case_dir"/repo/.develop-tools-original.json "$case_dir"/repo/.config/develop-tools.json \
       "$case_dir"/releases/* "$case_dir"/payload/* \
       "$case_dir"/fakebin/* "$case_dir"/restricted/* "$case_dir"/local/* \
       "$case_dir"/cache/develop-tools/$version/$target/* \
@@ -34,7 +34,7 @@ cleanup() {
       "$case_dir"/cache/develop-tools/$other_version \
       "$case_dir"/cache/develop-tools/$version \
       "$case_dir"/cache/develop-tools "$case_dir"/cache \
-      "$case_dir"/repo "$case_dir"/releases "$case_dir"/payload \
+      "$case_dir"/repo/.config "$case_dir"/repo "$case_dir"/releases "$case_dir"/payload \
       "$case_dir"/fakebin "$case_dir"/restricted "$case_dir"/local \
       "$case_dir"/state/mise/tracked-configs "$case_dir"/state/mise "$case_dir"/state \
       "$case_dir"/home "$case_dir" 2>/dev/null || :
@@ -364,6 +364,29 @@ for mode_name in pre-commit ci pre-push release; do
   assert_contains "$(cat "$case_dir/stderr")" '取得できません'
 done
 printf 'ok: download failure modes\n'
+
+fixture manifest_legacy_only
+run_resolver ci
+[ "$result" -eq 0 ] || fail_test "legacy-only manifest failed: $(cat "$case_dir/stderr")"
+assert_contains "$(cat "$case_dir/stdout")" 'ran:'
+printf 'ok: manifest legacy location only\n'
+
+fixture manifest_new_only
+mkdir -p "$case_dir/repo/.config"
+mv "$case_dir/repo/.develop-tools.json" "$case_dir/repo/.config/develop-tools.json"
+run_resolver ci
+[ "$result" -eq 0 ] || fail_test "new-only manifest failed: $(cat "$case_dir/stderr")"
+assert_contains "$(cat "$case_dir/stdout")" 'ran:'
+printf 'ok: manifest new location only\n'
+
+fixture manifest_both
+mkdir -p "$case_dir/repo/.config"
+cp "$case_dir/repo/.develop-tools.json" "$case_dir/repo/.config/develop-tools.json"
+run_resolver ci
+[ "$result" -ne 0 ] || fail_test 'both manifests unexpectedly passed'
+assert_contains "$(cat "$case_dir/stderr")" '.config/develop-tools.json'
+assert_contains "$(cat "$case_dir/stderr")" '.develop-tools.json'
+printf 'ok: both manifests fail naming both paths\n'
 
 fixture local_binary
 mkdir "$case_dir/local"

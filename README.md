@@ -74,6 +74,50 @@ Run a binary with `--help` for its options.
 
 All declared files must hold the same version. Set `release.changelogStamp` to `true` to also stamp the root `CHANGELOG.md` in the version commit.
 
+## Release notes
+
+`release.notes` in `.develop-tools.json` chooses how `release` writes the Release body. Without it, `release` keeps creating a lightweight tag and the body comes from the existing extraction. With it, `release` writes the body into an annotated tag.
+
+```json
+{
+  "release": {
+    "notes": { "mode": "changelog-section", "language": "en" }
+  }
+}
+```
+
+| Field | Values | Default |
+|---|---|---|
+| `mode` | `changelog-additions` (the entries added since the previous tag in a monthly `CHANGELOG.md`), `changelog-section` (the dated `## X.Y.Z (YYYY-MM-DD)` or `## [X.Y.Z] - YYYY-MM-DD` section of the version), or `ai` (a summary with one inference, falling back to `fallback`) | Required |
+| `fallback` | `changelog-additions` or `changelog-section`. Only with `mode: "ai"` | Required with `ai` |
+| `audience` | `private` or `public`. `public` applies the stronger output checks. Only with `mode: "ai"` | Required with `ai` |
+| `language` | `ja` or `en` | `ja` |
+
+`mode: "ai"` with `language: "en"` is not supported yet; `release` stops before writing anything. `release <bump> --no-ai` skips the inference and uses `fallback`.
+
+With `mode: "ai"`, `release` scrubs dates, commit SHAs and URLs from the extracted items, numbers them and makes one Anthropic API request without retrying. The summary becomes the tag body only when it passes the output checks; otherwise the `fallback` body is used and the release continues. The fallback reason is one of `key_missing`, `config_invalid`, `dictionary_missing`, `input_rejected`, `budget_exceeded`, `api_timeout`, `api_failed`, `response_rejected`, `output_rejected:<position>.<kind>`, `usage_unrecorded` and `unknown_purpose`.
+
+After creating the tag, `release` prints the body and its source: `AI の要約`, `fallback（<reason>）` or `--no-ai`. Read it before `release push`. To change it, recreate the tag with `git tag -f -a <tag> <commit>`.
+
+### Environment settings
+
+The API key reference, the forbidden terms and the internal names are not stored in this package or in the repository declaration. `release` reads them from `~/.config/develop-tools/llm.json` in the user's environment; keep the file readable only by the user.
+
+| Field | Meaning |
+|---|---|
+| `anthropic_api_key_ref` | 1Password secret reference (`op://…`) of the Anthropic API key. It is read with the 1Password service account token from `OP_SERVICE_ACCOUNT_TOKEN` or `~/.config/op/service-account.token` |
+| `forbidden_terms` | Terms that must not appear in the summary |
+| `internal_names` | Internal names that must not appear in the summary. Checked with `audience: "public"` |
+| `usage_ledger` | Absolute path of the JSON Lines file that receives one usage row per request |
+
+Without the file, `release` does not send the request (`key_missing`; `dictionary_missing` with `audience: "public"`). Without `anthropic_api_key_ref`, it does not send the request either (`key_missing` for both audiences). Without `usage_ledger`, it does not send the request either (`usage_unrecorded`). With `audience: "public"`, both `forbidden_terms` and `internal_names` are required (`dictionary_missing`). With `audience: "private"` and no `forbidden_terms`, the request is still sent and the source line shows `AI の要約（dictionary_missing）`. `release check` reports which fields are present in a repository that declares `mode: "ai"`.
+
+### Release workflow
+
+A Release workflow uses the annotation as the body when the tag object is an annotated tag with a non-empty annotation. For a lightweight tag or an empty annotation it uses the output of `release-notes <tag>`. Decide by the object type (`git cat-file -t refs/tags/<tag>`), not by `%(contents)`, which returns the commit message for a lightweight tag.
+
+This repository does not use `release`: its tag is created by the publishing step and the Release body is the matching `CHANGELOG.md` section (`scripts/release-notes.sh`).
+
 ## Versioning
 
 The Release version follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html) within 0.x: a patch release for changes callers can adopt without adjustment, including new features, and a minor release when callers must adjust. A major release comes only after an explicit stability declaration. Each Release body is the matching section of [`CHANGELOG.md`](./CHANGELOG.md).

@@ -1,11 +1,49 @@
 //! The repository-local tool pin has one schema and two distribution forms.
+use std::path::Path;
+
 use serde_json::{Value, json};
 
-pub const PATH: &str = ".develop-tools.json";
+/// 版固定 file の置き場。移行中は旧い [`LEGACY_PATH`] も読み、両方あれば止める。
+pub const PATH: &str = ".config/develop-tools.json";
+/// 移行前の置き場。全 repo が [`PATH`] へ移った後の Release で探索から外す。
+pub const LEGACY_PATH: &str = ".develop-tools.json";
+/// 新旧の両方があるときの失敗の先頭の語。
+pub const DUPLICATED: &str = "manifest_duplicated";
 pub const RESOLVER_PATH: &str = ".develop-tools/resolve";
 pub const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 pub const MACOS_TARGET: &str = "aarch64-apple-darwin";
 /// ADR 番号の契約の欄。値の正本は配る側の台帳で、配布がこの名前のまま写す。
+/// 作業ツリーの `root` で版固定 file を探し、repo 相対の path を返す。無ければ `None`。
+pub fn locate(root: &Path) -> Result<Option<&'static str>, String> {
+    locate_in(|path| match std::fs::symlink_metadata(root.join(path)) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(format!("{}: {error}", root.join(path).display())),
+    })
+}
+
+/// index や commit の tree など、1 つの参照元の中で版固定 file を探す。
+/// `exists` は repo 相対の path がその参照元にあるかを答える。
+pub fn locate_in(
+    mut exists: impl FnMut(&str) -> Result<bool, String>,
+) -> Result<Option<&'static str>, String> {
+    match (exists(PATH)?, exists(LEGACY_PATH)?) {
+        (true, true) => Err(format!(
+            "{DUPLICATED}: {PATH} と {LEGACY_PATH} の両方があります（{PATH} の 1 つにしてください）"
+        )),
+        (true, false) => Ok(Some(PATH)),
+        (false, true) => Ok(Some(LEGACY_PATH)),
+        (false, false) => Ok(None),
+    }
+}
+
 pub const ADR_CONTRACT_KEYS: [&str; 3] = [
     "adrMigratedThrough",
     "adrReservedNumbers",
@@ -61,9 +99,12 @@ pub struct AdrContract {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PlatformCheck {
-    pub cargo_workspace: String,
+    /// 1 つの path か重複の無い空でない配列で宣言し、読んだ後は常に配列。
+    pub cargo_workspaces: Vec<String>,
     pub bun: bool,
     pub setup: Option<String>,
+    /// `--run-ignored only` で続けて回す ignored test の nextest の filterset。
+    pub run_ignored: Option<String>,
 }
 
 /// 軽い CI（`ci-develop.yml` の標準の区画）の宣言。repo の中身の事実なので repo が書き、
@@ -84,9 +125,51 @@ pub struct RustCi {
 #[derive(Debug, PartialEq, Eq)]
 pub struct BunCi {
     pub dirs: Vec<String>,
+    /// install を repo の `ci:install` script に任せる（`true` のとき）。既定は素の `bun install`。
+    pub ci_install: bool,
 }
 
-/// repo が `.develop-tools.json` で宣言する値。版の固定（`version`・`sha256`）は
+/// `release.notes` の宣言。無ければ `release` は今の本文の作り方と軽量 tag を保つ。
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReleaseNotes {
+    pub mode: NotesMode,
+    pub language: NotesLanguage,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum NotesMode {
+    /// CHANGELOG からの抽出だけで本文を作る。
+    Changelog(NotesSource),
+    /// 推論で本文を作り、使えないときは `fallback` の抽出に戻す。
+    Ai {
+        fallback: NotesSource,
+        audience: NotesAudience,
+    },
+}
+
+/// CHANGELOG から本文を抽出する方法。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotesSource {
+    /// 月別の追記の抽出。
+    ChangelogAdditions,
+    /// 版の節の抽出。
+    ChangelogSection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotesLanguage {
+    Ja,
+    En,
+}
+
+/// 公開範囲。`gh` で visibility を引かず、宣言で持つ。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotesAudience {
+    Private,
+    Public,
+}
+
+/// repo が版固定 file（[`PATH`]、移行中は [`LEGACY_PATH`]）で宣言する値。版の固定（`version`・`sha256`）は
 /// [`known_shape`] が見るので、ここでは読まない。道具を配る側の repo の形でも読める。
 #[derive(Debug)]
 pub struct Declaration {
@@ -96,6 +179,8 @@ pub struct Declaration {
     pub platform_check: PlatformCheck,
     pub preflight_workflow: Option<String>,
     pub release: Option<Value>,
+    /// `release.notes` が無ければ `None`。
+    pub release_notes: Option<ReleaseNotes>,
     /// 契約の欄が 1 つも無ければ `None`。
     pub adr_contract: Option<AdrContract>,
     /// `ci` の欄が無ければ `None`。
@@ -182,9 +267,18 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
     };
     let bun = match ci.get("bun") {
         None => None,
-        Some(bun) => Some(BunCi {
-            dirs: directories(stack(bun, "ci.bun", &["dirs"])?, "ci.bun", "dirs")?,
-        }),
+        Some(bun) => {
+            let bun = stack(bun, "ci.bun", &["dirs", "ciInstall"])?;
+            let ci_install = match bun.get("ciInstall") {
+                None => false,
+                Some(Value::Bool(flag)) => *flag,
+                Some(_) => return Err("ci.bun.ciInstall は真偽値でなければなりません".into()),
+            };
+            Some(BunCi {
+                dirs: directories(bun, "ci.bun", "dirs")?,
+                ci_install,
+            })
+        }
     };
     Ok(Some(CiDeclaration { rust, bun }))
 }
@@ -257,6 +351,63 @@ fn extra_steps(rust: &serde_json::Map<String, Value>) -> Result<Vec<String>, Str
         .collect()
 }
 
+/// `release.notes` を読む。`mode` が `ai` のときだけ `fallback` と `audience` を受け、必須にする。
+fn release_notes(release: &Value) -> Result<Option<ReleaseNotes>, String> {
+    let Some(notes) = release.get("notes") else {
+        return Ok(None);
+    };
+    let notes = stack(
+        notes,
+        "release.notes",
+        &["mode", "fallback", "language", "audience"],
+    )?;
+    let text = |key: &str| match notes.get(key) {
+        None => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.as_str())),
+        Some(value) => Err(format!("release.notes.{key} が不正です: {value}")),
+    };
+    let unknown = |key: &str, value: &str| format!("release.notes.{key} が不正です: {value}");
+    let source = |key: &str| -> Result<Option<NotesSource>, String> {
+        text(key)?
+            .map(|value| match value {
+                "changelog-additions" => Ok(NotesSource::ChangelogAdditions),
+                "changelog-section" => Ok(NotesSource::ChangelogSection),
+                other => Err(unknown(key, other)),
+            })
+            .transpose()
+    };
+    let required =
+        |key: &str| format!("release.notes.mode が ai のときは release.notes.{key} が必要です");
+    let mode = match text("mode")?.ok_or("release.notes.mode が必要です")? {
+        "ai" => NotesMode::Ai {
+            fallback: source("fallback")?.ok_or_else(|| required("fallback"))?,
+            audience: match text("audience")?.ok_or_else(|| required("audience"))? {
+                "private" => NotesAudience::Private,
+                "public" => NotesAudience::Public,
+                other => return Err(unknown("audience", other)),
+            },
+        },
+        extract => {
+            let source = source("mode")?.ok_or_else(|| unknown("mode", extract))?;
+            if let Some(key) = ["fallback", "audience"]
+                .into_iter()
+                .find(|key| notes.contains_key(*key))
+            {
+                return Err(format!(
+                    "release.notes.{key} は mode が ai のときだけ書けます"
+                ));
+            }
+            NotesMode::Changelog(source)
+        }
+    };
+    let language = match text("language")? {
+        None | Some("ja") => NotesLanguage::Ja,
+        Some("en") => NotesLanguage::En,
+        Some(other) => return Err(unknown("language", other)),
+    };
+    Ok(Some(ReleaseNotes { mode, language }))
+}
+
 pub fn declaration(value: &Value) -> Result<Declaration, String> {
     let object = value.as_object().ok_or("JSON object が必要です")?;
     let integration_branch = optional_string(object, "integrationBranch")?;
@@ -267,6 +418,7 @@ pub fn declaration(value: &Value) -> Result<Declaration, String> {
         Some(release) if release.is_object() => Some(release.clone()),
         Some(_) => return Err("不正な release".into()),
     };
+    let release_notes = release.as_ref().map(release_notes).transpose()?.flatten();
     let preflight_workflow = match &release {
         Some(release) => optional_string(release.as_object().expect("object"), "preflightWorkflow")
             .map_err(|_| "不正な release.preflightWorkflow".to_owned())?,
@@ -299,9 +451,24 @@ pub fn declaration(value: &Value) -> Result<Declaration, String> {
     };
     let field = |key: &str| platform_check.and_then(|check| check.get(key));
     let platform_check = PlatformCheck {
-        cargo_workspace: match field("cargoWorkspace") {
-            None => ".".into(),
-            Some(Value::String(path)) if relative_workspace(path) => path.clone(),
+        cargo_workspaces: match field("cargoWorkspace") {
+            None => vec![".".into()],
+            Some(Value::String(path)) if relative_workspace(path) => vec![path.clone()],
+            Some(Value::Array(paths)) if !paths.is_empty() => {
+                let mut workspaces = Vec::with_capacity(paths.len());
+                for path in paths {
+                    match path.as_str() {
+                        Some(path)
+                            if relative_workspace(path)
+                                && !workspaces.iter().any(|known| known == path) =>
+                        {
+                            workspaces.push(path.to_owned());
+                        }
+                        _ => return Err("不正な platformCheck.cargoWorkspace".into()),
+                    }
+                }
+                workspaces
+            }
             Some(_) => return Err("不正な platformCheck.cargoWorkspace".into()),
         },
         bun: match field("bun") {
@@ -314,6 +481,11 @@ pub fn declaration(value: &Value) -> Result<Declaration, String> {
             Some(Value::String(command)) if !command.is_empty() => Some(command.clone()),
             Some(_) => return Err("不正な platformCheck.setup".into()),
         },
+        run_ignored: match field("runIgnored") {
+            None => None,
+            Some(Value::String(filter)) if !filter.is_empty() => Some(filter.clone()),
+            Some(_) => return Err("不正な platformCheck.runIgnored".into()),
+        },
     };
     Ok(Declaration {
         integration_branch,
@@ -321,6 +493,7 @@ pub fn declaration(value: &Value) -> Result<Declaration, String> {
         platform_check,
         preflight_workflow,
         release,
+        release_notes,
         adr_contract,
         ci,
     })
@@ -514,6 +687,44 @@ fn rewrite_value(
 mod tests {
     use super::*;
 
+    fn tree(files: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for file in files {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{}").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn locate_reads_new_then_legacy_and_stops_on_both() {
+        assert_eq!(locate(tree(&[PATH]).path()), Ok(Some(PATH)));
+        assert_eq!(locate(tree(&[LEGACY_PATH]).path()), Ok(Some(LEGACY_PATH)));
+        assert_eq!(locate(tree(&[]).path()), Ok(None));
+        let error = locate(tree(&[PATH, LEGACY_PATH]).path()).unwrap_err();
+        assert!(error.starts_with("manifest_duplicated"), "{error}");
+        assert!(
+            error.contains(PATH) && error.contains(LEGACY_PATH),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn locate_in_judges_within_one_source() {
+        let only =
+            |present: &'static [&'static str]| locate_in(move |path| Ok(present.contains(&path)));
+        assert_eq!(only(&[PATH]), Ok(Some(PATH)));
+        assert_eq!(only(&[LEGACY_PATH]), Ok(Some(LEGACY_PATH)));
+        assert_eq!(only(&[]), Ok(None));
+        let error = only(&[PATH, LEGACY_PATH]).unwrap_err();
+        assert!(error.starts_with("manifest_duplicated"), "{error}");
+        assert_eq!(
+            locate_in(|_| Err("index を読めません".to_owned())),
+            Err("index を読めません".to_owned())
+        );
+    }
+
     // OS 宣言の fixture の正本は `packages/action/tests/fixtures/platform-declarations.json`。
     // この crate は公開する workspace の外を読まないので、使う case だけを同じ名前で写す。
     // 正本の全 case に対する `declaration()` の判定は `tools/develop-core/tests/platform_declaration_parity.rs`
@@ -532,6 +743,16 @@ mod tests {
                     "preflightWorkflow": "ci.yml",
                     "versionFiles": [{"path": "tools/Cargo.toml", "kind": "cargo-workspace"}]
                 }
+            }),
+            "multi-workspace-run-ignored" => json!({
+                "platforms": ["linux", "macos"],
+                "platformCheck": {
+                    "cargoWorkspace": ["tools", "packages/cli"],
+                    "bun": true,
+                    "setup": "./bin/ci-install --frozen-lockfile",
+                    "runIgnored": "kind(lib) | kind(bin)"
+                },
+                "release": {"preflightWorkflow": "platform-check.yml"}
             }),
             "invalid-unknown-os" => json!({
                 "platforms": ["linux", "freebsd"],
@@ -554,9 +775,10 @@ mod tests {
         assert_eq!(
             declared.platform_check,
             PlatformCheck {
-                cargo_workspace: "tools".into(),
+                cargo_workspaces: vec!["tools".into()],
                 bun: true,
                 setup: Some("./bin/ci-install --frozen-lockfile".into()),
+                run_ignored: None,
             }
         );
         assert_eq!(declared.preflight_workflow.as_deref(), Some("ci.yml"));
@@ -569,15 +791,43 @@ mod tests {
     }
 
     #[test]
+    fn platform_check_reads_workspace_list_and_ignored_filter() {
+        let declared = declaration(&manifest("multi-workspace-run-ignored")).unwrap();
+        assert_eq!(
+            declared.platform_check,
+            PlatformCheck {
+                cargo_workspaces: vec!["tools".into(), "packages/cli".into()],
+                bun: true,
+                setup: Some("./bin/ci-install --frozen-lockfile".into()),
+                run_ignored: Some("kind(lib) | kind(bin)".into()),
+            }
+        );
+        for check in [
+            json!({"cargoWorkspace": []}),
+            json!({"cargoWorkspace": ["tools", "tools"]}),
+            json!({"cargoWorkspace": ["tools", "../cli"]}),
+            json!({"cargoWorkspace": ["tools", 1]}),
+            json!({"runIgnored": ""}),
+            json!({"runIgnored": true}),
+        ] {
+            assert!(
+                declaration(&json!({"platformCheck": check})).is_err(),
+                "{check}"
+            );
+        }
+    }
+
+    #[test]
     fn absent_declaration_has_no_platforms_and_default_check() {
         let declared = declaration(&json!({"version": "0.1.0"})).unwrap();
         assert!(declared.platforms.is_empty());
         assert_eq!(
             declared.platform_check,
             PlatformCheck {
-                cargo_workspace: ".".into(),
+                cargo_workspaces: vec![".".into()],
                 bun: false,
                 setup: None,
+                run_ignored: None,
             }
         );
         assert_eq!(declared.preflight_workflow, None);
@@ -682,6 +932,7 @@ mod tests {
                 }),
                 bun: Some(BunCi {
                     dirs: vec![".".into()],
+                    ci_install: false,
                 }),
             })
         );
@@ -704,6 +955,11 @@ mod tests {
             Some(vec!["cargo\ttest".into()])
         );
         assert_eq!(ci_declaration(&json!({"release": {}})).unwrap(), None);
+        let ci_install =
+            ci_declaration(&json!({"ci": {"bun": {"dirs": ["."], "ciInstall": true}}}))
+                .unwrap()
+                .unwrap();
+        assert_eq!(ci_install.bun.map(|bun| bun.ci_install), Some(true));
     }
 
     #[test]
@@ -767,6 +1023,10 @@ mod tests {
             (
                 json!({"ci": {"bun": {"dirs": ["."], "typecheck": "tsc"}}}),
                 "ci.bun.typecheck",
+            ),
+            (
+                json!({"ci": {"bun": {"dirs": ["."], "ciInstall": "true"}}}),
+                "ci.bun.ciInstall",
             ),
             (json!({"ci": {"go": {}}}), "ci.go"),
         ] {
@@ -899,5 +1159,72 @@ mod tests {
             serde_json::from_slice(&rewrite(Some(&current), pin(), None).unwrap()).unwrap();
         assert_eq!(kept["adrMigratedThrough"], 3);
         assert_eq!(kept["adrSanitizedNumbers"], json!([2]));
+    }
+
+    #[test]
+    fn release_notes_is_read_from_the_release_declaration() {
+        let notes = |notes: Value| declaration(&json!({"release": {"notes": notes}}));
+        assert_eq!(
+            declaration(&json!({"release": {"versionFiles": []}}))
+                .unwrap()
+                .release_notes,
+            None
+        );
+        assert_eq!(
+            notes(json!({"mode": "ai", "fallback": "changelog-additions", "audience": "public"}))
+                .unwrap()
+                .release_notes,
+            Some(ReleaseNotes {
+                mode: NotesMode::Ai {
+                    fallback: NotesSource::ChangelogAdditions,
+                    audience: NotesAudience::Public,
+                },
+                language: NotesLanguage::Ja,
+            })
+        );
+        assert_eq!(
+            notes(json!({"mode": "changelog-section", "language": "en"}))
+                .unwrap()
+                .release_notes,
+            Some(ReleaseNotes {
+                mode: NotesMode::Changelog(NotesSource::ChangelogSection),
+                language: NotesLanguage::En,
+            })
+        );
+    }
+
+    #[test]
+    fn release_notes_refuses_missing_and_unknown_values() {
+        let notes = |notes: Value| declaration(&json!({"release": {"notes": notes}}));
+        // ai の必須欄が無いときは、欠けた欄の名前を報告する。
+        for (declared, missing) in [
+            (
+                json!({"mode": "ai", "audience": "private"}),
+                "release.notes.fallback",
+            ),
+            (
+                json!({"mode": "ai", "fallback": "changelog-section"}),
+                "release.notes.audience",
+            ),
+        ] {
+            let error = notes(declared.clone()).unwrap_err();
+            assert!(error.contains(missing), "{declared}: {error}");
+        }
+        for declared in [
+            json!("ai"),
+            json!({}),
+            json!({"mode": "summary"}),
+            json!({"mode": "ai", "fallback": "ai", "audience": "private"}),
+            json!({"mode": "ai", "fallback": "changelog-section", "audience": "internal"}),
+            json!({"mode": "changelog-additions", "language": "fr"}),
+            json!({"mode": "changelog-additions", "language": ""}),
+            json!({"mode": "changelog-additions", "fallback": "changelog-section"}),
+            json!({"mode": "changelog-additions", "audience": "private"}),
+            // model 名・鍵の参照・辞書は宣言に書かせない。
+            json!({"mode": "changelog-additions", "model": "claude-haiku"}),
+            json!({"mode": "ai", "fallback": "changelog-section", "audience": "private", "anthropic_api_key_ref": "op://x"}),
+        ] {
+            assert!(notes(declared.clone()).is_err(), "{declared}");
+        }
     }
 }

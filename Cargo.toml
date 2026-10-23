@@ -3,13 +3,13 @@
 [workspace]
 resolver = "2"
 # glob にしない（`version_files.rs` が拒み、版の bump が使えなくなる）。
-members = ["crates/develop-tools-core", "crates/develop-release", "crates/develop-adr", "crates/island-docs", "crates/island-secrets", "crates/develop-staged"]
+members = ["crates/develop-tools-core", "crates/develop-release", "crates/develop-adr", "crates/island-docs", "crates/island-secrets", "crates/develop-staged", "crates/island-llm"]
 
 # [workspace.dependencies]・[workspace.lints]・[profile.*] は tools/Cargo.toml と同じ値にする
 # （tools/develop-health/tests/toolchain_contracts.rs が照合する）。tools の build では feature が
 # 統合されるので、食い違っても tools 側では気付けず、公開の build でだけ挙動が変わる。
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -25,6 +25,9 @@ toml = "1"
 # `preserve_order` は必須。`--json` の出力の順序は読む側から見える契約。
 serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
+# HTTP は blocking の ureq（tools/Cargo.toml と同じ選定）。
+ureq = "3"
+time = { version = "0.3", features = ["formatting"] }
 
 [workspace.lints.clippy]
 dbg_macro = "warn"

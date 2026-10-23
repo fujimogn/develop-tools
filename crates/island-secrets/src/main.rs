@@ -24,8 +24,7 @@ fn help() -> String {
     .examples(&[
         "develop-secrets --refs secrets.json --check",
         "develop-secrets --refs secrets.json --write .env",
-        "develop-secrets --declaration .develop-secrets.jsonc",
-        "develop-secrets --declaration config/develop-secrets.jsonc --repo-root .",
+        "develop-secrets --declaration .config/develop-secrets.jsonc --repo-root .",
         r#"printf '%s' "$TOKEN" | develop-secrets --put-env .env TOKEN"#,
         "cat token.json | develop-secrets --put-file credentials/refresh-token.json",
     ])

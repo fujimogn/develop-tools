@@ -321,19 +321,29 @@ fn staged_path_deleted(repo: &Path, path: &str, index_file: Option<&Path>) -> bo
 }
 
 /// repo の ADR 番号の契約。staged の検査なので、作業ツリーではなく index の
-/// `.develop-tools.json` を読む。宣言が無い・契約の欄が無い・壊れているときは失敗する。
+/// 版固定 file を読む（置き場も index の中で決める）。宣言が無い・契約の欄が無い・壊れているときは失敗する。
 pub fn adr_contract(repo: &Path, index_file: Option<&Path>) -> Result<AdrContract, String> {
-    let path = develop_tools_manifest::PATH;
     let listed = git_stdout_with_index(
         repo,
         index_file,
-        &["ls-files", "-z", "--cached", "--", path],
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--",
+            develop_tools_manifest::PATH,
+            develop_tools_manifest::LEGACY_PATH,
+        ],
     )?;
-    if listed.is_empty() {
+    let Some(path) =
+        develop_tools_manifest::locate_in(|path| Ok(listed.split('\0').any(|name| name == path)))?
+    else {
         return Err(format!(
-            "{path} が index に無い（ADR 番号の契約の欄は配布の道具が書く。手で足さない）"
+            "{}（移行中は旧い {}）が index に無い（ADR 番号の契約の欄は配布の道具が書く。手で足さない）",
+            develop_tools_manifest::PATH,
+            develop_tools_manifest::LEGACY_PATH
         ));
-    }
+    };
     let output = git_output_with_index(repo, index_file, &["show", &format!(":{path}")])?;
     if !output.status.success() {
         return Err(format!(
@@ -480,6 +490,28 @@ mod tests {
         )
         .unwrap();
         assert!(adr_contract(&repo, None).is_err());
+    }
+
+    #[test]
+    fn contract_is_located_in_the_index() {
+        let (_dir, repo) = repo_with_index_declaration(None);
+        fs::create_dir(repo.join(".config")).unwrap();
+        fs::write(
+            repo.join(develop_tools_manifest::PATH),
+            r#"{"adrMigratedThrough":9}"#,
+        )
+        .unwrap();
+        git_ok(&repo, &["add", develop_tools_manifest::PATH]);
+        // 作業ツリーにだけある旧い置き場は index の判定に入らない。
+        fs::write(
+            repo.join(develop_tools_manifest::LEGACY_PATH),
+            r#"{"adrMigratedThrough":30}"#,
+        )
+        .unwrap();
+        assert_eq!(adr_contract(&repo, None).unwrap().migrated_through, Some(9));
+        git_ok(&repo, &["add", develop_tools_manifest::LEGACY_PATH]);
+        let error = adr_contract(&repo, None).unwrap_err();
+        assert!(error.starts_with("manifest_duplicated"), "{error}");
     }
 
     #[test]

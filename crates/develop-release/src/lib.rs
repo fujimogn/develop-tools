@@ -4,11 +4,12 @@
 //! 版数の役目は配布物の同一性を言えることにある。開発機が複数あり、`bin/` の binary は
 //! git 管理外なので、**どの機がどの版の道具を持っているかは版数でしか言えない**。
 //!
-//! 版 file は repo の `.develop-tools.json` に宣言する。
+//! 版 file は repo の版固定 file（`.config/develop-tools.json`、移行中は旧い `.develop-tools.json`）に宣言する。
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+pub mod ai_check;
 pub mod ci_runs;
 pub mod preflight;
 pub mod push;
@@ -35,7 +36,7 @@ pub fn current_repo_root() -> Result<Option<PathBuf>, String> {
     }
 }
 
-/// 配布側の既存呼出点向け。版は `.develop-tools.json` の `release.versionFiles` だけから読む。
+/// 配布側の既存呼出点向け。版は版固定 file の `release.versionFiles` だけから読む。
 pub fn read_workspace_version(root: &Path) -> Result<Version, String> {
     Ok(version_files::VersionFiles::load(root)?.current())
 }
@@ -142,8 +143,8 @@ impl std::fmt::Display for Version {
 impl std::str::FromStr for Version {
     type Err = String;
 
-    /// **前ゼロ・余分な節を弾く。** `0.1.00` や `0.1.2.3` を通すと、書き戻した文字列と
-    /// tag 名が食い違って guard がすり抜ける。
+    /// **前ゼロ・数字以外（`+1` のような符号を含む）・余分な節を弾く。** `0.1.00` や `0.1.2.3` を
+    /// 通すと、書き戻した文字列と tag 名が食い違って guard がすり抜ける。
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = raw.split('.').collect();
         if parts.len() != 3 {
@@ -151,7 +152,10 @@ impl std::str::FromStr for Version {
         }
         let mut nums = [0u64; 3];
         for (slot, part) in nums.iter_mut().zip(parts) {
-            if part.is_empty() || (part.len() > 1 && part.starts_with('0')) {
+            if part.is_empty()
+                || !part.bytes().all(|byte| byte.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+            {
                 return Err(format!("semver ではありません: {raw}"));
             }
             *slot = part
@@ -251,35 +255,56 @@ pub fn next_version(current: Version, bump: Bump) -> Result<Version, String> {
 /// CHANGELOG のトップレベル項目の行頭と、太字の題の終わり。刻印を書く側と読む側で共有する。
 pub(crate) const CHANGELOG_TITLE_PREFIX: &str = "- **";
 pub(crate) const CHANGELOG_TITLE_END: &str = "**";
-const CHANGELOG_UNRELEASED: &str = "、未リリース）";
-/// 刻印の末尾（「（YYYY-MM-DD、v<版> で prod 反映）」の版より後ろ）。release notes はこれで刻印済みを見分ける。
+const CHANGELOG_UNRELEASED_SUFFIX: &str = "未リリース）";
+/// 刻印の末尾（「（…、v<版> で prod 反映）」の版より後ろ）。release notes はこれで刻印済みを見分ける。
 pub(crate) const CHANGELOG_RELEASED_SUFFIX: &str = " で prod 反映）";
-/// 刻印の版の前（「（YYYY-MM-DD、v<版> で prod 反映）」の日付と版の間）。
-pub(crate) const CHANGELOG_RELEASED_VERSION_PREFIX: &str = "、v";
 
-/// 題の末尾が島の標準の「（YYYY-MM-DD、未リリース）」なら、その「、未リリース）」の位置。
-fn dated_unreleased_suffix(title: &str) -> Option<usize> {
-    let head = title.strip_suffix(CHANGELOG_UNRELEASED)?;
-    let date = head.get(head.len().checked_sub(10)?..)?;
-    let is_date = date.bytes().enumerate().all(|(index, byte)| match index {
-        4 | 7 => byte == b'-',
-        _ => byte.is_ascii_digit(),
-    });
-    (is_date && head[..head.len() - 10].ends_with('（')).then_some(head.len())
+/// 日付の文字列が `YYYY-MM-DD` 形式かを返す。
+pub(crate) fn is_date(text: &str) -> bool {
+    text.len() == 10
+        && text.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 7 => byte == b'-',
+            _ => byte.is_ascii_digit(),
+        })
 }
 
-/// CHANGELOG のトップレベル項目（行頭 `- **`）の太字の題の末尾「（YYYY-MM-DD、未リリース）」を
-/// 「（YYYY-MM-DD、v<版> で prod 反映）」にし、書き換えた件数を返す。入れ子・本文・見出しと、
-/// 日付の無い括弧は触らない。
+/// 題の末尾が「（未リリース）」または「…、未リリース）」なら、置換対象となる「未リリース）」の開始位置を返す。
+/// 先行文字が「（」または「、」であること、かつ開き括弧「（」が存在することを検査する。
+pub(crate) fn unreleased_suffix_offset(title: &str) -> Option<usize> {
+    let head = title.strip_suffix(CHANGELOG_UNRELEASED_SUFFIX)?;
+    if (head.ends_with('（') || head.ends_with('、')) && head.contains('（') {
+        Some(head.len())
+    } else {
+        None
+    }
+}
+
+/// 題の末尾が「（v<版> で prod 反映）」または「…、v<版> で prod 反映）」なら、その版の文字列を返す。
+pub(crate) fn released_version_suffix(title: &str) -> Option<&str> {
+    let head = title.strip_suffix(CHANGELOG_RELEASED_SUFFIX)?;
+    let (prefix, version) = head.rsplit_once('v')?;
+    if (prefix.ends_with('（') || prefix.ends_with('、'))
+        && prefix.contains('（')
+        && version.parse::<Version>().is_ok()
+    {
+        Some(version)
+    } else {
+        None
+    }
+}
+
+/// CHANGELOG のトップレベル項目（行頭 `- **`）の太字の題の末尾「、未リリース）」または「（未リリース）」を
+/// 「v<版> で prod 反映）」に置き換え、前の補足（日付・段の説明など）はそのまま残す。
+/// 書き換えた件数を返す。入れ子・本文・見出しと、題の途中の括弧は触らない。
 pub fn stamp_changelog(text: &str, version: Version) -> (String, usize) {
     let mut count = 0;
     let mut out = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
         let stamped = line.strip_prefix(CHANGELOG_TITLE_PREFIX).and_then(|rest| {
             let title_end = rest.find(CHANGELOG_TITLE_END)?;
-            let suffix = dated_unreleased_suffix(&rest[..title_end])?;
+            let suffix = unreleased_suffix_offset(&rest[..title_end])?;
             Some(format!(
-                "{CHANGELOG_TITLE_PREFIX}{}{CHANGELOG_RELEASED_VERSION_PREFIX}{version}{CHANGELOG_RELEASED_SUFFIX}{}",
+                "{CHANGELOG_TITLE_PREFIX}{}v{version}{CHANGELOG_RELEASED_SUFFIX}{}",
                 &rest[..suffix],
                 &rest[title_end..]
             ))
@@ -370,7 +395,7 @@ mod tests {
         assert!(
             read_workspace_version(dir.path())
                 .unwrap_err()
-                .contains(".develop-tools.json")
+                .contains(develop_tools_core::develop_tools_manifest::PATH)
         );
         std::fs::write(
             dir.path().join(".develop-tools.json"),
@@ -422,7 +447,9 @@ mod tests {
     /// 前ゼロ・節の過不足を通すと、書き戻した文字列と tag 名が食い違って guard がすり抜ける。
     #[test]
     fn a_malformed_version_is_rejected() {
-        for raw in ["0.1.00", "1.2", "1.2.3.4", "v1.2.3", "1.2.x", "", "1..3"] {
+        for raw in [
+            "0.1.00", "1.2", "1.2.3.4", "v1.2.3", "1.2.x", "", "1..3", "+1.2.3", "1.+2.3",
+        ] {
             assert!(raw.parse::<Version>().is_err(), "通ってはならない: {raw}");
         }
     }

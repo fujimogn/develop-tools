@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-10-23
+
+### Added
+
+- Look for the version-pin manifest at `.config/develop-tools.json` first and at `.develop-tools.json` second. `resolve`, `release`, `check-release-version`, the staged ADR check and `develop-docs-check --check-local-version` share this lookup, and each one stops when both files exist (for `release` and `check-release-version`, a broken symlink counts as present). `develop-docs-check --check-local-version` exits 2 in that case and stays silent on other read errors, as before.
+- `develop-secrets` documents `.config/develop-secrets.jsonc` as the default declaration path. Tools that search a repository for the declaration try `.config/develop-secrets.jsonc`, then `.develop-secrets.jsonc`, then `config/develop-secrets.jsonc`, and fail when more than one exists.
+- `release.notes` in the manifest selects how `release` writes the Release body: `changelog-additions`, `changelog-section` (the dated section of the version; a missing, duplicated or empty section stops `release` before it writes anything) or `ai` (one summary request with a `fallback`). With `release.notes`, `release` writes the body into an annotated tag, prints the body and its source, and accepts `--no-ai` to skip the request. See the README for the fields and the environment settings.
+- With `mode: "ai"`, the items are scrubbed of dates, commit SHAs and URLs and numbered before the request, and the summary is used only when it passes the output checks (forbidden terms, internal names for `audience: "public"`, URLs, tokens and item references outside the input). Items the summary leaves out are pointed to through a compare link at the end. Every request, including a timed-out or truncated one, writes one row to the usage ledger.
+- `release check` validates the `release.notes` declaration and, in a repository that declares `mode: "ai"`, reports which environment settings are present.
+- Ship `release-notes` in the Release archives.
+- The manifest accepts `ci.bun.ciInstall`, so a Bun CI job can run the repository's `ci:install` script instead of the default install.
+- The manifest accepts a list of paths in `platformCheck.cargoWorkspace` and a nextest filterset in `platformCheck.runIgnored`, matching the platform check workflow.
+
+### Changed
+
+- The `changelogStamp` of `release` also stamps `（未リリース）` without a date and keeps any note before `、未リリース）`, replacing only that suffix with `v<version> で prod 反映）`.
+
+### Fixed
+
+- When `release` has moved the main branch but cannot create the tag, it stops, says which refs it moved, and prints the command that creates the tag (with the body, for an annotated tag) before `release push`.
+- With `mode: "changelog-section"`, `release` keeps leading whitespace in the version section and reports a missing `CHANGELOG.md` with its own message.
+- Version parsing rejects signs and other non-digit characters (for example `+1.2.3`), and reading release notes from `CHANGELOG.md` recognizes a code fence only from a run of its opening character.
+
 ## [0.6.1] - 2026-10-21
 
 The `v0.6.0` tag has no Release: its Test run failed and its Release workflow did not start. 0.6.1 is the first release with prebuilt archives.

@@ -6,6 +6,7 @@
 //! - [`strip_git_env`] — 継いだ `GIT_*` を落とす。誤ると別 repo の `.git` を書き換える。
 //! - [`managed_block`] — 配布と検査が同じ marker 規則で管理区画を読む。
 //! - [`github_repo`] — GitHub の `owner/repo` の解析。host の部分一致を残すと別 repo を指す。
+//! - [`bounded_name`] — 名前を独立した語として含むか。検査と AI 出力の照合が同じ規則を使う。
 
 use std::path::Path;
 use std::process::Command;
@@ -13,13 +14,14 @@ use std::process::Command;
 mod github_repo;
 pub use github_repo::github_repo;
 
+pub mod bounded_name;
 pub mod cli_help;
 pub mod develop_tools_manifest;
 pub mod managed_block;
 #[cfg(test)]
 mod managed_block_tests;
 
-/// Release のみが進める branch。日常統合先は repo の `.develop-tools.json` の `integrationBranch` から読む。
+/// Release のみが進める branch。日常統合先は repo の版固定 file の `integrationBranch` から読む。
 pub const RELEASE_BRANCH: &str = "main";
 
 pub mod freshness {
@@ -77,20 +79,19 @@ pub mod freshness {
     }
 }
 
-/// Release の日常統合先。repo の `.develop-tools.json` だけを読み、file が無ければ失敗する
+/// Release の日常統合先。repo の版固定 file だけを読み、file が無ければ失敗する
 /// （置き忘れた repo で main から版を上げないため）。欄が無ければ main。
 pub fn release_integration_branch(repo_root: &Path) -> Result<Option<String>, String> {
-    let pin = repo_root.join(develop_tools_manifest::PATH);
-    let source = match std::fs::read_to_string(&pin) {
-        Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(format!(
-                "{} がありません（日常統合先 integrationBranch を宣言してください。main だけで運用するなら {{}} を置けば main 扱い）",
-                pin.display()
-            ));
-        }
-        Err(error) => return Err(format!("{}: {error}", pin.display())),
+    let Some(relative) = develop_tools_manifest::locate(repo_root)? else {
+        return Err(format!(
+            "{}（移行中は旧い {}）がありません（日常統合先 integrationBranch を宣言してください。main だけで運用するなら {{}} を置けば main 扱い）",
+            repo_root.join(develop_tools_manifest::PATH).display(),
+            develop_tools_manifest::LEGACY_PATH
+        ));
     };
+    let pin = repo_root.join(relative);
+    let source =
+        std::fs::read_to_string(&pin).map_err(|error| format!("{}: {error}", pin.display()))?;
     let value: serde_json::Value =
         serde_json::from_str(&source).map_err(|error| format!("{}: {error}", pin.display()))?;
     let declared = develop_tools_manifest::declaration(&value)
@@ -167,7 +168,25 @@ mod tests {
     fn release_branch_fails_without_repo_pin() {
         let dir = tempfile::tempdir().unwrap();
         let error = release_integration_branch(dir.path()).unwrap_err();
-        assert!(error.contains(".develop-tools.json"), "{error}");
+        assert!(error.contains(develop_tools_manifest::PATH), "{error}");
+    }
+
+    #[test]
+    fn release_branch_reads_the_moved_pin_and_stops_on_both() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".config")).unwrap();
+        std::fs::write(
+            dir.path().join(develop_tools_manifest::PATH),
+            r#"{"integrationBranch":"develop"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            release_integration_branch(dir.path()).unwrap().as_deref(),
+            Some("develop")
+        );
+        std::fs::write(dir.path().join(develop_tools_manifest::LEGACY_PATH), "{}").unwrap();
+        let error = release_integration_branch(dir.path()).unwrap_err();
+        assert!(error.starts_with("manifest_duplicated"), "{error}");
     }
 
     /// 落とし忘れると別 repo の `.git` を書き換える。組み立てた時点で消えていること。

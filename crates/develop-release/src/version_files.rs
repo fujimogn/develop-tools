@@ -277,18 +277,20 @@ impl VersionFiles {
     }
 
     fn load_from(source: Source) -> Result<Self, String> {
-        let raw = source.read(develop_tools_manifest::PATH)?;
+        // 作業木か commit の tree か、同じ読み元の中で置き場を決める。作業木は共有の探索と同じ判定
+        // （壊れた symlink も在るとみなす）にする。
+        let located = match source {
+            Source::Tree(root) => develop_tools_manifest::locate(root)?,
+            Source::Commit { .. } => develop_tools_manifest::locate_in(|path| source.exists(path))?,
+        };
+        let manifest = located.unwrap_or(develop_tools_manifest::PATH);
+        let raw = source.read(manifest)?;
         let value: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|err| format!("{}: JSON が不正です: {err}", develop_tools_manifest::PATH))?;
+            .map_err(|err| format!("{manifest}: JSON が不正です: {err}"))?;
         let declared = develop_tools_manifest::declaration(&value)
-            .map_err(|err| format!("{}: {err}", develop_tools_manifest::PATH))?;
+            .map_err(|err| format!("{manifest}: {err}"))?;
         let release: Release = serde_json::from_value(declared.release.unwrap_or_default())
-            .map_err(|err| {
-                format!(
-                    "{}: release が不正です: {err}",
-                    develop_tools_manifest::PATH
-                )
-            })?;
+            .map_err(|err| format!("{manifest}: release が不正です: {err}"))?;
         if release.version_files.is_empty() {
             return Err("release.versionFiles が空です".to_owned());
         }
@@ -297,7 +299,7 @@ impl VersionFiles {
         Ok(files)
     }
 
-    /// `.develop-tools.json` を読まず、引数の宣言から読む。CHANGELOG は刻印しない。
+    /// 版固定 file を読まず、引数の宣言から読む。CHANGELOG は刻印しない。
     pub fn from_entries(root: &Path, entries: Vec<Entry>) -> Result<Self, String> {
         Self::from_source(Source::Tree(root), entries)
     }
@@ -724,6 +726,84 @@ mod tests {
                 .unwrap()
                 .contains("preflightWorkflow")
         );
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let out = develop_tools_core::git(root).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// 作業木と commit の tree は、それぞれの中で版固定 file の置き場を決める。
+    #[test]
+    fn manifest_is_located_within_each_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("package.json"), r#"{"version":"0.2.0"}"#).unwrap();
+        std::fs::create_dir(root.join(".config")).unwrap();
+        let manifest =
+            r#"{"release":{"versionFiles":[{"path":"package.json","kind":"package-json"}]}}"#;
+        std::fs::write(root.join(develop_tools_manifest::PATH), manifest).unwrap();
+        git(root, &["add", "-A"]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "moved",
+            ],
+        );
+        let moved = git(root, &["rev-parse", "HEAD"]);
+        // 作業木だけを旧い置き場へ戻しても、commit の tree は移した置き場を読む。
+        std::fs::rename(
+            root.join(develop_tools_manifest::PATH),
+            root.join(develop_tools_manifest::LEGACY_PATH),
+        )
+        .unwrap();
+        assert_eq!(VersionFiles::load(root).unwrap().current, version(0, 2, 0));
+        assert_eq!(
+            VersionFiles::load_at(root, &moved).unwrap().current,
+            version(0, 2, 0)
+        );
+        std::fs::write(root.join(develop_tools_manifest::PATH), manifest).unwrap();
+        let both = VersionFiles::load(root).err().unwrap();
+        assert!(both.starts_with("manifest_duplicated"), "{both}");
+        #[cfg(unix)]
+        {
+            // 新しい置き場が壊れた symlink でも、作業木では在るとみなして止める（共有の探索と同じ判定）。
+            std::fs::remove_file(root.join(develop_tools_manifest::PATH)).unwrap();
+            std::os::unix::fs::symlink("missing.json", root.join(develop_tools_manifest::PATH))
+                .unwrap();
+            let dangling = VersionFiles::load(root).err().unwrap();
+            assert!(dangling.starts_with("manifest_duplicated"), "{dangling}");
+            std::fs::remove_file(root.join(develop_tools_manifest::PATH)).unwrap();
+            std::fs::write(root.join(develop_tools_manifest::PATH), manifest).unwrap();
+        }
+        git(root, &["add", "-A"]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "both",
+            ],
+        );
+        let both = VersionFiles::load_at(root, "HEAD").err().unwrap();
+        assert!(both.starts_with("manifest_duplicated"), "{both}");
     }
 
     fn cli_workspace(root: &Path) -> VersionFiles {

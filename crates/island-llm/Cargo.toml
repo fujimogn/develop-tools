@@ -1,0 +1,24 @@
+[package]
+name = "island-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Messages API を用途の表で呼ぶ核（用途の表・鍵の解決・usage 台帳・出力形）"
+license.workspace = true
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+island-secrets = { path = "../island-secrets" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+ureq = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

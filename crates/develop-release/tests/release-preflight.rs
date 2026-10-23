@@ -180,12 +180,18 @@ fn run_check(repo: &Repo, mode: &str) -> Output {
         .arg("check")
         .current_dir(&repo.root)
         .env("PATH", &repo.path)
+        .env("HOME", home(repo))
         .env("RELEASE_CHECK_TEST_LOG", &repo.log)
         .env("RELEASE_CHECK_TEST_GH_MODE", mode)
         .env("GIT_DIR", "/nowhere/.git")
         .env("GIT_WORK_TREE", "/nowhere")
         .output()
         .unwrap()
+}
+
+/// 環境側の設定を置く HOME。利用者の本物の設定を読まないよう、test ごとに分ける。
+fn home(repo: &Repo) -> PathBuf {
+    repo.root.parent().unwrap().join("home")
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -428,4 +434,94 @@ fn release_check_does_not_dispatch_without_gh_auth() {
         "{:?}",
         log_lines(&repo)
     );
+}
+
+const AI_DECLARED: &str = r#"{"integrationBranch":"develop","release":{"preflightWorkflow":"ci.yml","notes":{"mode":"ai","fallback":"changelog-additions","audience":"public"}}}"#;
+
+#[test]
+fn release_check_reports_missing_llm_settings_for_an_ai_repo() {
+    let repo = setup(AI_DECLARED);
+    let output = run_check(&repo, "retry");
+    let stdout = text(&output.stdout);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert!(
+        stdout.contains(".config/develop-tools/llm.json"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("無し"), "{stdout}");
+    assert!(stdout.contains("bin/install-tools"), "{stdout}");
+}
+
+#[test]
+fn release_check_reports_each_llm_settings_field_for_an_ai_repo() {
+    let repo = setup(AI_DECLARED);
+    let settings = home(&repo).join(".config/develop-tools/llm.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"anthropic_api_key_ref":"op://vault/item/field","forbidden_terms":["司令塔"],"usage_ledger":"/state/usage.jsonl"}"#,
+    )
+    .unwrap();
+    let output = run_check(&repo, "retry");
+    let stdout = text(&output.stdout);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let field = |name: &str| {
+        stdout
+            .lines()
+            .find(|line| line.contains(name))
+            .unwrap_or_else(|| panic!("{name}: {stdout}"))
+            .to_owned()
+    };
+    assert!(field("anthropic_api_key_ref").contains("有り"), "{stdout}");
+    assert!(field("forbidden_terms").contains("有り"), "{stdout}");
+    assert!(field("internal_names").contains("無し"), "{stdout}");
+    assert!(field("usage_ledger").contains("有り"), "{stdout}");
+    assert!(stdout.contains("bin/install-tools"), "{stdout}");
+    assert!(
+        !stdout.contains("op://vault"),
+        "鍵の参照の値は出さない: {stdout}"
+    );
+}
+
+/// 欄の無い古い設定では台帳に書けず送らないので、欠けた欄として報告する。
+#[test]
+fn release_check_reports_a_settings_file_without_usage_ledger_as_incomplete() {
+    let repo = setup(AI_DECLARED);
+    let settings = home(&repo).join(".config/develop-tools/llm.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"anthropic_api_key_ref":"op://vault/item/field","forbidden_terms":["司令塔"],"internal_names":["inner"]}"#,
+    )
+    .unwrap();
+    let output = run_check(&repo, "retry");
+    let stdout = text(&output.stdout);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let ledger = stdout
+        .lines()
+        .find(|line| line.contains("usage_ledger"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(ledger.contains("無し"), "{stdout}");
+    assert!(stdout.contains("bin/install-tools"), "{stdout}");
+}
+
+#[test]
+fn release_check_does_not_report_llm_settings_without_ai_notes() {
+    let repo = setup(DECLARED);
+    let output = run_check(&repo, "retry");
+    let stdout = text(&output.stdout);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert!(!stdout.contains("llm.json"), "{stdout}");
+}
+
+#[test]
+fn release_check_refuses_an_ai_declaration_without_audience() {
+    let repo = setup(
+        r#"{"integrationBranch":"develop","release":{"preflightWorkflow":"ci.yml","notes":{"mode":"ai","fallback":"changelog-additions"}}}"#,
+    );
+    let output = run_check(&repo, "retry");
+    let stderr = text(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("release.notes.audience"), "{stderr}");
+    assert!(log_lines(&repo).is_empty(), "{:?}", log_lines(&repo));
 }

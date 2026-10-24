@@ -2,7 +2,7 @@ use develop_release::release_notes::{
     AiRuntime, BodySource, DeclaredNotes, NotesPlan, ReleaseBody, annotate_tag, extract_release,
     prepare_notes, release_body,
 };
-use develop_tools_core::develop_tools_manifest::NotesSource;
+use develop_tools_core::develop_tools_manifest::{NotesLanguage, NotesSource};
 use island_llm::settings::Audience;
 use island_llm::transport::{ApiRequest, ApiResponse, FailureKind, Transport, TransportError};
 use std::cell::Cell;
@@ -1206,7 +1206,15 @@ fn release_fails_when_the_declaration_has_no_version_files() {
         cargo
     );
     assert!(git(root, &["tag", "-l"]).is_empty());
-    assert!(!check_version(root).status.success());
+    // 版を持たない repo の push は止めず、飛ばした理由を 1 行出す。
+    let checked = check_version(root);
+    let checked_stderr = String::from_utf8_lossy(&checked.stderr);
+    assert!(checked.status.success(), "{checked_stderr}");
+    assert_eq!(checked_stderr.lines().count(), 1, "{checked_stderr}");
+    assert!(
+        checked_stderr.contains("release.versionFiles"),
+        "{checked_stderr}"
+    );
 }
 
 #[test]
@@ -2446,6 +2454,7 @@ fn ai_input_for_a_section_fallback_is_the_section_items() {
             audience: Audience::Public,
         },
         source: NotesSource::ChangelogSection,
+        language: NotesLanguage::Ja,
     };
     let prepared = prepare_notes(root, declared, "v1.2.4").unwrap();
     let extract = prepared.extract(root, "HEAD").unwrap();

@@ -1,8 +1,9 @@
 use develop_release::ai_check::{Checks, DICTIONARY_MISSING, check_output, prepare};
 use develop_release::release_notes::{
-    ChangelogSection, ReleaseExtract, extract_changelog_section, extract_release,
-    numbered_ai_input, scrub_for_ai,
+    ChangelogSection, ReleaseExtract, declared_notes, extract_changelog_section, extract_release,
+    numbered_ai_input, prepare_notes, scrub_for_ai,
 };
+use develop_tools_core::develop_tools_manifest::NotesLanguage;
 use island_llm::settings::{Audience, Settings};
 use std::path::Path;
 use std::process::Command;
@@ -479,6 +480,7 @@ fn extract() -> ReleaseExtract {
             "- **三つ目**".to_owned(),
         ],
         section: None,
+        language: NotesLanguage::Ja,
     }
 }
 
@@ -776,4 +778,52 @@ fn a_section_extract_renders_the_compare_line_and_the_section_body() {
         extract.render(),
         "変更範囲: [v0.1.0...v0.2.0](https://github.com/example/project/compare/v0.1.0...v0.2.0)\n\nSummary.\n\n- Fix: **A** fixed.\n"
     );
+}
+
+/// 宣言を読んで作る本文。`v0.1.0` の後に宣言と CHANGELOG を commit し、`v0.2.0` の本文にする。
+fn declared_render(notes: &str, changelog: &str) -> String {
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["tag", "v0.1.0"]);
+    std::fs::write(
+        root.join(".develop-tools.json"),
+        format!("{{\"release\": {{\"notes\": {notes}}}}}\n"),
+    )
+    .unwrap();
+    git(root, &["add", ".develop-tools.json"]);
+    commit(root, changelog, "notes");
+    let declared = declared_notes(root).unwrap().unwrap();
+    let prepared = prepare_notes(root, declared, "v0.2.0").unwrap();
+    prepared.extract(root, "HEAD").unwrap().render()
+}
+
+#[test]
+fn the_compare_heading_follows_the_declared_language() {
+    let section = "# Changelog\n\n## 0.2.0 (2026-10-23)\n\n- Fixed **A**.\n";
+    let additions = "# Changelog\n\n## 2026-09\n- **以前の項目**\n- **New item**\n";
+    let link = "[v0.1.0...v0.2.0](https://github.com/example/project/compare/v0.1.0...v0.2.0)";
+    for (notes, changelog, expected) in [
+        (
+            r#"{"mode":"changelog-section","language":"en"}"#,
+            section,
+            format!("Compare: {link}\n\n- Fixed **A**.\n"),
+        ),
+        (
+            r#"{"mode":"changelog-additions","language":"en"}"#,
+            additions,
+            format!("Compare: {link}\n\n- **New item**\n"),
+        ),
+        (
+            r#"{"mode":"changelog-section","language":"ja"}"#,
+            section,
+            format!("変更範囲: {link}\n\n- Fixed **A**.\n"),
+        ),
+        (
+            r#"{"mode":"changelog-section"}"#,
+            section,
+            format!("変更範囲: {link}\n\n- Fixed **A**.\n"),
+        ),
+    ] {
+        assert_eq!(declared_render(notes, changelog), expected, "{notes}");
+    }
 }

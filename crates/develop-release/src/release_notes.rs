@@ -188,6 +188,8 @@ pub struct ReleaseExtract {
     pub items: Vec<String>,
     /// 版の節の抽出（`changelog-section`）のときの節の中身。`items` はその節の箇条。
     pub section: Option<String>,
+    /// 本文の言語。compare の行の見出しを決める。宣言が無いときは日本語。
+    pub language: NotesLanguage,
 }
 
 impl ReleaseExtract {
@@ -204,7 +206,11 @@ impl ReleaseExtract {
 
     /// 前 tag から今回の tag への compare の行。
     pub fn compare_line(&self) -> String {
-        format!("変更範囲: {}", self.compare_link())
+        let heading = match self.language {
+            NotesLanguage::Ja => "変更範囲",
+            NotesLanguage::En => "Compare",
+        };
+        format!("{heading}: {}", self.compare_link())
     }
 
     /// 抽出をそのまま並べた本文（`changelog-additions` は項目、`changelog-section` は節の中身）。
@@ -250,6 +256,7 @@ pub fn extract_from(
     base: &ReleaseBase,
     end: &str,
     tag: &str,
+    language: NotesLanguage,
 ) -> Result<ReleaseExtract, String> {
     let ReleaseBase { previous, repo } = base;
     let diff = git(
@@ -268,6 +275,7 @@ pub fn extract_from(
         tag: tag.to_owned(),
         repo: repo.clone(),
         section: None,
+        language,
     })
 }
 
@@ -291,7 +299,7 @@ pub fn extract_release(
         &["rev-parse", "--verify", &format!("{end}^{{commit}}")],
     )?;
     let base = resolve_base(root, &format!("{end}^"), repo_arg)?;
-    extract_from(root, &base, &end, tag)
+    extract_from(root, &base, &end, tag, NotesLanguage::Ja)
 }
 
 /// 既存の tag の本文。tag の commit を終点に `extract_release` を使う。
@@ -659,6 +667,7 @@ impl NotesPlan {
 pub struct DeclaredNotes {
     pub plan: NotesPlan,
     pub source: NotesSource,
+    pub language: NotesLanguage,
 }
 
 /// repo の `release.notes` の宣言。無ければ `None`（`release` は軽量 tag を保つ）。
@@ -675,6 +684,7 @@ pub fn declared_notes(root: &Path) -> Result<Option<DeclaredNotes>, String> {
     Ok(Some(DeclaredNotes {
         plan: NotesPlan::from_declaration(&notes)?,
         source,
+        language: notes.language,
     }))
 }
 
@@ -714,7 +724,7 @@ impl PreparedNotes {
     /// 終点の commit の CHANGELOG から抽出する。
     pub fn extract(&self, root: &Path, end: &str) -> Result<ReleaseExtract, String> {
         if self.declared.source == NotesSource::ChangelogAdditions {
-            return extract_from(root, &self.base, end, &self.tag);
+            return extract_from(root, &self.base, end, &self.tag, self.declared.language);
         }
         let ChangelogSection { body, items } = self.section_at(root, end)?;
         let ReleaseBase { previous, repo } = &self.base;
@@ -724,6 +734,7 @@ impl PreparedNotes {
             repo: repo.clone(),
             items,
             section: Some(body),
+            language: self.declared.language,
         })
     }
 

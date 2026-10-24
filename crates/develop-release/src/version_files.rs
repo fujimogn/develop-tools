@@ -276,7 +276,30 @@ impl VersionFiles {
         Self::load_from(Source::Commit { root, commit })
     }
 
-    fn load_from(source: Source) -> Result<Self, String> {
+    /// 作業木の宣言が読めて、`release.versionFiles` の欄を持たないときだけ true。
+    /// `release` の他の欄は [`Self::load`] と同じ型で検証し、読めない・壊れた宣言は false にして
+    /// 失敗の報告は [`Self::load`] に任せる。
+    pub fn undeclared(root: &Path) -> bool {
+        match Self::declared_release(Source::Tree(root)) {
+            Ok((_, None)) => true,
+            Ok((_, Some(mut release))) => match release.as_object_mut() {
+                Some(object) if !object.contains_key("versionFiles") => {
+                    object.insert(
+                        "versionFiles".to_owned(),
+                        serde_json::Value::Array(Vec::new()),
+                    );
+                    serde_json::from_value::<Release>(release).is_ok()
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        }
+    }
+
+    /// 版固定 file の path と、その `release` の欄を読む。
+    fn declared_release(
+        source: Source,
+    ) -> Result<(&'static str, Option<serde_json::Value>), String> {
         // 作業木か commit の tree か、同じ読み元の中で置き場を決める。作業木は共有の探索と同じ判定
         // （壊れた symlink も在るとみなす）にする。
         let located = match source {
@@ -289,7 +312,12 @@ impl VersionFiles {
             .map_err(|err| format!("{manifest}: JSON が不正です: {err}"))?;
         let declared = develop_tools_manifest::declaration(&value)
             .map_err(|err| format!("{manifest}: {err}"))?;
-        let release: Release = serde_json::from_value(declared.release.unwrap_or_default())
+        Ok((manifest, declared.release))
+    }
+
+    fn load_from(source: Source) -> Result<Self, String> {
+        let (manifest, release) = Self::declared_release(source)?;
+        let release: Release = serde_json::from_value(release.unwrap_or_default())
             .map_err(|err| format!("{manifest}: release が不正です: {err}"))?;
         if release.version_files.is_empty() {
             return Err("release.versionFiles が空です".to_owned());

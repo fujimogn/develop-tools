@@ -1,6 +1,6 @@
 //! `release push`。統合先、main、tag の順に完全な refspec で push する。
 //!
-//! tag は、main の SHA の push を契機にした run がすべて成功してから出す。
+//! tag は、その commit の main push を契機にした run がすべて成功してから出す。
 //! skipped と neutral は成功にしない。design は成功の条件を「すべて成功」とだけ
 //! 書いており、この 2 つは取消とは分けて失敗として conclusion を報告する。
 
@@ -46,7 +46,12 @@ where
         .ok_or("版固定 file から日常統合先を決められません")?;
     let main_branch = develop_tools_core::RELEASE_BRANCH;
     let main_sha = rev_parse(root, &format!("refs/heads/{main_branch}"))?;
-    let tag = find_tag(root, &main_sha)?;
+    let main_only = integration == main_branch;
+    let tag = find_tag(root, &main_sha, main_only)?;
+    let tag_sha = rev_parse(root, &format!("refs/tags/{tag}^{{commit}}"))?;
+    if main_only {
+        require_ancestor(root, &tag_sha, &main_sha)?;
+    }
     let mut integration_ok = false;
 
     if integration != main_branch {
@@ -56,6 +61,10 @@ where
     }
     push_ref(root, "heads", main_branch)
         .map_err(|err| format!("{err}\n{}", stages(&integration, integration_ok, false)))?;
+    if main_only {
+        let remote_main = remote_sha(root, &format!("refs/heads/{main_branch}"))?;
+        require_ancestor(root, &tag_sha, &remote_main)?;
+    }
 
     if !tracked_workflow(root)? {
         println!("✓ tracked の workflow が無いので CI は待ちません");
@@ -68,7 +77,7 @@ where
 
     let report = stages(&integration, integration_ok, true);
     ensure_gh(root).map_err(|err| format!("{err}\n{report}"))?;
-    wait_for_ci(root, &main_sha, main_branch, &mut now, &mut sleep)
+    wait_for_ci(root, &tag_sha, main_branch, &mut now, &mut sleep)
         .map_err(|err| format!("{err}\n{report}"))?;
     push_ref(root, "tags", &tag).map_err(|err| format!("{err}\n{report}"))
 }
@@ -77,7 +86,7 @@ fn push_help() -> String {
     let examples = ["release push", "release push --tag-without-ci-check"];
     Help::new(
         "release push [--tag-without-ci-check]",
-        "Push the integration branch, then main, then the release tag. The tag is pushed only after every workflow run for that main push succeeds.",
+        "Push the integration branch, then main, then the release tag. The tag is pushed only after every main push workflow run for the tag commit succeeds. When main is the integration branch and its tip has no version tag, use the tag for the version declared at main; its commit must be an ancestor of origin/main.",
         "waits for GitHub Actions up to the tool's CI_WAIT constant",
         "pushes branch and tag refs to origin; leaves the tag local when CI cannot be confirmed",
     )
@@ -130,7 +139,7 @@ fn push_ref(root: &Path, namespace: &str, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn find_tag(root: &Path, sha: &str) -> Result<String, String> {
+fn find_tag(root: &Path, sha: &str, main_only: bool) -> Result<String, String> {
     let listed = git_stdout(root, &["tag", "--points-at", sha])?;
     let mut tags = Vec::new();
     for line in listed.lines() {
@@ -144,12 +153,24 @@ fn find_tag(root: &Path, sha: &str) -> Result<String, String> {
     tags.sort();
     match tags.len() {
         1 => Ok(tags.remove(0)),
+        0 if main_only => {
+            let version = crate::version_files::VersionFiles::load_at(root, sha)?.current();
+            Ok(format!("v{version}"))
+        }
         0 => Err("main の SHA に v<semver> の tag がありません".to_owned()),
         _ => Err(format!(
             "main の SHA に版の tag が複数あります: {}",
             tags.join(" ")
         )),
     }
+}
+
+fn require_ancestor(root: &Path, commit: &str, main: &str) -> Result<(), String> {
+    git_stdout(root, &["merge-base", "--is-ancestor", commit, main])
+        .map(drop)
+        .map_err(|err| {
+            format!("tag の commit {commit} が main {main} に含まれると確認できません: {err}")
+        })
 }
 
 fn tracked_workflow(root: &Path) -> Result<bool, String> {

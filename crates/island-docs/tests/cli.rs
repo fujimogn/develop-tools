@@ -469,6 +469,140 @@ fn staged_and_range_read_scope_copy_from_their_snapshot() {
     );
 }
 
+const NEW_SCOPE_COPY: &str = ".config/island-docs-scopes.json";
+const OLD_SCOPE_COPY: &str = "config/island-docs-scopes.json";
+
+fn scope_with_limit(limit: usize) -> String {
+    format!(
+        "{{\"version\":1,\"byteLimits\":[{{\"scope\":\"all\",\"path\":\"README.md\",\"maxBytes\":{limit}}}],\"linkSourceExclusions\":[],\"hostPathLinkAllowScopes\":[],\"indexRecordDirs\":[{{\"scope\":\"all\",\"dirs\":[\"reviews\"]}}],\"indexRequirements\":[],\"docsLayouts\":[]}}"
+    )
+}
+
+/// 旧配置を外して新配置だけにした repo。
+fn repo_with_new_placement_only() -> tempfile::TempDir {
+    let dir = island_repo(None);
+    let scopes = fs::read_to_string(dir.path().join(OLD_SCOPE_COPY)).expect("fixture");
+    fs::remove_file(dir.path().join(OLD_SCOPE_COPY)).expect("remove old");
+    write(dir.path(), NEW_SCOPE_COPY, &scopes);
+    dir
+}
+
+#[test]
+fn new_placement_alone_is_read_in_every_mode() {
+    let dir = repo_with_new_placement_only();
+    write(dir.path(), "README.md", "# 入口\n[gone](gone.md)\n");
+    git(dir.path(), &["add", "."]);
+    for args in [&["--tracked"][..], &["--staged"][..]] {
+        let out = run(dir.path(), args);
+        let err = stderr(&out);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {err}");
+        assert!(err.contains("gone.md"), "{args:?}: {err}");
+    }
+    git(dir.path(), &["commit", "-qm", "new placement"]);
+    let base = head(dir.path());
+    write(dir.path(), "README.md", "# 入口\n[gone2](gone2.md)\n");
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "broken link"]);
+    let range = run(dir.path(), &["--range", &base, &head(dir.path())]);
+    assert_eq!(range.status.code(), Some(1), "{}", stderr(&range));
+    assert!(stderr(&range).contains("gone2.md"), "{}", stderr(&range));
+}
+
+#[test]
+fn both_placements_stop_even_with_identical_bytes() {
+    let dir = island_repo(None);
+    let same = fs::read_to_string(dir.path().join(OLD_SCOPE_COPY)).expect("old");
+    write(dir.path(), NEW_SCOPE_COPY, &same);
+    git(dir.path(), &["add", "."]);
+    let out = run(dir.path(), &["--tracked"]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains(NEW_SCOPE_COPY), "{err}");
+    assert!(err.contains(OLD_SCOPE_COPY), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+}
+
+#[test]
+fn index_copy_wins_over_a_different_working_tree_copy() {
+    let dir = repo_with_new_placement_only();
+    write(dir.path(), NEW_SCOPE_COPY, &scope_with_limit(10));
+    write(dir.path(), "README.md", "# more than ten bytes\n");
+    git(dir.path(), &["add", "."]);
+    // 作業木だけ大きな上限に変えても、index の新配置（上限 10）で判定する。
+    write(dir.path(), NEW_SCOPE_COPY, &scope_with_limit(100_000));
+    for args in [&["--tracked"][..], &["--staged"][..]] {
+        let out = run(dir.path(), args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("README.md: 容量上限"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn working_tree_new_placement_is_not_a_fallback_for_a_legacy_head() {
+    let dir = island_repo(None);
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "base"]);
+    let base = head(dir.path());
+    write(dir.path(), "README.md", "# more than ten bytes\n");
+    write(dir.path(), OLD_SCOPE_COPY, &scope_with_limit(10));
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "legacy head"]);
+    // 作業木に新配置を足しても、range の head tree は旧配置だけ。
+    write(dir.path(), NEW_SCOPE_COPY, &scope_with_limit(100_000));
+    let out = run(dir.path(), &["--range", &base, &head(dir.path())]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("README.md: 容量上限"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_scope_copy_is_rejected_without_falling_through_to_the_other() {
+    use std::os::unix::fs::symlink;
+    let dir = island_repo(None);
+    let scopes = fs::read_to_string(dir.path().join(OLD_SCOPE_COPY)).expect("old");
+    write(dir.path(), "real/scopes.json", &scopes);
+    // 新配置が symlink、旧配置が通常 file: 旧へ進まず停止する。
+    fs::create_dir_all(dir.path().join(".config")).expect("mkdir");
+    symlink("../real/scopes.json", dir.path().join(NEW_SCOPE_COPY)).expect("symlink");
+    git(dir.path(), &["add", "."]);
+    let out = run(dir.path(), &["--tracked"]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains(NEW_SCOPE_COPY), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+
+    // 旧配置だけが symlink のときも同様に停止する（欠落扱いで黙らない）。
+    fs::remove_file(dir.path().join(NEW_SCOPE_COPY)).expect("rm");
+    fs::remove_file(dir.path().join(OLD_SCOPE_COPY)).expect("rm");
+    symlink("../real/scopes.json", dir.path().join(OLD_SCOPE_COPY)).expect("symlink");
+    git(dir.path(), &["add", "-A"]);
+    let out = run(dir.path(), &["--tracked"]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains("symlink") || err.contains("通常 file"),
+        "{err}"
+    );
+}
+
+#[test]
+fn invalid_json_names_the_selected_new_path() {
+    let dir = repo_with_new_placement_only();
+    write(dir.path(), NEW_SCOPE_COPY, "not json");
+    git(dir.path(), &["add", "."]);
+    let out = run(dir.path(), &["--tracked"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains(NEW_SCOPE_COPY), "{}", stderr(&out));
+}
+
 #[test]
 fn invalid_scope_copy_reports_an_error_without_panicking() {
     let dir = island_repo(None);

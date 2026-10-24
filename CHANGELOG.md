@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-10-24
+
+### Added
+
+- `island-docs` reads the scope table copy from `.config/island-docs-scopes.json` or `config/island-docs-scopes.json`. It fails when both exist, even with the same bytes, and when the copy is not a regular file (a symlink is refused).
+
+### Fixed
+
+- With `release.notes.language: "en"`, the compare line at the top of the Release body reads `Compare:` instead of the Japanese heading.
+- `check-release-version` no longer fails in a repository whose manifest declares no `release.versionFiles` (for example a repository without versions): it prints one line to stderr and skips the working-tree check. A broken declaration still fails, and tags sent with `--pre-push` are still checked.
+- `release push` in a repository whose integration branch is `main` no longer stops when the tip of `main` has moved past the release commit and carries no version tag. It pushes the tag for the version declared at `main`, after checking that the tag commit is an ancestor of `origin/main` and that every `main` push run for that commit succeeded.
+
 ## [0.6.2] - 2026-10-23
 
 ### Added

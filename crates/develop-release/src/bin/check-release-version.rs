@@ -17,10 +17,10 @@ fn main() {
         let help = Help::new(
             "check-release-version [--pre-push] [--help]",
             "check-release-version — push 前に release tag と declared version files の整合性を検査します。",
-            "宣言した全 file の版を常に照合します。HEAD に v<semver> tag がある場合だけ tag と main への包含を確認します。--pre-push では Git pre-push の stdin を読み、送る refs/tags/v<semver> ごとに、その tag の commit の版 file と tag の一致、その commit の main への包含も確認します（削除の行と tag 以外の行は読み飛ばします）。repo の外では soft-skip します。",
+            "宣言した全 file の版を常に照合します。release.versionFiles を宣言していない repo では作業木の照合を飛ばし、理由を stderr に 1 行出します（宣言が壊れているときは失敗します）。HEAD に v<semver> tag がある場合だけ tag と main への包含を確認します。--pre-push では Git pre-push の stdin を読み、送る refs/tags/v<semver> ごとに、その tag の commit の版 file と tag の一致、その commit の main への包含も確認します（削除の行と tag 以外の行は読み飛ばします）。repo の外では soft-skip します。",
             "なし。git tag、.develop-tools.json、release.versionFiles の file を読み取ります。--pre-push では stdin と tag の commit の同じ file を読み取ります。",
         )
-        .exit("0 = release でない / 一致 / repo 外の soft-skip、1 = git の失敗、tag・版数の不一致、main 外の tag、または設定の読み取りエラー")
+        .exit("0 = release でない / 一致 / repo 外・版の宣言なしの soft-skip、1 = git の失敗、tag・版数の不一致、main 外の tag、または設定の読み取りエラー")
         .examples(&["check-release-version", "check-release-version --pre-push < <pre-push stdin>"]);
         print!("{}", help.render());
         return;
@@ -32,7 +32,14 @@ fn main() {
         Ok(None) => return,
         Err(err) => fail(&err),
     };
-    check_head(&root);
+    // 版を持たない repo は作業木の照合を飛ばす。送る tag の照合は宣言の有無にかかわらず行う。
+    if VersionFiles::undeclared(&root) {
+        eprintln!(
+            "check-release-version: release.versionFiles の宣言が無いため版の照合を飛ばします"
+        );
+    } else {
+        check_head(&root);
+    }
     if pre_push {
         let mut input = String::new();
         if let Err(err) = std::io::stdin().read_to_string(&mut input) {

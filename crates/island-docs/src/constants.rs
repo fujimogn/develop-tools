@@ -191,13 +191,25 @@ pub struct ScopeTable {
     retired_extra_sources: Vec<SourceExclusion>,
 }
 
-/// 各 repo が tracked に持つ scope 表の写し。内蔵の表は無く、写しの無い repo は検査できない。
+/// 各 repo が tracked に持つ scope 表の写し（旧配置）。内蔵の表は無く、写しの無い repo は検査できない。
 pub const SCOPE_COPY_PATH: &str = "config/island-docs-scopes.json";
 
+/// 新配置。旧配置とはちょうど片方だけを置く（[`crate::check::select_scope_copy`]）。
+pub const SCOPE_COPY_PATH_DOT_CONFIG: &str = ".config/island-docs-scopes.json";
+
 impl ScopeTable {
-    /// 写しの bytes を読む。写しが無ければ（`None`）失敗にする。`root` は診断の path にだけ使う。
+    /// 旧配置の写しの bytes を読む。写しが無ければ（`None`）失敗にする。`root` は診断の path にだけ使う。
     pub fn from_copy(root: &std::path::Path, copy: Option<&[u8]>) -> Result<Self, String> {
-        let path = root.join(SCOPE_COPY_PATH);
+        Self::from_copy_at(root, SCOPE_COPY_PATH, copy)
+    }
+
+    /// `relative` に置かれた写しの bytes を読む。診断には選んだ path を示す。
+    pub fn from_copy_at(
+        root: &std::path::Path,
+        relative: &str,
+        copy: Option<&[u8]>,
+    ) -> Result<Self, String> {
+        let path = root.join(relative);
         let bytes = copy.ok_or_else(|| {
             format!(
                 "{} がありません（scope 表の写しを repo に置いてください）",

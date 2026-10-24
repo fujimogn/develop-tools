@@ -10,8 +10,9 @@ use regex::Regex;
 
 use crate::constants::{
     ISLAND_BLOCK_PATH, MARKDOWN_EXTENSION, RETIRED_REGISTRY_PATH, SCOPE_COPY_PATH,
-    SCRIPT_REFERENCE_CONTEXT_EXCLUSIONS, SCRIPT_REFERENCE_HISTORICAL_EXTRA, ScopeTable,
-    allows_host_path_links, byte_limits_for, is_link_source, is_retired_historical, matches_prefix,
+    SCOPE_COPY_PATH_DOT_CONFIG, SCRIPT_REFERENCE_CONTEXT_EXCLUSIONS,
+    SCRIPT_REFERENCE_HISTORICAL_EXTRA, ScopeTable, allows_host_path_links, byte_limits_for,
+    is_link_source, is_retired_historical, matches_prefix,
 };
 use crate::git::{Entry, Repo};
 use crate::links::{self, BrokenLink, Snapshot};
@@ -94,16 +95,41 @@ pub struct Outcome {
     pub checked: usize,
 }
 
+/// `entries`（index か commit tree）から scope 表の写しの entry を選ぶ。
+/// 新旧どちらか片方の通常 file だけを受け、`Ok(None)` はどちらも無い。
+/// 両方ある（bytes が同じでも）、または候補が通常 file でないときは、他方へ進まず失敗する。
+pub fn select_scope_copy(entries: &[Entry]) -> Result<Option<&Entry>, String> {
+    let found: Vec<&Entry> = [SCOPE_COPY_PATH_DOT_CONFIG, SCOPE_COPY_PATH]
+        .into_iter()
+        .filter_map(|path| entries.iter().find(|entry| entry.path == path))
+        .collect();
+    if let [new, old] = found[..] {
+        return Err(format!(
+            "scope 表の写しが {} と {} の両方にあります（片方だけにしてください）",
+            new.path, old.path
+        ));
+    }
+    match found.first() {
+        Some(entry) if !entry.is_regular_file() => Err(format!(
+            "{} は通常 file ではありません（mode {}。symlink は受けません）",
+            entry.path, entry.mode
+        )),
+        other => Ok(other.copied()),
+    }
+}
+
 /// `entries`（index か commit tree）にある scope 表の写しを読む。写しが無ければ失敗する。
 pub fn scope_table(repo: &Repo, entries: &[Entry]) -> Result<ScopeTable, String> {
-    let copy = entries
-        .iter()
-        .find(|entry| entry.path == SCOPE_COPY_PATH)
-        .filter(|entry| entry.is_regular_file())
+    let selected = select_scope_copy(entries)?;
+    let copy = selected
         .map(|entry| repo.read_blobs(&[&entry.oid]))
         .transpose()?
         .and_then(|mut blobs| blobs.pop());
-    ScopeTable::from_copy(repo.root(), copy.as_deref())
+    ScopeTable::from_copy_at(
+        repo.root(),
+        selected.map_or(SCOPE_COPY_PATH, |entry| entry.path.as_str()),
+        copy.as_deref(),
+    )
 }
 
 /// `repo` の index を読んで検査する。

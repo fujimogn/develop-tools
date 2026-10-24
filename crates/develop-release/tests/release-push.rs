@@ -108,6 +108,10 @@ if [ -z "$commit" ]; then
   echo "commit がありません" >&2
   exit 2
 fi
+if [ "$commit" != "$RELEASE_PUSH_TEST_CI_SHA" ]; then
+  printf '[]\n'
+  exit 0
+fi
 
 json_run() {
   id=$1
@@ -125,6 +129,10 @@ json_run() {
 }
 
 case "$mode" in
+  tip-only)
+    commit=$RELEASE_PUSH_TEST_MAIN_SHA
+    printf '[%s]\n' "$(json_run 11 ci completed success)"
+    ;;
   success)
     printf '[%s,%s]\n' "$(json_run 11 ci completed success)" "$(json_run 12 release-check completed success)"
     ;;
@@ -309,6 +317,7 @@ fn run_push(repo: &Repo, mode: &str, with_gh: bool, extra: &[&str]) -> Output {
         .env("PATH", path)
         .env("RELEASE_PUSH_TEST_LOG", &repo.log)
         .env("RELEASE_PUSH_TEST_GH_MODE", mode)
+        .env("RELEASE_PUSH_TEST_CI_SHA", &repo.release_sha)
         .env("GIT_DIR", "/nowhere/.git")
         .env("GIT_WORK_TREE", "/nowhere")
         .output()
@@ -604,6 +613,123 @@ fn release_push_pushes_main_once_when_it_is_the_integration_branch() {
     assert_eq!(remote_sha(&repo.root, "refs/tags/v0.1.1"), repo.release_sha);
 }
 
+fn advance_main_after_release(repo: &Repo) -> String {
+    git(&repo.root, &["push", "-q", "origin", "main"]);
+    std::fs::write(
+        repo.root.join(".develop-tools.json"),
+        "{\"integrationBranch\":\"main\",\"release\":{\"versionFiles\":[{\"path\":\"package.json\",\"kind\":\"package-json\"}]}}\n",
+    )
+    .unwrap();
+    std::fs::write(repo.root.join("package.json"), "{\"version\":\"0.1.1\"}\n").unwrap();
+    git(&repo.root, &["add", "."]);
+    git(&repo.root, &["commit", "-qm", "shipment after release"]);
+    let tip = git(&repo.root, &["rev-parse", "HEAD"]);
+    git(&repo.root, &["push", "-q", "origin", "main"]);
+    tip
+}
+
+#[test]
+fn main_only_push_publishes_ancestor_tag_after_checking_its_commit_ci() {
+    let repo = setup("main", Workflow::Tracked, ServerHook::None);
+    let tip = advance_main_after_release(&repo);
+    git(&repo.root, &["tag", "v99.0.0", &repo.previous_sha]);
+    let output = run_push(&repo, "success", true, &[]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(remote_sha(&repo.root, "refs/heads/main"), tip);
+    assert_eq!(remote_sha(&repo.root, "refs/tags/v0.1.1"), repo.release_sha);
+    let log = log_text(&repo);
+    let gh_line = log
+        .lines()
+        .find(|line| line.starts_with("gh run list"))
+        .unwrap();
+    assert!(
+        gh_line.contains(&format!("--commit {}", repo.release_sha)),
+        "{gh_line}"
+    );
+    assert!(!gh_line.contains(&tip), "{gh_line}");
+    assert!(gh_line.contains("--branch main"), "{gh_line}");
+}
+
+#[test]
+fn main_only_push_preserves_an_annotated_ancestor_tag() {
+    let repo = setup_tagged(
+        "main",
+        Workflow::Tracked,
+        ServerHook::None,
+        TagKind::Annotated,
+    );
+    let tag_object = git(&repo.root, &["rev-parse", "refs/tags/v0.1.1"]);
+    advance_main_after_release(&repo);
+    let output = run_push(&repo, "success", true, &[]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(remote_sha(&repo.root, "refs/tags/v0.1.1"), tag_object);
+    assert_eq!(
+        remote_sha(&repo.root, "refs/tags/v0.1.1^{}"),
+        repo.release_sha
+    );
+}
+
+#[test]
+fn main_only_push_keeps_ancestor_tag_local_when_its_ci_fails() {
+    let repo = setup("main", Workflow::Tracked, ServerHook::None);
+    let tip = advance_main_after_release(&repo);
+    let output = run_push(&repo, "failure", true, &[]);
+    assert!(!output.status.success());
+    assert!(
+        text(&output.stderr).contains("失敗"),
+        "{}",
+        text(&output.stderr)
+    );
+    assert_eq!(remote_sha(&repo.root, "refs/heads/main"), tip);
+    assert_eq!(remote_sha(&repo.root, "refs/tags/v0.1.1"), "");
+    assert!(log_text(&repo).contains(&format!("--commit {}", repo.release_sha)));
+}
+
+#[test]
+fn main_only_push_rejects_a_declared_version_tag_outside_main() {
+    let repo = setup("main", Workflow::Tracked, ServerHook::None);
+    git(
+        &repo.root,
+        &["checkout", "-qb", "outside", &repo.previous_sha],
+    );
+    git(
+        &repo.root,
+        &["commit", "--allow-empty", "-qm", "outside main"],
+    );
+    git(&repo.root, &["tag", "v0.1.2"]);
+    git(&repo.root, &["checkout", "-q", "main"]);
+    advance_main_after_release(&repo);
+    std::fs::write(repo.root.join("package.json"), "{\"version\":\"0.1.2\"}\n").unwrap();
+    git(&repo.root, &["add", "package.json"]);
+    git(&repo.root, &["commit", "-qm", "declare outside version"]);
+    let output = run_push(&repo, "success", true, &[]);
+    assert!(!output.status.success());
+    assert!(
+        text(&output.stderr).contains("含まれると確認できません"),
+        "{}",
+        text(&output.stderr)
+    );
+    assert_eq!(remote_sha(&repo.root, "refs/tags/v0.1.2"), "");
+    assert!(!log_text(&repo).contains("gh "));
+}
+
+#[test]
+fn develop_push_still_requires_a_version_tag_at_main_tip() {
+    let repo = setup("develop", Workflow::Tracked, ServerHook::None);
+    git(&repo.root, &["checkout", "-q", "main"]);
+    advance_main_after_release(&repo);
+    std::fs::write(
+        repo.root.join(".develop-tools.json"),
+        "{\"integrationBranch\":\"develop\"}\n",
+    )
+    .unwrap();
+    let output = run_push(&repo, "success", true, &[]);
+    assert!(!output.status.success());
+    assert!(text(&output.stderr).contains("main の SHA に v<semver> の tag がありません"));
+    assert_eq!(remote_sha(&repo.root, "refs/tags/v0.1.1"), "");
+    assert!(!log_text(&repo).contains("gh "));
+}
+
 struct EnvGuard {
     keys: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
@@ -638,14 +764,27 @@ impl Drop for EnvGuard {
 
 fn run_with_clock(mode: &str) -> (Result<(), String>, std::time::Duration, Repo) {
     let repo = setup("develop", Workflow::Tracked, ServerHook::None);
+    run_repo_with_clock(repo, mode)
+}
+
+fn run_repo_with_clock(repo: Repo, mode: &str) -> (Result<(), String>, std::time::Duration, Repo) {
     let _keep_lock = &repo._lock;
     let path = repo.path_with_gh.clone();
+    let main_sha = git(&repo.root, &["rev-parse", "refs/heads/main"]);
     let _env = EnvGuard::set(&[
         ("PATH", path.as_os_str()),
         ("GIT_DIR", std::ffi::OsStr::new("/nowhere/.git")),
         ("GIT_WORK_TREE", std::ffi::OsStr::new("/nowhere")),
         ("RELEASE_PUSH_TEST_LOG", repo.log.as_os_str()),
         ("RELEASE_PUSH_TEST_GH_MODE", std::ffi::OsStr::new(mode)),
+        (
+            "RELEASE_PUSH_TEST_CI_SHA",
+            std::ffi::OsStr::new(&repo.release_sha),
+        ),
+        (
+            "RELEASE_PUSH_TEST_MAIN_SHA",
+            std::ffi::OsStr::new(&main_sha),
+        ),
     ]);
     let slept = std::cell::Cell::new(std::time::Duration::ZERO);
     let now = std::cell::Cell::new(std::time::Duration::ZERO);
@@ -659,6 +798,30 @@ fn run_with_clock(mode: &str) -> (Result<(), String>, std::time::Duration, Repo)
         },
     );
     (result, slept.get(), repo)
+}
+
+#[test]
+fn main_only_push_keeps_ancestor_tag_local_without_runs_for_its_commit() {
+    let repo = setup("main", Workflow::Tracked, ServerHook::None);
+    let tip = advance_main_after_release(&repo);
+    let (result, slept, repo) = run_repo_with_clock(repo, "empty");
+    let err = result.expect_err("run が無ければ tag を出さない");
+    assert!(err.contains("run が無い"), "{err}");
+    assert_eq!(slept, develop_release::push::CI_WAIT);
+    assert_eq!(remote_sha(&repo.root, "refs/heads/main"), tip);
+    assert_eq!(remote_sha(&repo.root, "refs/tags/v0.1.1"), "");
+    assert!(log_text(&repo).contains(&format!("--commit {}", repo.release_sha)));
+}
+
+#[test]
+fn main_only_push_does_not_substitute_a_successful_main_tip_run_for_tag_ci() {
+    let repo = setup("main", Workflow::Tracked, ServerHook::None);
+    advance_main_after_release(&repo);
+    let (result, slept, repo) = run_repo_with_clock(repo, "tip-only");
+    let err = result.expect_err("main 先頭の成功だけで祖先 tag を出さない");
+    assert!(err.contains("run が無い"), "{err}");
+    assert_eq!(slept, develop_release::push::CI_WAIT);
+    assert_eq!(remote_sha(&repo.root, "refs/tags/v0.1.1"), "");
 }
 
 #[test]

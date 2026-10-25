@@ -1656,7 +1656,8 @@ fn check_local_version_warns_only_when_older_and_never_fails() {
     let parsed = parse_version(&local);
     let newer_pin = format_version([parsed[0], parsed[1], parsed[2] + 1]);
     let dir = tempfile::tempdir().expect("tempdir");
-    let pin = dir.path().join(".develop-tools.json");
+    fs::create_dir_all(dir.path().join(".config")).expect("config dir");
+    let pin = dir.path().join(".config/develop-tools.json");
 
     assert_silent_success(&run(dir.path(), &["--check-local-version"]));
 
@@ -1696,7 +1697,8 @@ fn check_local_version_skips_fields_added_beside_the_version() {
     let parsed = parse_version(&local);
     let newer_pin = format_version([parsed[0], parsed[1], parsed[2] + 1]);
     let dir = tempfile::tempdir().expect("tempdir");
-    let pin = dir.path().join(".develop-tools.json");
+    fs::create_dir_all(dir.path().join(".config")).expect("config dir");
+    let pin = dir.path().join(".config/develop-tools.json");
     let with_added_fields = |version: &str| {
         format!(
             r#"{{"version":"{version}","sha256":{{}},"integrationBranch":"develop","release":{{"versionFiles":[]}}}}"#

@@ -397,8 +397,9 @@ mod tests {
                 .unwrap_err()
                 .contains(develop_tools_core::develop_tools_manifest::PATH)
         );
+        std::fs::create_dir_all(dir.path().join(".config")).unwrap();
         std::fs::write(
-            dir.path().join(".develop-tools.json"),
+            dir.path().join(".config/develop-tools.json"),
             r#"{"integrationBranch":"develop"}"#,
         )
         .unwrap();
@@ -418,8 +419,9 @@ mod tests {
             "[workspace]\nmembers = []\n[workspace.package]\nversion = \"0.5.10\"\n",
         )
         .unwrap();
+        std::fs::create_dir_all(dir.path().join(".config")).unwrap();
         std::fs::write(
-            dir.path().join(".develop-tools.json"),
+            dir.path().join(".config/develop-tools.json"),
             r#"{"platforms":["linux"]}"#,
         )
         .unwrap();

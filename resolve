@@ -74,12 +74,12 @@ esac
 manifest=
 if [ -f .config/develop-tools.json ] && [ -f .develop-tools.json ]; then
   fail '.config/develop-tools.json と .develop-tools.json の両方があります'
+elif [ -f .develop-tools.json ]; then
+  fail '.develop-tools.json は旧い置き場です。.config/develop-tools.json へ移す'
 elif [ -f .config/develop-tools.json ]; then
   manifest=.config/develop-tools.json
-elif [ -f .develop-tools.json ]; then
-  manifest=.develop-tools.json
 else
-  fail '.develop-tools.json がありません'
+  fail '.config/develop-tools.json がありません'
 fi
 cache_root=${XDG_CACHE_HOME:-$HOME/.cache}/develop-tools
 manifest_digest=$(checksum "$manifest") || fail 'manifest の sha256 を計算できません'

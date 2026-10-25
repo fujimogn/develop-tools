@@ -84,7 +84,7 @@ pub mod freshness {
 pub fn release_integration_branch(repo_root: &Path) -> Result<Option<String>, String> {
     let Some(relative) = develop_tools_manifest::locate(repo_root)? else {
         return Err(format!(
-            "{}（移行中は旧い {}）がありません（日常統合先 integrationBranch を宣言してください。main だけで運用するなら {{}} を置けば main 扱い）",
+            "{} がありません（{} は退役済み。日常統合先 integrationBranch を宣言してください。main だけで運用するなら {{}} を置けば main 扱い）",
             repo_root.join(develop_tools_manifest::PATH).display(),
             develop_tools_manifest::LEGACY_PATH
         ));
@@ -145,9 +145,9 @@ mod tests {
     fn release_branch_prefers_repo_pin_and_main_when_branch_is_absent() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir_all(repo.join(".config")).unwrap();
         std::fs::write(
-            repo.join(".develop-tools.json"),
+            repo.join(develop_tools_manifest::PATH),
             r#"{"integrationBranch":"develop"}"#,
         )
         .unwrap();
@@ -155,12 +155,16 @@ mod tests {
             release_integration_branch(&repo).unwrap().as_deref(),
             Some("develop")
         );
-        std::fs::write(repo.join(".develop-tools.json"), r#"{"version":"0.1.0"}"#).unwrap();
+        std::fs::write(
+            repo.join(develop_tools_manifest::PATH),
+            r#"{"version":"0.1.0"}"#,
+        )
+        .unwrap();
         assert_eq!(
             release_integration_branch(&repo).unwrap().as_deref(),
             Some("main")
         );
-        std::fs::write(repo.join(".develop-tools.json"), "null").unwrap();
+        std::fs::write(repo.join(develop_tools_manifest::PATH), "null").unwrap();
         assert!(release_integration_branch(&repo).is_err());
     }
 

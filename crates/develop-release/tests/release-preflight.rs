@@ -146,7 +146,12 @@ fn setup(manifest: &str) -> Repo {
     git(&root, &["config", "user.name", "Test"]);
     git(&root, &["config", "user.email", "test@example.com"]);
     git(&root, &["config", "commit.gpgsign", "false"]);
-    std::fs::write(root.join(".develop-tools.json"), format!("{manifest}\n")).unwrap();
+    std::fs::create_dir_all(root.join(".config")).unwrap();
+    std::fs::write(
+        root.join(".config/develop-tools.json"),
+        format!("{manifest}\n"),
+    )
+    .unwrap();
     git(&root, &["add", "."]);
     git(&root, &["commit", "-qm", "base"]);
     git(&root, &["remote", "add", "origin", bare.to_str().unwrap()]);

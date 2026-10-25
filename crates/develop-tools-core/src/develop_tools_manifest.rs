@@ -3,9 +3,9 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-/// 版固定 file の置き場。移行中は旧い [`LEGACY_PATH`] も読み、両方あれば止める。
+/// 版固定 file の置き場。旧い [`LEGACY_PATH`] が残っていれば止める。
 pub const PATH: &str = ".config/develop-tools.json";
-/// 移行前の置き場。全 repo が [`PATH`] へ移った後の Release で探索から外す。
+/// 退役した置き場。読み込まず、旧配置と重複の検出に使う。
 pub const LEGACY_PATH: &str = ".develop-tools.json";
 /// 新旧の両方があるときの失敗の先頭の語。
 pub const DUPLICATED: &str = "manifest_duplicated";
@@ -39,7 +39,9 @@ pub fn locate_in(
             "{DUPLICATED}: {PATH} と {LEGACY_PATH} の両方があります（{PATH} の 1 つにしてください）"
         )),
         (true, false) => Ok(Some(PATH)),
-        (false, true) => Ok(Some(LEGACY_PATH)),
+        (false, true) => Err(format!(
+            "manifest_legacy: {LEGACY_PATH} は旧い置き場です（{PATH} へ移してください）"
+        )),
         (false, false) => Ok(None),
     }
 }
@@ -169,7 +171,7 @@ pub enum NotesAudience {
     Public,
 }
 
-/// repo が版固定 file（[`PATH`]、移行中は [`LEGACY_PATH`]）で宣言する値。版の固定（`version`・`sha256`）は
+/// repo が版固定 file（[`PATH`]）で宣言する値。版の固定（`version`・`sha256`）は
 /// [`known_shape`] が見るので、ここでは読まない。道具を配る側の repo の形でも読める。
 #[derive(Debug)]
 pub struct Declaration {
@@ -698,9 +700,10 @@ mod tests {
     }
 
     #[test]
-    fn locate_reads_new_then_legacy_and_stops_on_both() {
+    fn locate_reads_current_and_rejects_retired_placements() {
         assert_eq!(locate(tree(&[PATH]).path()), Ok(Some(PATH)));
-        assert_eq!(locate(tree(&[LEGACY_PATH]).path()), Ok(Some(LEGACY_PATH)));
+        let error = locate(tree(&[LEGACY_PATH]).path()).unwrap_err();
+        assert!(error.starts_with("manifest_legacy:"), "{error}");
         assert_eq!(locate(tree(&[]).path()), Ok(None));
         let error = locate(tree(&[PATH, LEGACY_PATH]).path()).unwrap_err();
         assert!(error.starts_with("manifest_duplicated"), "{error}");
@@ -715,7 +718,8 @@ mod tests {
         let only =
             |present: &'static [&'static str]| locate_in(move |path| Ok(present.contains(&path)));
         assert_eq!(only(&[PATH]), Ok(Some(PATH)));
-        assert_eq!(only(&[LEGACY_PATH]), Ok(Some(LEGACY_PATH)));
+        let error = only(&[LEGACY_PATH]).unwrap_err();
+        assert!(error.starts_with("manifest_legacy:"), "{error}");
         assert_eq!(only(&[]), Ok(None));
         let error = only(&[PATH, LEGACY_PATH]).unwrap_err();
         assert!(error.starts_with("manifest_duplicated"), "{error}");

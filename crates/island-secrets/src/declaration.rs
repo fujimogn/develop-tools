@@ -32,7 +32,7 @@ pub const MISSING_PROJECT: &str = "missing-project";
 /// 宣言の既定の置き場（repo root からの相対）。
 pub const DEFAULT_PATH: &str = ".config/develop-secrets.jsonc";
 
-/// 台帳に明示値の無い repo で探す宣言の置き場（強い順）。ルート直下と `config/` は移行の間だけ読む。
+/// 宣言の置き場。旧配置は読み込まず、旧配置と重複の検出に使う。
 const SEARCH_PATHS: [&str; 3] = [
     DEFAULT_PATH,
     ".develop-secrets.jsonc",
@@ -48,7 +48,10 @@ pub fn find_in_repo(repo_root: &Path) -> Result<Option<&'static str>, String> {
         .collect();
     match found.as_slice() {
         [] => Ok(None),
-        [path] => Ok(Some(path)),
+        [path] if *path == DEFAULT_PATH => Ok(Some(path)),
+        [path] => Err(format!(
+            "{path} は旧い置き場です（{DEFAULT_PATH} へ移してください）"
+        )),
         _ => Err(format!(
             "宣言の置き場が 2 つ以上あります（{}）。1 つにしてください",
             found.join("・")
@@ -470,4 +473,39 @@ pub fn strip_jsonc(text: &str) -> Result<String, String> {
         index += 1;
     }
     String::from_utf8(out).map_err(|_| "JSONC は UTF-8 にしてください".to_owned())
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    #[test]
+    fn current_declaration_is_read_and_duplicate_placements_fail() {
+        let repo = tempfile::tempdir().unwrap();
+        assert_eq!(find_in_repo(repo.path()).unwrap(), None);
+        let current = repo.path().join(DEFAULT_PATH);
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::write(current, "{}").unwrap();
+        assert_eq!(find_in_repo(repo.path()).unwrap(), Some(DEFAULT_PATH));
+        fs::write(repo.path().join(SEARCH_PATHS[1]), "{}").unwrap();
+        let error = find_in_repo(repo.path()).unwrap_err();
+        assert!(error.contains("2 つ以上"), "{error}");
+        assert!(
+            error.contains(DEFAULT_PATH) && error.contains(SEARCH_PATHS[1]),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn retired_declarations_fail_instead_of_being_read() {
+        for path in [".develop-secrets.jsonc", "config/develop-secrets.jsonc"] {
+            let repo = tempfile::tempdir().unwrap();
+            let file = repo.path().join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "{}").unwrap();
+            let error = find_in_repo(repo.path()).unwrap_err();
+            assert!(error.contains("旧い置き場"), "{error}");
+            assert!(error.contains(path), "{error}");
+        }
+    }
 }

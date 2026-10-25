@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-10-25
+
+### Changed
+
+- `resolve` no longer reads a root `.develop-tools.json`. A file left only at that path fails and names `.config/develop-tools.json` as the place to move it. Both files still fail.
+- The version pin, secret declaration, ADR, and lefthook lookups read only their `.config/` locations. A file left only at a retired root location (or `config/` for secret declarations) fails and names the new path; the old paths are still checked so duplicates are reported.
+
 ## [0.6.3] - 2026-10-24
 
 ### Added

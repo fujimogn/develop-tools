@@ -36,8 +36,9 @@ fn declaration(root: &Path, integration_branch: Option<&str>, version_files: &st
     let branch = integration_branch
         .map(|branch| format!(",\n  \"integrationBranch\": \"{branch}\""))
         .unwrap_or_default();
+    std::fs::create_dir_all(root.join(".config")).unwrap();
     std::fs::write(
-        root.join(".develop-tools.json"),
+        root.join(".config/develop-tools.json"),
         format!(
             "{{\n  \"release\": {{\n    \"versionFiles\": [{version_files}]\n  }}{branch}\n}}\n"
         ),
@@ -302,7 +303,7 @@ fn release_fails_without_repo_pin() {
     let dir = fixture();
     let root = dir.path();
     git(root, &["switch", "-q", "develop"]);
-    git(root, &["rm", "-q", ".develop-tools.json"]);
+    git(root, &["rm", "-q", ".config/develop-tools.json"]);
     git(root, &["commit", "-qm", "drop pin"]);
     let snapshot = || {
         (
@@ -348,7 +349,7 @@ fn release_patch_updates_child_repo_without_develop_meta_markers() {
         Some("develop"),
         r#"{"path":"package.json","kind":"package-json"},{"path":"worker.json","kind":"package-json"}"#,
     );
-    git(root, &["add", ".develop-tools.json"]);
+    git(root, &["add", ".config/develop-tools.json"]);
     git(root, &["commit", "-qm", "declare integration branch"]);
 
     let output = release(root);
@@ -1187,8 +1188,9 @@ fn release_fails_when_the_declaration_has_no_version_files() {
     let dir = fixture();
     let root = dir.path();
     git(root, &["switch", "-q", "develop"]);
+    std::fs::create_dir_all(root.join(".config")).unwrap();
     std::fs::write(
-        root.join(".develop-tools.json"),
+        root.join(".config/develop-tools.json"),
         "{\n  \"integrationBranch\": \"develop\"\n}\n",
     )
     .unwrap();
@@ -1255,7 +1257,7 @@ fn root_package_json_must_be_declared() {
         Some("develop"),
         r#"{"path":"packages/worker/package.json","kind":"package-json"}"#,
     );
-    git(root, &["add", ".develop-tools.json"]);
+    git(root, &["add", ".config/develop-tools.json"]);
     git(root, &["commit", "-qm", "omit root version declaration"]);
     let before = git(root, &["rev-parse", "HEAD"]);
 
@@ -1276,7 +1278,7 @@ fn unknown_version_file_kind_is_rejected_without_writing() {
         Some("develop"),
         r#"{"path":"package.json","kind":"unknown-kind"}"#,
     );
-    git(root, &["add", ".develop-tools.json"]);
+    git(root, &["add", ".config/develop-tools.json"]);
     git(root, &["commit", "-qm", "unknown version kind"]);
     let before = git(root, &["rev-parse", "HEAD"]);
 
@@ -1358,8 +1360,9 @@ fn platform_repo(platforms: Option<&str>) -> PlatformRepo {
         .unwrap_or_else(|| {
             ",\n  \"release\": {\"versionFiles\": [{\"path\":\"package.json\",\"kind\":\"package-json\"}]}".to_owned()
         });
+    std::fs::create_dir_all(root.join(".config")).unwrap();
     std::fs::write(
-        root.join(".develop-tools.json"),
+        root.join(".config/develop-tools.json"),
         format!("{{\n  \"integrationBranch\": \"develop\"{declared}\n}}\n"),
     )
     .unwrap();
@@ -1567,8 +1570,9 @@ fn changelog_fixture(stamp: bool, changelog: Option<&str>) -> Fixture {
     } else {
         ""
     };
+    std::fs::create_dir_all(root.join(".config")).unwrap();
     std::fs::write(
-        root.join(".develop-tools.json"),
+        root.join(".config/develop-tools.json"),
         format!(
             "{{\n  \"release\": {{\n    \"versionFiles\": [{{\"path\":\"package.json\",\"kind\":\"package-json\"}}]{stamp}\n  }},\n  \"integrationBranch\": \"develop\"\n}}\n"
         ),
@@ -1597,8 +1601,9 @@ fn unreadable_changelog_fixture(stamp: bool) -> Fixture {
     } else {
         ""
     };
+    std::fs::create_dir_all(root.join(".config")).unwrap();
     std::fs::write(
-        root.join(".develop-tools.json"),
+        root.join(".config/develop-tools.json"),
         format!(
             "{{\n  \"release\": {{\n    \"versionFiles\": [{{\"path\":\"package.json\",\"kind\":\"package-json\"}}]{stamp}\n  }},\n  \"integrationBranch\": \"develop\"\n}}\n"
         ),
@@ -1792,8 +1797,9 @@ fn notes_fixture(notes: Option<&str>, item: Option<&str>) -> Fixture {
     let notes = notes
         .map(|notes| format!(",\n    \"notes\": {notes}"))
         .unwrap_or_default();
+    std::fs::create_dir_all(root.join(".config")).unwrap();
     std::fs::write(
-        root.join(".develop-tools.json"),
+        root.join(".config/develop-tools.json"),
         format!(
             "{{\n  \"release\": {{\n    \"versionFiles\": [{{\"path\":\"package.json\",\"kind\":\"package-json\"}}]{notes}\n  }},\n  \"integrationBranch\": \"develop\"\n}}\n"
         ),

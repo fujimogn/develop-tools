@@ -642,8 +642,9 @@ mod tests {
     }
 
     fn declare(root: &Path, entries: &str) {
+        std::fs::create_dir_all(root.join(".config")).unwrap();
         std::fs::write(
-            root.join(".develop-tools.json"),
+            root.join(".config/develop-tools.json"),
             format!(r#"{{"release":{{"versionFiles":[{entries}]}}}}"#),
         )
         .unwrap();
@@ -743,8 +744,9 @@ mod tests {
                 "{entries}"
             );
         }
+        std::fs::create_dir_all(root.join(".config")).unwrap();
         std::fs::write(
-            root.join(".develop-tools.json"),
+            root.join(".config/develop-tools.json"),
             r#"{"platforms":["linux"],"release":{"versionFiles":[{"path":"package.json","kind":"package-json"}]}}"#,
         )
         .unwrap();
@@ -798,7 +800,8 @@ mod tests {
             root.join(develop_tools_manifest::LEGACY_PATH),
         )
         .unwrap();
-        assert_eq!(VersionFiles::load(root).unwrap().current, version(0, 2, 0));
+        let legacy = VersionFiles::load(root).err().unwrap();
+        assert!(legacy.starts_with("manifest_legacy:"), "{legacy}");
         assert_eq!(
             VersionFiles::load_at(root, &moved).unwrap().current,
             version(0, 2, 0)

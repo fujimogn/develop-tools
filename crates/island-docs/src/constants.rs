@@ -1,5 +1,5 @@
 //! 島の docs 検査の定数。数値と語彙はここ、repo × path の行は
-//! repo 内の `config/island-docs-scopes.json` から読む。
+//! repo 内の `.config/island-docs-scopes.json`（移行中は旧 `config/island-docs-scopes.json`）から読む。
 //!
 //! repo は GitHub の `owner/name`（`remote.origin.url` から引く）で指す。
 

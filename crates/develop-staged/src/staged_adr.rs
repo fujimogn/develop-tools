@@ -339,9 +339,8 @@ pub fn adr_contract(repo: &Path, index_file: Option<&Path>) -> Result<AdrContrac
         develop_tools_manifest::locate_in(|path| Ok(listed.split('\0').any(|name| name == path)))?
     else {
         return Err(format!(
-            "{}（移行中は旧い {}）が index に無い（ADR 番号の契約の欄は配布の道具が書く。手で足さない）",
-            develop_tools_manifest::PATH,
-            develop_tools_manifest::LEGACY_PATH
+            "{} が index に無い（ADR 番号の契約の欄は配布の道具が書く。手で足さない）",
+            develop_tools_manifest::PATH
         ));
     };
     let output = git_output_with_index(repo, index_file, &["show", &format!(":{path}")])?;
@@ -449,8 +448,9 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         git_ok(&repo, &["init", "-q"]);
         if let Some(text) = declaration {
-            fs::write(repo.join(".develop-tools.json"), text).unwrap();
-            git_ok(&repo, &["add", ".develop-tools.json"]);
+            fs::create_dir(repo.join(".config")).unwrap();
+            fs::write(repo.join(develop_tools_manifest::PATH), text).unwrap();
+            git_ok(&repo, &["add", develop_tools_manifest::PATH]);
         }
         (dir, repo)
     }
@@ -471,10 +471,23 @@ mod tests {
     }
 
     #[test]
+    fn retired_index_declaration_fails() {
+        let (_dir, repo) = repo_with_index_declaration(None);
+        fs::write(
+            repo.join(develop_tools_manifest::LEGACY_PATH),
+            r#"{"adrMigratedThrough":9}"#,
+        )
+        .unwrap();
+        git_ok(&repo, &["add", develop_tools_manifest::LEGACY_PATH]);
+        let error = adr_contract(&repo, None).unwrap_err();
+        assert!(error.starts_with("manifest_legacy:"), "{error}");
+    }
+
+    #[test]
     fn index_declaration_wins_over_the_worktree() {
         let (_dir, repo) = repo_with_index_declaration(Some(r#"{"adrMigratedThrough":9}"#));
         fs::write(
-            repo.join(".develop-tools.json"),
+            repo.join(develop_tools_manifest::PATH),
             r#"{"adrMigratedThrough":30}"#,
         )
         .unwrap();

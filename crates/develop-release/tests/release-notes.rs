@@ -785,12 +785,13 @@ fn declared_render(notes: &str, changelog: &str) -> String {
     let dir = fixture();
     let root = dir.path();
     git(root, &["tag", "v0.1.0"]);
+    std::fs::create_dir_all(root.join(".config")).unwrap();
     std::fs::write(
-        root.join(".develop-tools.json"),
+        root.join(".config/develop-tools.json"),
         format!("{{\"release\": {{\"notes\": {notes}}}}}\n"),
     )
     .unwrap();
-    git(root, &["add", ".develop-tools.json"]);
+    git(root, &["add", ".config/develop-tools.json"]);
     commit(root, changelog, "notes");
     let declared = declared_notes(root).unwrap().unwrap();
     let prepared = prepare_notes(root, declared, "v0.2.0").unwrap();

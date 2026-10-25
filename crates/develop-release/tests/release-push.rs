@@ -226,8 +226,9 @@ fn setup_tagged(
         &root,
         &["config", "core.hooksPath", hooks.to_str().unwrap()],
     );
+    std::fs::create_dir_all(root.join(".config")).unwrap();
     std::fs::write(
-        root.join(".develop-tools.json"),
+        root.join(".config/develop-tools.json"),
         format!("{{\"integrationBranch\":\"{integration}\"}}\n"),
     )
     .unwrap();
@@ -615,8 +616,9 @@ fn release_push_pushes_main_once_when_it_is_the_integration_branch() {
 
 fn advance_main_after_release(repo: &Repo) -> String {
     git(&repo.root, &["push", "-q", "origin", "main"]);
+    std::fs::create_dir_all(repo.root.join(".config")).unwrap();
     std::fs::write(
-        repo.root.join(".develop-tools.json"),
+        repo.root.join(".config/develop-tools.json"),
         "{\"integrationBranch\":\"main\",\"release\":{\"versionFiles\":[{\"path\":\"package.json\",\"kind\":\"package-json\"}]}}\n",
     )
     .unwrap();
@@ -718,8 +720,9 @@ fn develop_push_still_requires_a_version_tag_at_main_tip() {
     let repo = setup("develop", Workflow::Tracked, ServerHook::None);
     git(&repo.root, &["checkout", "-q", "main"]);
     advance_main_after_release(&repo);
+    std::fs::create_dir_all(repo.root.join(".config")).unwrap();
     std::fs::write(
-        repo.root.join(".develop-tools.json"),
+        repo.root.join(".config/develop-tools.json"),
         "{\"integrationBranch\":\"develop\"}\n",
     )
     .unwrap();

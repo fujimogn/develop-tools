@@ -72,7 +72,8 @@ fixture() {
     digest=$(shasum -a 256 "$case_dir/releases/$asset" | awk '{print $1}')
   fi
   printf '%s  %s\n' "$digest" "$asset" > "$case_dir/releases/SHA256SUMS"
-  printf '{"version":"%s","sha256":{"%s":"%s"}}\n' "$version" "$target" "$digest" > "$case_dir/repo/.develop-tools.json"
+  mkdir -p "$case_dir/repo/.config"
+  printf '{"version":"%s","sha256":{"%s":"%s"}}\n' "$version" "$target" "$digest" > "$case_dir/repo/.config/develop-tools.json"
   cat > "$case_dir/fakebin/curl" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$CURL_LOG"
@@ -243,12 +244,12 @@ done
 printf 'ok: missing commands named\n'
 
 fixture manifest_aba
-cp "$case_dir/repo/.develop-tools.json" "$case_dir/repo/.develop-tools-original.json"
+cp "$case_dir/repo/.config/develop-tools.json" "$case_dir/repo/.develop-tools-original.json"
 printf '{"version":"%s","sha256":{"%s":"%064d"}}\n' "$other_version" "$target" 0 > "$case_dir/repo/.develop-tools-next.json"
 if command -v sha256sum >/dev/null 2>&1; then
-  original_digest=$(sha256sum "$case_dir/repo/.develop-tools.json" | awk '{print $1}')
+  original_digest=$(sha256sum "$case_dir/repo/.config/develop-tools.json" | awk '{print $1}')
 else
-  original_digest=$(shasum -a 256 "$case_dir/repo/.develop-tools.json" | awk '{print $1}')
+  original_digest=$(shasum -a 256 "$case_dir/repo/.config/develop-tools.json" | awk '{print $1}')
 fi
 for cache_version in "$version" "$other_version"; do
   cache_dir=$case_dir/cache/develop-tools/$cache_version/$target
@@ -258,7 +259,7 @@ for cache_version in "$version" "$other_version"; do
 done
 # Each jq call changes the source manifest before forwarding its original arguments.
 # shellcheck disable=SC2016
-printf '#!/bin/sh\nif [ ! -e "$JQ_LOG" ]; then\n  cp .develop-tools-next.json .develop-tools.json\nelse\n  cp .develop-tools-original.json .develop-tools.json\nfi\nprintf "jq\\n" >> "$JQ_LOG"\nfor arg do snapshot=$arg; done\nprintf "%%s\\n" "$snapshot" >> "$SNAPSHOT_LOG"\nexec "%s" "$@"\n' "$(real_command jq)" > "$case_dir/fakebin/jq"
+printf '#!/bin/sh\nif [ ! -e "$JQ_LOG" ]; then\n  cp .develop-tools-next.json .config/develop-tools.json\nelse\n  cp .develop-tools-original.json .config/develop-tools.json\nfi\nprintf "jq\\n" >> "$JQ_LOG"\nfor arg do snapshot=$arg; done\nprintf "%%s\\n" "$snapshot" >> "$SNAPSHOT_LOG"\nexec "%s" "$@"\n' "$(real_command jq)" > "$case_dir/fakebin/jq"
 chmod +x "$case_dir/fakebin/jq"
 run_resolver ci aba
 [ "$result" -eq 0 ] || fail_test "manifest ABA setup failed: $(cat "$case_dir/stderr")"
@@ -267,21 +268,21 @@ read -r snapshot_path < "$case_dir/snapshot.log"
 [ "$(wc -l < "$case_dir/snapshot.log")" -eq 2 ] || fail_test 'manifest ABA did not record both jq sources'
 [ "$(sed -n '2p' "$case_dir/snapshot.log")" = "$snapshot_path" ] || fail_test 'manifest ABA used different jq sources'
 [ ! -e "$snapshot_path" ] || fail_test 'manifest snapshot survived the resolver'
-[ "$(cat "$case_dir/repo/.develop-tools.json")" = "$(cat "$case_dir/repo/.develop-tools-original.json")" ] || fail_test 'manifest ABA did not restore the source'
+[ "$(cat "$case_dir/repo/.config/develop-tools.json")" = "$(cat "$case_dir/repo/.develop-tools-original.json")" ] || fail_test 'manifest ABA did not restore the source'
 index=$case_dir/cache/develop-tools/.manifest-$target-$original_digest
 [ "$(cat "$index")" = "$original_digest $version $digest" ] || fail_test 'manifest ABA mixed the index with another version'
 printf 'ok: manifest ABA keeps digest and jq values on one snapshot\n'
 
 fixture manifest_race
-cp "$case_dir/repo/.develop-tools.json" "$case_dir/repo/.develop-tools-next.json"
-printf '{"version":"%s","sha256":{"%s":"%064d"}}\n' "$version" "$target" 0 > "$case_dir/repo/.develop-tools.json"
+cp "$case_dir/repo/.config/develop-tools.json" "$case_dir/repo/.develop-tools-next.json"
+printf '{"version":"%s","sha256":{"%s":"%064d"}}\n' "$version" "$target" 0 > "$case_dir/repo/.config/develop-tools.json"
 cache_dir=$case_dir/cache/develop-tools/$version/$target
 mkdir -p "$cache_dir"
 cp "$case_dir/payload/$binary" "$cache_dir/$binary"
 printf '%s\n' "$digest" > "$cache_dir/.sha256"
 # The first jq invocation replaces the manifest before reading it.
 # shellcheck disable=SC2016
-printf '#!/bin/sh\nif [ ! -e "$JQ_LOG" ]; then\n  cp .develop-tools-next.json .develop-tools.json\nfi\nprintf "jq\\n" >> "$JQ_LOG"\nexec "%s" "$@"\n' "$(real_command jq)" > "$case_dir/fakebin/jq"
+printf '#!/bin/sh\nif [ ! -e "$JQ_LOG" ]; then\n  cp .develop-tools-next.json .config/develop-tools.json\nfi\nprintf "jq\\n" >> "$JQ_LOG"\nexec "%s" "$@"\n' "$(real_command jq)" > "$case_dir/fakebin/jq"
 chmod +x "$case_dir/fakebin/jq"
 run_resolver ci raced
 [ "$result" -ne 0 ] || fail_test 'manifest replacement escaped the snapshot check'
@@ -290,7 +291,7 @@ assert_contains "$(cat "$case_dir/stderr")" 'sha256 が一致しません'
 for index in "$case_dir"/cache/develop-tools/.manifest-"$target"-*; do
   [ ! -e "$index" ] || fail_test 'manifest race wrote an index for stale bytes'
 done
-printf '{"version":"%s","sha256":{"%s":"%064d"}}\n' "$version" "$target" 0 > "$case_dir/repo/.develop-tools.json"
+printf '{"version":"%s","sha256":{"%s":"%064d"}}\n' "$version" "$target" 0 > "$case_dir/repo/.config/develop-tools.json"
 run_resolver ci stale
 [ "$result" -ne 0 ] || fail_test 'restored manifest executed a binary with a different digest'
 assert_contains "$(cat "$case_dir/stderr")" 'sha256 が一致しません'
@@ -300,9 +301,9 @@ fixture cache_hit
 run_resolver ci first
 [ "$result" -eq 0 ] || fail_test 'initial cache install failed'
 if command -v sha256sum >/dev/null 2>&1; then
-  manifest_digest=$(sha256sum "$case_dir/repo/.develop-tools.json" | awk '{print $1}')
+  manifest_digest=$(sha256sum "$case_dir/repo/.config/develop-tools.json" | awk '{print $1}')
 else
-  manifest_digest=$(shasum -a 256 "$case_dir/repo/.develop-tools.json" | awk '{print $1}')
+  manifest_digest=$(shasum -a 256 "$case_dir/repo/.config/develop-tools.json" | awk '{print $1}')
 fi
 index=$case_dir/cache/develop-tools/.manifest-$target-$manifest_digest
 [ -f "$index" ] || fail_test 'verified cache did not write a manifest index'
@@ -315,8 +316,8 @@ run_resolver ci second
 [ "$(wc -l < "$case_dir/curl.log")" -eq 2 ] || fail_test 'cache hit fetched again'
 [ ! -e "$case_dir/jq.log" ] || fail_test 'manifest index hit called jq'
 assert_contains "$(cat "$case_dir/stdout")" 'ran:second'
-cp "$case_dir/repo/.develop-tools.json" "$case_dir/repo/.develop-tools-next.json"
-printf '{ "version":"%s", "sha256":{"%s":"%s"}}\n' "$version" "$target" "$digest" > "$case_dir/repo/.develop-tools.json"
+cp "$case_dir/repo/.config/develop-tools.json" "$case_dir/repo/.develop-tools-next.json"
+printf '{ "version":"%s", "sha256":{"%s":"%s"}}\n' "$version" "$target" "$digest" > "$case_dir/repo/.config/develop-tools.json"
 run_resolver ci rewritten
 [ "$result" -eq 0 ] || fail_test 'rewritten manifest with the same digest was rejected'
 [ "$(wc -l < "$case_dir/jq.log")" -eq 2 ] || fail_test 'changed manifest did not call jq'
@@ -324,11 +325,11 @@ run_resolver ci rewritten
 run_resolver ci rewritten_again
 [ "$result" -eq 0 ] || fail_test 'rewritten manifest missed its index'
 [ "$(wc -l < "$case_dir/jq.log")" -eq 2 ] || fail_test 'rewritten manifest called jq twice'
-cp "$case_dir/repo/.develop-tools-next.json" "$case_dir/repo/.develop-tools.json"
+cp "$case_dir/repo/.develop-tools-next.json" "$case_dir/repo/.config/develop-tools.json"
 run_resolver ci restored
 [ "$result" -eq 0 ] || fail_test 'restored manifest was rejected'
 [ "$(wc -l < "$case_dir/jq.log")" -eq 2 ] || fail_test 'restored manifest missed its index'
-printf '{"version":"%s","sha256":{"%s":"%064d"}}\n' "$version" "$target" 0 > "$case_dir/repo/.develop-tools.json"
+printf '{"version":"%s","sha256":{"%s":"%064d"}}\n' "$version" "$target" 0 > "$case_dir/repo/.config/develop-tools.json"
 run_resolver ci
 [ "$result" -ne 0 ] || fail_test 'changed manifest digest was accepted'
 [ "$(wc -l < "$case_dir/jq.log")" -eq 4 ] || fail_test 'changed digest did not return to jq'
@@ -340,7 +341,7 @@ printf 'ok: manifest index hit and changed manifest fallback\n'
 for mismatch in manifest sums; do
   fixture "mismatch_$mismatch"
   if [ "$mismatch" = manifest ]; then
-    printf '{"version":"%s","sha256":{"%s":"%064d"}}\n' "$version" "$target" 0 > "$case_dir/repo/.develop-tools.json"
+    printf '{"version":"%s","sha256":{"%s":"%064d"}}\n' "$version" "$target" 0 > "$case_dir/repo/.config/develop-tools.json"
   else
     printf '%064d  %s\n' 0 "$asset" > "$case_dir/releases/SHA256SUMS"
   fi
@@ -365,27 +366,25 @@ for mode_name in pre-commit ci pre-push release; do
 done
 printf 'ok: download failure modes\n'
 
-fixture manifest_legacy_only
-run_resolver ci
-[ "$result" -eq 0 ] || fail_test "legacy-only manifest failed: $(cat "$case_dir/stderr")"
-assert_contains "$(cat "$case_dir/stdout")" 'ran:'
-printf 'ok: manifest legacy location only\n'
-
 fixture manifest_new_only
-mkdir -p "$case_dir/repo/.config"
-mv "$case_dir/repo/.develop-tools.json" "$case_dir/repo/.config/develop-tools.json"
 run_resolver ci
 [ "$result" -eq 0 ] || fail_test "new-only manifest failed: $(cat "$case_dir/stderr")"
 assert_contains "$(cat "$case_dir/stdout")" 'ran:'
 printf 'ok: manifest new location only\n'
 
+fixture manifest_legacy_only
+mv "$case_dir/repo/.config/develop-tools.json" "$case_dir/repo/.develop-tools.json"
+run_resolver ci
+[ "$result" -ne 0 ] || fail_test 'legacy-only manifest unexpectedly passed'
+assert_contains "$(cat "$case_dir/stderr")" '旧い置き場です'
+assert_contains "$(cat "$case_dir/stderr")" '.config/develop-tools.json へ移す'
+printf 'ok: manifest legacy location only fails\n'
+
 fixture manifest_both
-mkdir -p "$case_dir/repo/.config"
-cp "$case_dir/repo/.develop-tools.json" "$case_dir/repo/.config/develop-tools.json"
+cp "$case_dir/repo/.config/develop-tools.json" "$case_dir/repo/.develop-tools.json"
 run_resolver ci
 [ "$result" -ne 0 ] || fail_test 'both manifests unexpectedly passed'
-assert_contains "$(cat "$case_dir/stderr")" '.config/develop-tools.json'
-assert_contains "$(cat "$case_dir/stderr")" '.develop-tools.json'
+assert_contains "$(cat "$case_dir/stderr")" '.config/develop-tools.json と .develop-tools.json の両方があります'
 printf 'ok: both manifests fail naming both paths\n'
 
 fixture local_binary

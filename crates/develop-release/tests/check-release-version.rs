@@ -15,7 +15,8 @@ fn repo(manifest: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     std::fs::write(root.join("package.json"), "{\"version\":\"1.2.3\"}\n").unwrap();
-    std::fs::write(root.join(".develop-tools.json"), manifest).unwrap();
+    std::fs::create_dir_all(root.join(".config")).unwrap();
+    std::fs::write(root.join(".config/develop-tools.json"), manifest).unwrap();
     git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Test"]);
     git(root, &["config", "user.email", "test@example.com"]);

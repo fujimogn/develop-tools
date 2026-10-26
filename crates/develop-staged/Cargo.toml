@@ -35,3 +35,8 @@ test = false
 name = "check-staged-docs"
 path = "src/bin/check-staged-docs.rs"
 test = false
+
+[[bin]]
+name = "inspect-adr"
+path = "src/bin/inspect-adr.rs"
+test = false

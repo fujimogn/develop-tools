@@ -45,35 +45,43 @@ pub fn read_workspace_version(root: &Path) -> Result<Version, String> {
 #[serde(deny_unknown_fields)]
 struct ReleaseBinariesFile {
     binaries: Vec<String>,
+    #[serde(rename = "includePublic", default = "include_public_by_default")]
+    include_public: bool,
 }
 
-/// 公開 CLI の一覧と非公開の一覧を合成する。
+fn include_public_by_default() -> bool {
+    true
+}
+
+fn read_release_binaries_file(path: &Path) -> Result<ReleaseBinariesFile, String> {
+    let text = std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    serde_json::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+/// snapshot の宣言に従って公開一覧と専用一覧を合成する。
 ///
-/// 公開側の file が無い Release 済み snapshot（v0.5.10 まで）は、その snapshot の
-/// `config/release-binaries.json` だけで一覧を作る。移行の縮退。tasks 3.2 で外す。
+/// `includePublic` の省略/true は従来の一覧を保ち、false は専用一覧だけを使う。
+/// 公開 manifest の無い旧 snapshot では、その snapshot の専用一覧を使う。
 pub fn load_release_binaries(root: &Path) -> Result<Vec<String>, String> {
-    let public = root.join("packages/cli/config/release-binaries.json");
-    let public_missing = match std::fs::metadata(&public) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-        Err(err) => return Err(format!("{}: {err}", public.display())),
-        Ok(_) => false,
-    };
-    let relatives: &[&str] = if public_missing {
-        &["config/release-binaries.json"]
+    let private_path = root.join("config/release-binaries.json");
+    let private = read_release_binaries_file(&private_path)?;
+    let public_path = root.join("packages/cli/config/release-binaries.json");
+    let public = if private.include_public {
+        match std::fs::metadata(&public_path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(format!("{}: {err}", public_path.display())),
+            Ok(_) => Some(read_release_binaries_file(&public_path)?),
+        }
     } else {
-        &[
-            "packages/cli/config/release-binaries.json",
-            "config/release-binaries.json",
-        ]
+        None
     };
     let mut seen = std::collections::HashSet::new();
     let mut binaries = Vec::new();
-    for relative in relatives {
-        let path = root.join(relative);
-        let text =
-            std::fs::read_to_string(&path).map_err(|err| format!("{}: {err}", path.display()))?;
-        let file: ReleaseBinariesFile =
-            serde_json::from_str(&text).map_err(|err| format!("{}: {err}", path.display()))?;
+    for (path, file) in public
+        .into_iter()
+        .map(|file| (&public_path, file))
+        .chain(std::iter::once((&private_path, private)))
+    {
         if file.binaries.is_empty() {
             return Err(format!("{}: binary 一覧が空です", path.display()));
         }

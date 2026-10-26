@@ -42,12 +42,19 @@ The resolver needs `curl`, `tar`, `jq` and `sha256sum` or `shasum`. In GitHub Ac
 | `develop-docs-check` | Check local Markdown links, heading anchors and size limits in tracked, staged or ranged files. |
 | `check-staged-docs` | Check a staged `TODO.md` and `CHANGELOG.md`. |
 | `check-staged-adr` | Check the structure of staged architecture decision records and their numbers against the ADR numbering contract in the staged `.develop-tools.json`. |
+| `inspect-adr` | Inspect all working-tree ADRs, including numbering, archives, the template and the README index. |
 | `develop-secrets` | Build development secret files from secret references or standard input without printing the values. |
 | `release` | Advance the declared version files, fast-forward `main` and create a local tag. `release push` publishes them. |
 | `check-release-version` | Before a push, check that the release tag matches the declared version files. |
 | `archive-changelog` | Move older months of `CHANGELOG.md` out of the file and into Git history. |
 
 Run a binary with `--help` for its options.
+
+## Inspect all ADRs
+
+Run `./resolve ci inspect-adr` from the repository root. Declare at least one ADR numbering field (`adrMigratedThrough`, `adrReservedNumbers` or `adrSanitizedNumbers`) in `.config/develop-tools.json`. The command uses this current manifest contract; it does not read the retired `docs/adr/adr-contract.json`. The command reads the working tree, including unstaged and untracked ADRs; it does not require a Git index. Keep the template baseline at `scripts/develop-tools/adr-template.md` and the local template at `docs/adr/adr-template.md`. The baseline is a Markdown document and must remain available when replacing older scripts with this binary.
+
+The command reports template drift, missing README entries, duplicate or missing numbers, reserved-number reuse and invalid legacy or sanitized archive hashes. It writes no files. Exit codes are `0` for no findings, `1` for documentation violations and `2` for argument or input-reading failures. Use `check-staged-adr` for staged changes; that command does not check whole-tree template drift.
 
 ## Version files
 

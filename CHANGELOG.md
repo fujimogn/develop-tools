@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-10-27
+
+### Added
+
+- Add `inspect-adr` for full repository ADR validation.
+
+### Changed
+
+- Honor `includePublic` in release inventories while preserving legacy snapshots.
+
 ## [0.6.4] - 2026-10-25
 
 ### Changed

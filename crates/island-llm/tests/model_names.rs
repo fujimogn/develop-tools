@@ -47,5 +47,5 @@ fn every_table_row_names_a_model() {
         .iter()
         .map(|p| p.name)
         .collect();
-    assert_eq!(names, ["digest", "release-notes"]);
+    assert_eq!(names, ["digest", "release-notes", "release-notes-en"]);
 }

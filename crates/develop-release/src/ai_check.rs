@@ -7,6 +7,7 @@
 use std::collections::BTreeSet;
 
 use develop_tools_core::bounded_name::contains_bounded_name;
+use develop_tools_core::develop_tools_manifest::NotesLanguage;
 use island_llm::settings::{Audience, DictionaryMissing, Settings};
 use serde_json::{Map, Value};
 
@@ -260,10 +261,13 @@ impl AiNotes {
         let tail = if self.unreferenced.is_empty() {
             extract.compare_line()
         } else {
-            format!(
-                "その他の変更は {} を参照してください。",
-                extract.compare_link()
-            )
+            match extract.language {
+                NotesLanguage::Ja => format!(
+                    "その他の変更は {} を参照してください。",
+                    extract.compare_link()
+                ),
+                NotesLanguage::En => format!("See {} for other changes.", extract.compare_link()),
+            }
         };
         format!("{}\n\n{items}\n{tail}\n", self.summary)
     }

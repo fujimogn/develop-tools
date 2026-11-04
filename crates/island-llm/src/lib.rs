@@ -100,11 +100,14 @@ pub fn run(
     check_budget(purpose, input.len())?;
     let api_key = key::resolve(key_ref, runtime).ok_or(Failure::KeyMissing)?;
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": purpose.model,
         "max_tokens": purpose.max_tokens,
         "messages": [{"role": "user", "content": format!("{}{input}", purpose.instruction)}],
     });
+    if let Some(thinking) = purpose.thinking {
+        body["thinking"] = serde_json::json!(thinking);
+    }
     let sent = runtime.transport.send(&ApiRequest {
         body,
         api_key: &api_key,

@@ -228,9 +228,14 @@ fn snapshot_declarations_preserve_twelve_eight_and_four_member_archives() {
         }
         config(dir.path(), &manifest.to_string());
         if mode != "legacy" {
+            // C2 は公開9本を合成しない。省略/true の旧 snapshot は公開8+private4を保つ。
+            let mut declared_public = public.to_vec();
+            if mode == "false" {
+                declared_public.push("inspect-adr");
+            }
             public_config(
                 dir.path(),
-                &serde_json::json!({"binaries":public}).to_string(),
+                &serde_json::json!({"binaries":declared_public}).to_string(),
             );
         }
         assert_eq!(

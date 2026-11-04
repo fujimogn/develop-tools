@@ -5,12 +5,14 @@ use island_docs::markdown::fence_mask;
 pub use island_docs::records::{
     Finding, FindingKind, TODO_ITEM_WARNING_BYTES, inspect_changelog, inspect_todo,
 };
-use island_docs::records::{is_month_heading, parse_month_heading};
+use island_docs::records::{changelog_item_date, is_month_heading, parse_month_heading};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangelogArchivePlan {
     pub content: String,
     pub archived_months: Vec<String>,
+    /// 保護月の中から退避した日付（古い月だけで上限に戻らないときだけ）。
+    pub archived_dates: Vec<String>,
     pub bytes_before: usize,
     pub bytes_after: usize,
 }
@@ -29,6 +31,7 @@ pub fn plan_changelog_archive(
         return Ok(ChangelogArchivePlan {
             content: content.to_owned(),
             archived_months: Vec::new(),
+            archived_dates: Vec::new(),
             bytes_before,
             bytes_after: bytes_before,
         });
@@ -52,17 +55,10 @@ pub fn plan_changelog_archive(
     let target = CHANGELOG_MAX_BYTES * CHANGELOG_ARCHIVE_TARGET_PERCENT / 100;
     let mut archived = Vec::new();
     loop {
-        let candidate_preamble = archive_preamble(&preamble, &archived, commit_sha);
+        let candidate_preamble = archive_preamble(&preamble, newest(&archived), commit_sha);
         let candidate = render(&candidate_preamble, &sections);
         if candidate.len() <= target {
-            let mut archived_months = archived;
-            archived_months.sort();
-            return Ok(ChangelogArchivePlan {
-                content: candidate.clone(),
-                archived_months,
-                bytes_before,
-                bytes_after: candidate.len(),
-            });
+            return Ok(finished_plan(candidate, archived, Vec::new(), bytes_before));
         }
 
         let Some((index, _)) = sections
@@ -72,14 +68,18 @@ pub fn plan_changelog_archive(
             .min_by(|(_, left), (_, right)| left.month.cmp(&right.month))
         else {
             if candidate.len() <= CHANGELOG_MAX_BYTES {
-                let mut archived_months = archived;
-                archived_months.sort();
-                return Ok(ChangelogArchivePlan {
-                    content: candidate.clone(),
-                    archived_months,
-                    bytes_before,
-                    bytes_after: candidate.len(),
-                });
+                return Ok(finished_plan(candidate, archived, Vec::new(), bytes_before));
+            }
+            if let Some(plan) = archive_old_dates(
+                &preamble,
+                &mut sections,
+                &protected_month,
+                archived.clone(),
+                commit_sha,
+                target,
+                bytes_before,
+            ) {
+                return Ok(plan);
             }
             let message = if protects_current_month {
                 "古い月をすべて退避しても上限に戻りません。当月の項目を畳む必要があります"
@@ -91,6 +91,122 @@ pub fn plan_changelog_archive(
         archived.push(sections[index].month.clone());
         sections.remove(index);
     }
+}
+
+fn finished_plan(
+    content: String,
+    mut archived_months: Vec<String>,
+    mut archived_dates: Vec<String>,
+    bytes_before: usize,
+) -> ChangelogArchivePlan {
+    archived_months.sort();
+    archived_dates.sort();
+    let bytes_after = content.len();
+    ChangelogArchivePlan {
+        content,
+        archived_months,
+        archived_dates,
+        bytes_before,
+        bytes_after,
+    }
+}
+
+fn newest(labels: &[String]) -> Option<&str> {
+    labels.iter().max().map(String::as_str)
+}
+
+/// 古い月を尽くしても上限を超えるとき、保護月の項目を日付の古いものから日付単位で除く。
+/// いちばん新しい日付と日付を読めない行は残す。上限に戻らなければ `None`。
+fn archive_old_dates(
+    preamble: &str,
+    sections: &mut [MonthSection],
+    protected_month: &str,
+    archived_months: Vec<String>,
+    commit_sha: &str,
+    target: usize,
+    bytes_before: usize,
+) -> Option<ChangelogArchivePlan> {
+    let index = sections
+        .iter()
+        .position(|section| section.month == protected_month)?;
+    let mut segments = split_items(&sections[index].raw);
+    let mut dates = segments
+        .iter()
+        .filter_map(|segment| segment.date.clone())
+        .collect::<Vec<_>>();
+    dates.sort();
+    dates.dedup();
+    dates.pop();
+
+    let mut archived_dates = Vec::new();
+    let mut last = None;
+    for date in dates {
+        segments.retain(|segment| segment.date.as_deref() != Some(date.as_str()));
+        archived_dates.push(date);
+        sections[index].raw = segments
+            .iter()
+            .map(|segment| segment.raw.as_str())
+            .collect();
+        let candidate = render(
+            &archive_preamble(preamble, newest(&archived_dates), commit_sha),
+            sections,
+        );
+        if candidate.len() <= target {
+            return Some(finished_plan(
+                candidate,
+                archived_months,
+                archived_dates,
+                bytes_before,
+            ));
+        }
+        last = Some(candidate);
+    }
+    last.filter(|candidate| candidate.len() <= CHANGELOG_MAX_BYTES)
+        .map(|candidate| finished_plan(candidate, archived_months, archived_dates, bytes_before))
+}
+
+struct ItemSegment {
+    date: Option<String>,
+    raw: String,
+}
+
+/// 月節を、トップレベル項目とそれ以外の行に分ける。項目の続きは、字下げした行と、空行の後で
+/// 字下げが続く行だけにする。字下げの無い項目以外の行（fence・見出し・本文）は日付なしで残す。
+fn split_items(raw: &str) -> Vec<ItemSegment> {
+    let records = raw.split_inclusive('\n').collect::<Vec<_>>();
+    let lines = records
+        .iter()
+        .map(|record| record.trim_end_matches(['\r', '\n']))
+        .collect::<Vec<_>>();
+    let fenced = fence_mask(&lines);
+    let indented = |line: &str| line.starts_with(' ') || line.starts_with('\t');
+    let mut segments: Vec<ItemSegment> = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        let line = lines[index];
+        let starts_item = !fenced[index] && line.starts_with("- ");
+        let in_item = segments
+            .last()
+            .is_some_and(|segment| segment.date.is_some());
+        let continues_item = !starts_item
+            && in_item
+            && if line.trim().is_empty() {
+                lines[index + 1..]
+                    .iter()
+                    .find(|next| !next.trim().is_empty())
+                    .is_some_and(|next| indented(next))
+            } else {
+                indented(line)
+            };
+        if continues_item {
+            segments.last_mut().expect("checked").raw.push_str(record);
+            continue;
+        }
+        segments.push(ItemSegment {
+            date: starts_item.then(|| changelog_item_date(line)).flatten(),
+            raw: (*record).to_owned(),
+        });
+    }
+    segments
 }
 
 #[derive(Debug, Clone)]
@@ -143,16 +259,11 @@ fn parse_sections(content: &str) -> Result<(String, Vec<MonthSection>), String> 
     Ok((preamble, sections))
 }
 
-fn archive_preamble(preamble: &str, archived: &[String], commit_sha: &str) -> String {
-    if archived.is_empty() {
+fn archive_preamble(preamble: &str, newest_archived: Option<&str>, commit_sha: &str) -> String {
+    let Some(newest_archived) = newest_archived else {
         return preamble.to_owned();
-    }
-    let mut months = archived.to_vec();
-    months.sort();
-    let note = format!(
-        "> {} 以前は git 履歴（退避直前の commit: {commit_sha}）",
-        months.last().expect("archived is non-empty")
-    );
+    };
+    let note = format!("> {newest_archived} 以前は git 履歴（退避直前の commit: {commit_sha}）");
 
     let records = preamble.split_inclusive('\n').collect::<Vec<_>>();
     if let Some(note_index) = records

@@ -319,6 +319,11 @@ pub fn parse_month_heading(line: &str) -> Option<String> {
     Some(month.to_owned())
 }
 
+/// トップレベル成果項目の完了日。形式が正しくなければ `None`。
+pub fn changelog_item_date(line: &str) -> Option<String> {
+    parse_changelog_item(line).ok()
+}
+
 fn parse_changelog_item(line: &str) -> Result<String, String> {
     let Some(rest) = line.strip_prefix("- **") else {
         return Err(

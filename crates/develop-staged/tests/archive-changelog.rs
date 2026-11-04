@@ -285,3 +285,32 @@ fn output_text(output: &Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     )
 }
+
+#[test]
+fn yes_archives_old_dates_of_the_current_month_when_it_alone_is_over_the_cap() {
+    let month = current_month();
+    let item = |day: &str| format!("- **成果（{month}-{day}）**: {}\n", "x".repeat(50_000));
+    let content = format!(
+        "# Changelog\n> 古い分は git 履歴に任せる。\n\n## {month}\n{}{}{}",
+        item("20"),
+        item("10"),
+        item("01"),
+    );
+    let repo = repo_with_changelog(&content);
+    let before_sha = git_output(repo.path(), &["rev-parse", "HEAD"]);
+
+    let dry = run_archiver(repo.path(), &[]);
+    assert!(dry.status.success(), "{}", output_text(&dry));
+    assert!(output_text(&dry).contains(&format!("退避する保護月の日付: {month}-01〜{month}-10")));
+
+    let output = run_archiver(repo.path(), &["--yes"]);
+
+    assert!(output.status.success(), "{}", output_text(&output));
+    let result = fs::read_to_string(repo.path().join("CHANGELOG.md")).unwrap();
+    assert!(result.contains(&format!("（{month}-20）")));
+    assert!(!result.contains(&format!("（{month}-10）")));
+    assert!(result.contains(&format!(
+        "> {month}-10 以前は git 履歴（退避直前の commit: {before_sha}）"
+    )));
+    assert!(result.len() <= 96_000);
+}

@@ -333,3 +333,95 @@ fn archive_refuses_to_apply_when_current_month_alone_is_too_large() {
 
     assert!(error.contains("当月の項目を畳む"));
 }
+
+#[test]
+fn archive_moves_into_old_dates_of_the_current_month_when_months_run_out() {
+    let item = |date: &str| format!("- **成果（{date}）**: {}\n", "x".repeat(30_000));
+    let content = format!(
+        "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-10\n{}{}{}{}\n## 2026-09\n- **成果（2026-09-01）**: old\n",
+        item("2026-10-29"),
+        item("2026-10-20"),
+        item("2026-10-10"),
+        item("2026-10-01"),
+    );
+
+    let plan = plan_changelog_archive(&content, "2026-10", "deadbeef").unwrap();
+
+    assert_eq!(plan.archived_months, vec!["2026-09"]);
+    assert_eq!(plan.archived_dates, vec!["2026-10-01"]);
+    assert!(plan.content.contains("（2026-10-29）"));
+    assert!(plan.content.contains("（2026-10-10）"));
+    assert!(!plan.content.contains("（2026-10-01）"));
+    assert!(
+        plan.content
+            .contains("> 2026-10-01 以前は git 履歴（退避直前の commit: deadbeef）")
+    );
+    assert_eq!(plan.content.matches("以前は git 履歴").count(), 1);
+    assert!(plan.bytes_after <= CHANGELOG_MAX_BYTES * CHANGELOG_ARCHIVE_TARGET_PERCENT / 100);
+    assert!(
+        inspect_changelog(plan.content.as_bytes())
+            .iter()
+            .all(|f| f.kind != FindingKind::Error)
+    );
+}
+
+#[test]
+fn archive_picks_dates_by_value_not_by_position_and_keeps_the_newest_date() {
+    let item = |date: &str| format!("- **成果（{date}、補足）**: {}\n", "x".repeat(41_000));
+    let content = format!(
+        "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-10\n{}{}{}{}",
+        item("2026-10-05"),
+        item("2026-10-29"),
+        item("2026-10-02"),
+        item("2026-10-29"),
+    );
+
+    let plan = plan_changelog_archive(&content, "2026-10", "deadbeef").unwrap();
+
+    assert_eq!(plan.archived_dates, vec!["2026-10-02", "2026-10-05"]);
+    assert_eq!(plan.content.matches("（2026-10-29、補足）").count(), 2);
+    assert!(plan.content.contains("> 2026-10-05 以前は git 履歴"));
+    assert!(plan.bytes_after <= CHANGELOG_MAX_BYTES);
+}
+
+#[test]
+fn archive_refuses_when_the_newest_date_alone_is_too_large() {
+    let content = format!(
+        "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-10\n- **成果（2026-10-29）**: {}\n- **成果（2026-10-01）**: old\n",
+        "x".repeat(CHANGELOG_MAX_BYTES)
+    );
+
+    let error = plan_changelog_archive(&content, "2026-10", "deadbeef").unwrap_err();
+
+    assert!(error.contains("当月の項目を畳む"));
+}
+
+#[test]
+fn archive_keeps_unindented_lines_after_an_archived_item() {
+    let content = format!(
+        "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-10\n- **新（2026-10-29）**: {}\n- **旧（2026-10-01）**: {}\n```markdown\n## 2026-05\n```\n",
+        "x".repeat(60_000),
+        "y".repeat(61_000)
+    );
+
+    let plan = plan_changelog_archive(&content, "2026-10", "deadbeef").unwrap();
+
+    assert_eq!(plan.archived_dates, vec!["2026-10-01"]);
+    assert!(!plan.content.contains("（2026-10-01）"));
+    assert!(plan.content.contains("```markdown\n## 2026-05\n```\n"));
+}
+
+#[test]
+fn archive_takes_the_indented_continuation_after_a_blank_line_with_its_item() {
+    let content = format!(
+        "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-10\n- **新（2026-10-29）**: {}\n- **旧（2026-10-01）**: {}\n\n  旧の補足\n",
+        "x".repeat(60_000),
+        "y".repeat(61_000)
+    );
+
+    let plan = plan_changelog_archive(&content, "2026-10", "deadbeef").unwrap();
+
+    assert_eq!(plan.archived_dates, vec!["2026-10-01"]);
+    assert!(!plan.content.contains("旧の補足"));
+    assert!(plan.content.contains("（2026-10-29）"));
+}

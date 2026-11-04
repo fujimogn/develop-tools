@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-11-04
+
+### Added
+
+- Support AI release notes with `release.notes.language: "en"`, including the version-section input, English compare guidance and the same public output checks.
+- `archive-changelog` archives the oldest dates of the current month when archiving every older month still leaves `CHANGELOG.md` over the limit. The newest date stays in place.
+
+### Fixed
+
+- AI release notes no longer fall back with `response_rejected` because thinking used up the output limit: the release-notes request disables thinking and allows up to 16,000 output tokens.
+- Date archiving in `archive-changelog` keeps unindented lines and moves a continuation after a blank line together with its entry.
+- `changelog-additions` release notes leave out rewrites of older entries: additions in the same change run as a removed entry are treated as edits and reported with a warning.
+- `changelog-additions` reads a removed horizontal rule (`---`) in the diff as body text, not as a file header.
+
 ## [0.6.5] - 2026-10-27
 
 ### Added

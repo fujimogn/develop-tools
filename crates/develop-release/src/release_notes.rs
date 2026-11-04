@@ -148,35 +148,95 @@ fn released_for_other_tag(item: &str, tag: &str) -> bool {
     release_tag(&marked) && marked != tag
 }
 
-/// 全行の文脈を含む diff から、月別節に追加されたトップレベル項目だけを採る。
-pub fn extract_changelog_additions(diff: &str, tag: &str) -> Vec<String> {
-    let mut additions = Vec::new();
-    let mut monthly = false;
-    let mut fence = Fence::default();
+/// Each side needs its own heading and fence state: deleted Markdown must not
+/// change the interpretation of the new document (or vice versa).
+#[derive(Default)]
+struct MonthlyItems {
+    monthly: bool,
+    fence: Fence,
+}
+
+impl MonthlyItems {
+    fn step(&mut self, content: &str) -> bool {
+        if self.fence.step(content) || self.fence.is_open() {
+            return false;
+        }
+        if content.starts_with("# ") || content.starts_with("## ") {
+            self.monthly = monthly_heading(content);
+        }
+        self.monthly && content.starts_with(crate::CHANGELOG_TITLE_PREFIX)
+    }
+}
+
+#[derive(Default)]
+struct ChangelogAdditions {
+    items: Vec<String>,
+    edited: Vec<String>,
+}
+
+/// Unchanged context or diff metadata ends a change run. If an old monthly item
+/// was removed, its replacements have no stable identity and cannot safely be
+/// called new items.
+fn changelog_additions(diff: &str, tag: &str) -> ChangelogAdditions {
+    let mut result = ChangelogAdditions::default();
+    let mut old = MonthlyItems::default();
+    let mut new = MonthlyItems::default();
+    let mut pending = Vec::new();
+    let mut removed_item = false;
+    let flush = |result: &mut ChangelogAdditions, pending: &mut Vec<String>, removed: &mut bool| {
+        if *removed {
+            result.edited.append(pending);
+        } else {
+            result.items.append(pending);
+        }
+        *removed = false;
+    };
+    let mut in_hunk = false;
     for line in diff.lines() {
-        if line.starts_with("+++") || line.starts_with('-') {
+        if line.starts_with("@@ ") {
+            flush(&mut result, &mut pending, &mut removed_item);
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk {
             continue;
         }
         let Some((prefix, content)) = line.split_at_checked(1) else {
+            flush(&mut result, &mut pending, &mut removed_item);
             continue;
         };
-        if prefix != "+" && prefix != " " {
-            continue;
-        }
-        if fence.step(content) || fence.is_open() {
-            continue;
-        }
-        if content.starts_with("# ") || content.starts_with("## ") {
-            monthly = monthly_heading(content);
-        } else if monthly
-            && prefix == "+"
-            && content.starts_with(crate::CHANGELOG_TITLE_PREFIX)
-            && !released_for_other_tag(content, tag)
-        {
-            additions.push(content.to_owned());
+        match prefix {
+            "-" => removed_item |= old.step(content),
+            "+" => {
+                if new.step(content) && !released_for_other_tag(content, tag) {
+                    pending.push(content.to_owned());
+                }
+            }
+            " " => {
+                flush(&mut result, &mut pending, &mut removed_item);
+                old.step(content);
+                new.step(content);
+            }
+            // Git's no-newline marker belongs to the current change run.
+            "\\" => {}
+            _ => flush(&mut result, &mut pending, &mut removed_item),
         }
     }
-    additions
+    flush(&mut result, &mut pending, &mut removed_item);
+    result
+}
+
+/// 全行の文脈を含む diff から、月別節に純粋に追加された項目を採る。
+/// 旧項目の削除と同じ連続変更区間にある追加は編集とみなし、警告して除く。
+pub fn extract_changelog_additions(diff: &str, tag: &str) -> Vec<String> {
+    let result = changelog_additions(diff, tag);
+    if !result.edited.is_empty() {
+        eprintln!(
+            "警告: 既存項目の削除を含む変更区間のため、以下を Release 本文から除外しました。新規項目が混ざっている場合は tag 注釈に補ってください。\n{}",
+            result.edited.join("\n")
+        );
+    }
+    result.items
 }
 
 /// 前 tag から終点の commit までの抽出。AI の入力と fallback の本文はどちらもここから作る。
@@ -622,9 +682,6 @@ pub fn numbered_ai_input(items: &[String]) -> String {
         .collect()
 }
 
-/// 用途の表の行の名前（`island-llm` の `purpose`）。
-const PURPOSE: &str = "release-notes";
-
 /// 推論の実行環境。usage 台帳の置き場は持たず、環境側の設定の `usage_ledger` から決める
 /// （他の LLM の呼び出しと同じ台帳に足し、費用の記録を 1 か所にまとめる）。
 pub struct AiRuntime<'a> {
@@ -634,8 +691,7 @@ pub struct AiRuntime<'a> {
     pub transport: &'a dyn Transport,
 }
 
-/// 宣言から決めた本文の作り方。英語の指示文は未実装なので、宣言がそれを要するときは
-/// [`NotesPlan::from_declaration`] が書く前に止める。
+/// 宣言から決めた本文の作り方。指示文の言語は抽出の宣言に従う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotesPlan {
     /// CHANGELOG の抽出をそのまま本文にする。
@@ -648,10 +704,6 @@ impl NotesPlan {
     pub fn from_declaration(notes: &ReleaseNotes) -> Result<Self, String> {
         match notes.mode {
             NotesMode::Changelog(_) => Ok(Self::Changelog),
-            NotesMode::Ai { .. } if notes.language != NotesLanguage::Ja => Err(
-                "release.notes の language が en の AI 本文はまだ使えません（指示文が日本語だけ）"
-                    .to_owned(),
-            ),
             NotesMode::Ai { audience, .. } => Ok(Self::Ai {
                 audience: match audience {
                     NotesAudience::Private => Audience::Private,
@@ -843,7 +895,11 @@ fn ai_body(
         ledger: ledger.to_path_buf(),
         transport: runtime.transport,
     };
-    let value = match island_llm::run(PURPOSE, input.as_bytes(), settings.key_ref(), &runtime) {
+    let purpose = match extract.language {
+        NotesLanguage::Ja => "release-notes",
+        NotesLanguage::En => "release-notes-en",
+    };
+    let value = match island_llm::run(purpose, input.as_bytes(), settings.key_ref(), &runtime) {
         Ok(Output::Json(value)) => value,
         Ok(Output::Line(_)) => return Err(Failure::ResponseRejected.code().to_owned()),
         Err(failure) => return Err(failure.code().to_owned()),
@@ -885,4 +941,69 @@ pub fn annotate_tag(root: &Path, tag: &str, sha: &str, body: &str) -> Result<(),
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod rewritten_item_tests {
+    use super::*;
+
+    #[test]
+    fn real_release_diff_excludes_rewritten_old_item() {
+        // v0.5.31..141a3a78 (v0.5.32 version commit): actual changed lines,
+        // with repo names anonymized and unrelated context reduced to the separating unchanged item.
+        let diff = r#"diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,4 +1,5 @@
+ ## 2026-10
++- **Release の段取りと残りの棚卸しを記録した（2026-10-27）**: v0.5.32 は 13 本の橋渡しとして技術的に出せる。公開 0.6.5 を先に出す手順にした（[手順](./docs/reviews/2026-10-27-release-0-5-32-recheck.md)）。publish-develop-tools 8.3 を閉じた。島の残 branch・worktree と、残る Formation・TGL を持ち主付きで記録した（[branch](./docs/reviews/2026-10-27-island-leftovers.md)・[Formation](./docs/reviews/2026-10-27-formation-tgl-leftovers.md)）。TODO と CHANGELOG の長い項目を縮めた。
+ - **repo-a を Renovate の App の対象にした（2026-10-26、藤井作業）**: 既存項目
+-- **Supabase CLI と moli の秘密を出す subcommand を確認に回した（2026-10-26、藤井指示、未 Release）**: Claude の ask に secrets list・projects api-keys・status・branches get・`supabase db` 配下・`moli serve` を足した（[記録](./docs/reviews/2026-10-26-ask-supabase.md)）。Mac に Supabase CLI を入れ、Codex は prompt に回した（repo-b `2084b384`）。
++- **Supabase CLI と moli の秘密を出す subcommand を確認に回した（2026-10-26、藤井指示）**: Claude の ask に secrets list・projects api-keys・status・branches get・`supabase db` 配下・`moli serve` を足した（v0.5.31 で出した、[記録](./docs/reviews/2026-10-26-ask-supabase.md)）。Mac に Supabase CLI を入れ、Codex は prompt に回した（repo-b `2084b384`）。
+"#;
+        assert_eq!(extract_changelog_additions(diff, "v0.5.32"), vec![r#"- **Release の段取りと残りの棚卸しを記録した（2026-10-27）**: v0.5.32 は 13 本の橋渡しとして技術的に出せる。公開 0.6.5 を先に出す手順にした（[手順](./docs/reviews/2026-10-27-release-0-5-32-recheck.md)）。publish-develop-tools 8.3 を閉じた。島の残 branch・worktree と、残る Formation・TGL を持ち主付きで記録した（[branch](./docs/reviews/2026-10-27-island-leftovers.md)・[Formation](./docs/reviews/2026-10-27-formation-tgl-leftovers.md)）。TODO と CHANGELOG の長い項目を縮めた。"#.to_owned()]);
+    }
+
+    #[test]
+    fn mixed_replacements_are_excluded_but_separated_additions_survive() {
+        let diff = "@@ -1,8 +1,8 @@\n ## 2026-10\n-- **old**: long\n+- **renamed**: short\n+- **ambiguous new**\n \n+- **definitely new**\n";
+        let result = changelog_additions(diff, "v1.0.0");
+        assert_eq!(result.items, ["- **definitely new**"]);
+        assert_eq!(
+            result.edited,
+            ["- **renamed**: short", "- **ambiguous new**"]
+        );
+    }
+
+    #[test]
+    fn old_fences_and_headings_do_not_contaminate_new_document() {
+        let diff = "@@ -1,8 +1,8 @@\n ## 2026-10\n-```md\n-- **example**\n-```\n+- **new item**\n ## Other\n-- **not monthly**\n+## 2026-11\n+- **new month**\n";
+        let result = changelog_additions(diff, "v1.0.0");
+        assert_eq!(result.items, ["- **new item**", "- **new month**"]);
+        assert!(result.edited.is_empty());
+    }
+
+    #[test]
+    fn new_fences_hide_examples_and_removed_monthly_items_still_mark_edits() {
+        let diff = "@@ -1,8 +1,8 @@\n ## 2026-10\n-- **old**\n+```md\n+- **example**\n+```\n+- **replacement**\n \n+- **new**\n";
+        let result = changelog_additions(diff, "v1.0.0");
+        assert_eq!(result.items, ["- **new**"]);
+        assert_eq!(result.edited, ["- **replacement**"]);
+    }
+
+    #[test]
+    fn no_newline_marker_does_not_split_a_replacement() {
+        let diff = "@@ -1,8 +1,8 @@\n ## 2026-10\n-- **old**\n\\ No newline at end of file\n+- **replacement**\n\\ No newline at end of file\n";
+        let result = changelog_additions(diff, "v1.0.0");
+        assert!(result.items.is_empty());
+        assert_eq!(result.edited, ["- **replacement**"]);
+    }
+
+    #[test]
+    fn deleted_horizontal_rule_does_not_split_a_replacement_run() {
+        let diff = "@@ -1,3 +1,2 @@\n ## 2026-10\n-- **old**\n----\n+- **replacement**\n";
+        let result = changelog_additions(diff, "v1.0.0");
+        assert!(result.items.is_empty());
+        assert_eq!(result.edited, ["- **replacement**"]);
+    }
 }

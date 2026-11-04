@@ -13,7 +13,7 @@ fn main() {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         let help = Help::new(
             "archive-changelog [--yes]",
-            "archive-changelog — CHANGELOG.md の古い月を git 履歴へ退避します。",
+            "archive-changelog — CHANGELOG.md の古い月（足りなければ当月の古い日付）を git 履歴へ退避します。",
             "既定は変更しない dry-run です。確認後は --yes で working tree を更新します。",
             "CHANGELOG.md のみを編集します。旧節を別ファイルへ移しません。",
         )
@@ -53,15 +53,18 @@ fn main() {
         "CHANGELOG.md: {} bytes → {} bytes",
         plan.bytes_before, plan.bytes_after
     );
-    if plan.archived_months.is_empty() {
+    if plan.archived_months.is_empty() && plan.archived_dates.is_empty() {
         println!("退避する月: なし（変更不要）");
         return;
     }
-    println!(
-        "退避する月: {}〜{}",
-        plan.archived_months.first().expect("non-empty months"),
-        plan.archived_months.last().expect("non-empty months")
-    );
+    for (label, values) in [
+        ("月", &plan.archived_months),
+        ("保護月の日付", &plan.archived_dates),
+    ] {
+        if let (Some(first), Some(last)) = (values.first(), values.last()) {
+            println!("退避する{label}: {first}〜{last}");
+        }
+    }
     println!("退避直前の commit: {commit_sha}");
 
     if !apply {

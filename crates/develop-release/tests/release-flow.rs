@@ -5,7 +5,7 @@ use develop_release::release_notes::{
 use develop_tools_core::develop_tools_manifest::{NotesLanguage, NotesSource};
 use island_llm::settings::Audience;
 use island_llm::transport::{ApiRequest, ApiResponse, FailureKind, Transport, TransportError};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -1839,6 +1839,7 @@ const AI_PRIVATE: &str = r#"{"mode":"ai","fallback":"changelog-additions","audie
 struct CountingTransport {
     reply: Result<ApiResponse, TransportError>,
     calls: Cell<usize>,
+    last_body: RefCell<Option<serde_json::Value>>,
 }
 
 impl CountingTransport {
@@ -1859,6 +1860,7 @@ impl CountingTransport {
         Self {
             reply,
             calls: Cell::new(0),
+            last_body: RefCell::new(None),
         }
     }
 }
@@ -1867,6 +1869,7 @@ impl Transport for CountingTransport {
     fn send(&self, request: &ApiRequest<'_>) -> Result<ApiResponse, TransportError> {
         self.calls.set(self.calls.get() + 1);
         assert_eq!(request.api_key.expose(), "test-api-key");
+        *self.last_body.borrow_mut() = Some(request.body.clone());
         self.reply.clone()
     }
 }
@@ -2299,28 +2302,19 @@ fn undeclared_release_keeps_a_lightweight_tag() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("本文:"));
 }
 
-/// 書く前に止まるもの: 英語の AI 本文・前 tag 無し・知らない引数。
+/// 知らない引数は書く前に止める。
 #[test]
-fn unsupported_notes_and_arguments_refuse_before_writing() {
-    let english =
-        r#"{"mode":"ai","fallback":"changelog-additions","audience":"private","language":"en"}"#;
-    for (notes, args, expected) in [
-        (Some(english), &["patch"][..], "language"),
-        (Some(AI_PRIVATE), &["patch", "--ai"][..], "--ai"),
-    ] {
-        let fixture = notes_fixture(notes, Some(NOTES_ITEM));
-        let root = fixture.path();
-        let head = git(root, &["rev-parse", "HEAD"]);
-
-        let (output, _home) = release_with(root, args);
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{notes:?}");
-        assert!(stderr.contains(expected), "{stderr}");
-        assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
-        assert_eq!(git(root, &["status", "--porcelain"]), "");
-        assert_eq!(git(root, &["tag", "--list"]), "v1.2.3");
-    }
+fn unsupported_arguments_refuse_before_writing() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let root = fixture.path();
+    let head = git(root, &["rev-parse", "HEAD"]);
+    let (output, _home) = release_with(root, &["patch", "--ai"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("--ai"), "{stderr}");
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+    assert_eq!(git(root, &["tag", "--list"]), "v1.2.3");
 }
 
 #[test]
@@ -2538,4 +2532,104 @@ fn a_missing_changelog_refuses_with_section_missing_and_says_so() {
     assert!(stderr.contains("CHANGELOG.md がありません"), "{stderr}");
     assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
     assert_eq!(git(root, &["tag", "--list"]), "v1.2.3");
+}
+
+#[test]
+fn english_ai_section_notes_use_the_english_purpose_once_and_public_checks() {
+    let declaration =
+        r#"{"mode":"ai","fallback":"changelog-section","audience":"public","language":"en"}"#;
+    let fixture = notes_fixture(Some(declaration), Some(NOTES_ITEM));
+    let root = fixture.path();
+    std::fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## 1.2.4 (2026-11-04)\n\n- Fixed selection.\n- Improved display.\n",
+    )
+    .unwrap();
+    git(root, &["add", "CHANGELOG.md"]);
+    git(root, &["commit", "-qm", "section notes"]);
+    let declared = develop_release::release_notes::declared_notes(root)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        declared.plan,
+        NotesPlan::Ai {
+            audience: Audience::Public
+        }
+    );
+    let prepared = develop_release::release_notes::prepare_notes(root, declared, "v1.2.4").unwrap();
+    let extract = prepared.extract(root, "HEAD").unwrap();
+    assert_eq!(extract.items, ["- Fixed selection.", "- Improved display."]);
+    let env = NotesEnv::new(Some(&full_settings().replace("社内語", "private-term")));
+    for (summary, source) in [
+        (
+            "Selection improved.",
+            BodySource::Ai {
+                dictionary_missing: false,
+            },
+        ),
+        (
+            "A PRIVATE-TERM change.",
+            BodySource::Fallback("output_rejected:summary.term".to_owned()),
+        ),
+        (
+            "Updated Secret-Repo.",
+            BodySource::Fallback("output_rejected:summary.internal_name".to_owned()),
+        ),
+    ] {
+        let transport = CountingTransport::json(
+            serde_json::json!({"summary":summary,"items":[{"text":"Fixed selection.","sources":[1]}]}),
+        );
+        let body = release_body(
+            &extract,
+            prepared.plan(),
+            false,
+            &env.settings(),
+            &env.runtime(&transport),
+        );
+        assert_eq!(transport.calls.get(), 1);
+        assert_eq!(body.source, source);
+        let purpose = island_llm::purpose::find("release-notes-en").unwrap();
+        assert_eq!(
+            transport.last_body.borrow().as_ref().unwrap()["messages"][0]["content"],
+            format!(
+                "{}[1] - Fixed selection.\n[2] - Improved display.\n",
+                purpose.instruction
+            )
+        );
+        if matches!(source, BodySource::Ai { .. }) {
+            assert!(body.text.starts_with("Selection improved.\n"));
+            assert!(body.text.contains("See [v1.2.3...v1.2.4]"));
+        } else {
+            assert_eq!(body.text, extract.render());
+        }
+    }
+    let rows = env.ledger_rows();
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|row| row["purpose"] == "release-notes-en"));
+    let transport = CountingTransport::json(serde_json::json!({}));
+    let body = release_body(
+        &extract,
+        prepared.plan(),
+        true,
+        &env.settings(),
+        &env.runtime(&transport),
+    );
+    assert_eq!(transport.calls.get(), 0);
+    assert_eq!(body.source, BodySource::NoAi);
+    assert_eq!(body.text, extract.render());
+}
+
+#[test]
+fn english_ai_release_with_no_ai_accepts_the_declaration_and_tags() {
+    let declaration =
+        r#"{"mode":"ai","fallback":"changelog-additions","audience":"public","language":"en"}"#;
+    let fixture = notes_fixture(Some(declaration), Some("- **Selection improved**"));
+    let (output, _home) = release_with(fixture.path(), &["patch", "--no-ai"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(git(fixture.path(), &["cat-file", "-t", "v1.2.4"]), "tag");
+    assert!(tag_contents(fixture.path(), "v1.2.4").starts_with("Compare:"));
 }

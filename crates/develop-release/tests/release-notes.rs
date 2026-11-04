@@ -258,7 +258,7 @@ fn an_untagged_end_commit_extracts_the_same_items_as_the_tag() {
     git(dir.path(), &["tag", "v0.1.0"]);
     commit(
         dir.path(),
-        "# Changelog\n\n## 2026-10\n- **版 commit の項目**\n",
+        "# Changelog\n\n## 2026-10\n- **版 commit の項目**\n\n## 2026-09\n- **以前の項目**\n",
         "version commit",
     );
     let head = git(dir.path(), &["rev-parse", "HEAD"]);
@@ -581,7 +581,7 @@ fn a_lightweight_previous_tag_starts_the_range_of_an_annotated_release() {
     git(dir.path(), &["tag", "v0.1.0"]);
     commit(
         dir.path(),
-        "# Changelog\n\n## 2026-10\n- **移行後の項目**\n",
+        "# Changelog\n\n## 2026-10\n- **移行後の項目**\n\n## 2026-09\n- **以前の項目**\n",
         "change",
     );
     let head = git(dir.path(), &["rev-parse", "HEAD"]);
@@ -605,7 +605,7 @@ fn an_annotated_previous_tag_is_chosen_for_an_untagged_end_commit() {
     annotate(dir.path(), "v0.1.0");
     commit(
         dir.path(),
-        "# Changelog\n\n## 2026-10\n- **版 commit の項目**\n",
+        "# Changelog\n\n## 2026-10\n- **版 commit の項目**\n\n## 2026-09\n- **以前の項目**\n",
         "version commit",
     );
     let head = git(dir.path(), &["rev-parse", "HEAD"]);
@@ -826,5 +826,91 @@ fn the_compare_heading_follows_the_declared_language() {
         ),
     ] {
         assert_eq!(declared_render(notes, changelog), expected, "{notes}");
+    }
+}
+
+#[test]
+fn rewritten_and_ambiguous_items_are_listed_on_stderr_instead_of_the_release_body() {
+    let dir = fixture();
+    commit(
+        dir.path(),
+        "# Changelog\n\n## 2026-10\n- **old title**: long body\n\n- **unchanged**\n",
+        "base",
+    );
+    git(dir.path(), &["tag", "v0.1.0"]);
+    commit(
+        dir.path(),
+        "# Changelog\n\n## 2026-10\n- **renamed**: short\n- **ambiguous new**\n\n- **unchanged**\n- **pure addition**\n",
+        "rewrite and add",
+    );
+    git(dir.path(), &["tag", "v0.2.0"]);
+    let output = notes(dir.path(), "v0.2.0");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "変更範囲: [v0.1.0...v0.2.0](https://github.com/example/project/compare/v0.1.0...v0.2.0)\n\n- **pure addition**\n"
+    );
+    let warning = String::from_utf8(output.stderr).unwrap();
+    assert!(warning.contains("警告:"));
+    assert!(warning.contains("tag 注釈に補ってください"));
+    assert!(warning.contains("- **renamed**: short\n- **ambiguous new**\n"));
+    assert!(!warning.contains("- **pure addition**"));
+}
+
+#[test]
+fn english_ai_output_uses_english_compare_guidance() {
+    let extract = ReleaseExtract {
+        language: NotesLanguage::En,
+        ..extract()
+    };
+    let value = output(
+        "Selection improved.",
+        &[("Choose an item from the list.", &[1])],
+    );
+    let notes = check_output(&value, 3, &checks(Audience::Public)).unwrap();
+    assert_eq!(
+        notes.render(&extract),
+        format!(
+            "Selection improved.\n\n- Choose an item from the list.\n\nSee {} for other changes.\n",
+            extract.compare_link()
+        )
+    );
+    let complete = check_output(&value, 1, &checks(Audience::Public)).unwrap();
+    assert!(
+        complete
+            .render(&extract)
+            .ends_with(&format!("Compare: {}\n", extract.compare_link()))
+    );
+}
+
+#[test]
+fn english_public_output_keeps_the_same_checks() {
+    let checks = checks(Audience::Public);
+    for (value, code) in [
+        (
+            output("A FORMATION change.", &[("Selection improved.", &[1])]),
+            "summary.term",
+        ),
+        (
+            output("Changes.", &[("Updated Secret-Repo checks.", &[1])]),
+            "items.0.text.internal_name",
+        ),
+        (
+            output("Changes.", &[("Selection improved.", &[2])]),
+            "items.0.sources.out_of_range",
+        ),
+        (
+            serde_json::json!({"summary":"Changes.","items":[{"text":"Selection improved."}]}),
+            "items.0.sources.required",
+        ),
+        (
+            output("Changes.", &[("Read https://example.com", &[1])]),
+            "items.0.text.url",
+        ),
+    ] {
+        assert_eq!(
+            check_output(&value, 1, &checks).unwrap_err(),
+            format!("output_rejected:{code}")
+        );
     }
 }

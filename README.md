@@ -100,7 +100,7 @@ All declared files must hold the same version. Set `release.changelogStamp` to `
 | `audience` | `private` or `public`. `public` applies the stronger output checks. Only with `mode: "ai"` | Required with `ai` |
 | `language` | `ja` or `en` | `ja` |
 
-`mode: "ai"` with `language: "en"` is not supported yet; `release` stops before writing anything. `release <bump> --no-ai` skips the inference and uses `fallback`.
+`mode: "ai"` uses the declared `language`: `ja` selects Japanese instructions and `en` selects English instructions, with the same JSON output and validation checks. `release <bump> --no-ai` skips the inference and uses `fallback`.
 
 With `mode: "ai"`, `release` scrubs dates, commit SHAs and URLs from the extracted items, numbers them and makes one Anthropic API request without retrying. The summary becomes the tag body only when it passes the output checks; otherwise the `fallback` body is used and the release continues. The fallback reason is one of `key_missing`, `config_invalid`, `dictionary_missing`, `input_rejected`, `budget_exceeded`, `api_timeout`, `api_failed`, `response_rejected`, `output_rejected:<position>.<kind>`, `usage_unrecorded` and `unknown_purpose`.
 

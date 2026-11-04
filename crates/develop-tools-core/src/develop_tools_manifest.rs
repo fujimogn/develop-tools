@@ -129,6 +129,15 @@ pub struct BunCi {
     pub dirs: Vec<String>,
     /// install を repo の `ci:install` script に任せる（`true` のとき）。既定は素の `bun install`。
     pub ci_install: bool,
+    pub test: Option<BunTest>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct BunTest {
+    pub command: String,
+    pub shards: u64,
+    pub prepare_uses: Option<String>,
+    pub build: Option<String>,
 }
 
 /// `release.notes` の宣言。無ければ `release` は今の本文の作り方と軽量 tag を保つ。
@@ -270,7 +279,7 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
     let bun = match ci.get("bun") {
         None => None,
         Some(bun) => {
-            let bun = stack(bun, "ci.bun", &["dirs", "ciInstall"])?;
+            let bun = stack(bun, "ci.bun", &["dirs", "ciInstall", "test"])?;
             let ci_install = match bun.get("ciInstall") {
                 None => false,
                 Some(Value::Bool(flag)) => *flag,
@@ -279,10 +288,53 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
             Some(BunCi {
                 dirs: directories(bun, "ci.bun", "dirs")?,
                 ci_install,
+                test: bun.get("test").map(bun_test).transpose()?,
             })
         }
     };
     Ok(Some(CiDeclaration { rust, bun }))
+}
+
+fn bun_test(value: &Value) -> Result<BunTest, String> {
+    let test = stack(
+        value,
+        "ci.bun.test",
+        &["command", "shards", "prepareUses", "build"],
+    )?;
+    let command = |key: &str| -> Result<String, String> {
+        test.get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty() && single_line_command(value))
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!("ci.bun.test.{key} は式と改行を含まない空でない1行のcommandにする")
+            })
+    };
+    let shards = test
+        .get("shards")
+        .and_then(Value::as_u64)
+        .filter(|n| *n >= 1)
+        .ok_or("ci.bun.test.shards は1以上の整数にする")?;
+    let prepare_uses = test
+        .get("prepareUses")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|path| {
+                    path.strip_prefix("./").is_some_and(|relative| {
+                        relative != "." && relative_workspace(relative) && !relative.contains("${{")
+                    })
+                })
+                .map(str::to_owned)
+                .ok_or("ci.bun.test.prepareUses は ./ で始まるrepo内local actionのpathにする")
+        })
+        .transpose()?;
+    Ok(BunTest {
+        command: command("command")?,
+        shards,
+        prepare_uses,
+        build: test.get("build").map(|_| command("build")).transpose()?,
+    })
 }
 
 /// 宣言の object を読み、`keys` の外の欄を名前付きで拒む。
@@ -327,6 +379,13 @@ fn directories(
 }
 
 /// `run:` にそのまま置くので、式（`${{`）と改行などの制御文字を受けない。水平タブは 1 行のままなので受ける。
+fn single_line_command(command: &str) -> bool {
+    !command.is_empty()
+        && !command.contains("${{")
+        && !command.chars().any(|ch| ch.is_control() && ch != '\t')
+}
+
+/// Rust の追加検査を1行の command として読む。
 fn extra_steps(rust: &serde_json::Map<String, Value>) -> Result<Vec<String>, String> {
     let steps = match rust.get("extraSteps") {
         None => return Ok(Vec::new()),
@@ -337,15 +396,7 @@ fn extra_steps(rust: &serde_json::Map<String, Value>) -> Result<Vec<String>, Str
         .iter()
         .enumerate()
         .map(|(index, step)| match step.as_str() {
-            Some(command)
-                if !command.is_empty()
-                    && !command.contains("${{")
-                    && !command
-                        .chars()
-                        .any(|char| char.is_control() && char != '\t') =>
-            {
-                Ok(command.to_owned())
-            }
+            Some(command) if single_line_command(command) => Ok(command.to_owned()),
             _ => Err(format!(
                 "ci.rust.extraSteps[{index}] は式（${{{{）と改行を含まない 1 行の command でなければなりません: {step}"
             )),
@@ -918,6 +969,68 @@ mod tests {
     }
 
     #[test]
+    fn ci_bun_test_accepts_the_optional_declaration() {
+        for test in [
+            json!({"command": "bun run test", "shards": 1}),
+            json!({"command": "bun run test", "shards": 2,
+                "prepareUses": "./.github/actions/web-codegen",
+                "build": "bun run --filter='@example/web' build:ci"}),
+            json!({"command": "bun run test", "shards": 1000}),
+        ] {
+            let manifest = json!({"ci": {"bun": {"dirs": ["."], "test": test}}});
+            assert!(ci_declaration(&manifest).is_ok(), "{manifest}");
+        }
+    }
+
+    #[test]
+    fn ci_bun_test_rejects_invalid_values_before_generation() {
+        for (key, value) in [
+            ("command", json!("")),
+            ("command", json!("  ")),
+            ("command", json!("bun run test\necho extra")),
+            ("command", json!("bun run test\r")),
+            ("command", json!("echo ${{ github.ref }}")),
+            ("command", json!(false)),
+            ("command", Value::Null),
+            ("build", json!("")),
+            ("build", json!("bun run build\n")),
+            ("build", json!(true)),
+            ("build", Value::Null),
+            ("shards", json!(0)),
+            ("shards", json!(-1)),
+            ("shards", json!(1.5)),
+            ("shards", json!("2")),
+            ("prepareUses", json!("owner/action@ref")),
+            ("prepareUses", json!("../action")),
+            ("prepareUses", json!("./../action")),
+            ("prepareUses", json!("./.github/../../action")),
+            ("prepareUses", json!("./.github/action\n")),
+            ("prepareUses", json!("./")),
+            ("prepareUses", Value::Null),
+            ("unknown", json!(true)),
+        ] {
+            let mut test = json!({"command": "bun run test", "shards": 2});
+            test[key] = value;
+            let manifest = json!({"ci": {"bun": {"dirs": ["."], "test": test}}});
+            let error = ci_declaration(&manifest).unwrap_err();
+            assert!(
+                error.contains(&format!("ci.bun.test.{key}")),
+                "{manifest}: {error}"
+            );
+        }
+        for test in [
+            json!({}),
+            json!(null),
+            json!(false),
+            json!({"command": "test"}),
+        ] {
+            assert!(
+                ci_declaration(&json!({"ci": {"bun": {"dirs": ["."], "test": test}}})).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn ci_declaration_reads_rust_and_bun_stacks() {
         let declared = declaration(&json!({"ci": {
             "rust": {
@@ -937,6 +1050,7 @@ mod tests {
                 bun: Some(BunCi {
                     dirs: vec![".".into()],
                     ci_install: false,
+                    test: None,
                 }),
             })
         );

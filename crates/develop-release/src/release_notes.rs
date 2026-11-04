@@ -745,7 +745,7 @@ pub fn declared_notes(root: &Path) -> Result<Option<DeclaredNotes>, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedNotes {
     declared: DeclaredNotes,
-    base: ReleaseBase,
+    base: Option<ReleaseBase>,
     tag: String,
 }
 
@@ -756,30 +756,75 @@ pub fn prepare_notes(
     declared: DeclaredNotes,
     tag: &str,
 ) -> Result<PreparedNotes, String> {
-    let base = release_base(root, "HEAD")?;
+    // tag が一つも無い初回だけ節の本文を使う。既存 tag の解決失敗は隠さない。
+    let base = if git(
+        root,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "refs/tags",
+        ],
+    )?
+    .is_empty()
+    {
+        None
+    } else {
+        Some(release_base(root, "HEAD")?)
+    };
     let prepared = PreparedNotes {
         declared,
         base,
         tag: tag.to_owned(),
     };
-    if declared.source == NotesSource::ChangelogSection {
+    if prepared.base.is_none() || declared.source == NotesSource::ChangelogSection {
         prepared.section_at(root, "HEAD")?;
     }
     Ok(prepared)
 }
 
 impl PreparedNotes {
+    /// 初回は比較範囲が無いため推論せず版の節を使い、それ以外は宣言どおり本文を作る。
+    pub fn body(
+        &self,
+        root: &Path,
+        end: &str,
+        no_ai: bool,
+        settings_path: &Path,
+        runtime: &AiRuntime<'_>,
+    ) -> Result<ReleaseBody, String> {
+        if self.base.is_none() {
+            let section = self.section_at(root, end)?;
+            return Ok(ReleaseBody {
+                text: format!("{}\n", section.body),
+                source: BodySource::FirstRelease,
+            });
+        }
+        let extract = self.extract(root, end)?;
+        Ok(release_body(
+            &extract,
+            self.plan(),
+            no_ai,
+            settings_path,
+            runtime,
+        ))
+    }
+
     pub fn plan(&self) -> NotesPlan {
         self.declared.plan
     }
 
     /// 終点の commit の CHANGELOG から抽出する。
     pub fn extract(&self, root: &Path, end: &str) -> Result<ReleaseExtract, String> {
+        let base = self
+            .base
+            .as_ref()
+            .ok_or("前 tag の無い初回は本文の節を使ってください")?;
         if self.declared.source == NotesSource::ChangelogAdditions {
-            return extract_from(root, &self.base, end, &self.tag, self.declared.language);
+            return extract_from(root, base, end, &self.tag, self.declared.language);
         }
         let ChangelogSection { body, items } = self.section_at(root, end)?;
-        let ReleaseBase { previous, repo } = &self.base;
+        let ReleaseBase { previous, repo } = base;
         Ok(ReleaseExtract {
             previous: previous.clone(),
             tag: self.tag.clone(),
@@ -809,6 +854,8 @@ impl PreparedNotes {
 /// 本文の出どころ。`release` は本文と一緒にこれを 1 行で出す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodySource {
+    /// 前 tag が無いため比較・推論をせず版の節を使った。
+    FirstRelease,
     /// CHANGELOG の抽出だけの宣言。
     Changelog,
     /// 照合を通った AI の本文。private で辞書が無いまま推論したら `dictionary_missing`。
@@ -823,6 +870,7 @@ pub enum BodySource {
 impl std::fmt::Display for BodySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::FirstRelease => write!(f, "前 tag が無いため、推論せず CHANGELOG の版の節を抽出"),
             Self::Changelog => write!(f, "CHANGELOG の抽出"),
             Self::Ai {
                 dictionary_missing: false,

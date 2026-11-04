@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use develop_tools_core::bounded_name::contains_bounded_name;
+use develop_tools_core::bounded_name::contains_internal_name;
 use develop_tools_core::develop_tools_manifest::NotesLanguage;
 use island_llm::settings::{Audience, DictionaryMissing, Settings};
 use serde_json::{Map, Value};
@@ -167,7 +167,7 @@ fn text_kind(text: &str, checks: &Checks) -> Option<&'static str> {
     } else if checks
         .internal_names
         .iter()
-        .any(|name| contains_bounded_name(text, name, true))
+        .any(|name| contains_internal_name(text, name))
     {
         Some("internal_name")
     } else {

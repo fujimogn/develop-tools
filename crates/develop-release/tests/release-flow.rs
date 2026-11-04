@@ -2318,7 +2318,7 @@ fn unsupported_arguments_refuse_before_writing() {
 }
 
 #[test]
-fn declared_release_without_a_previous_tag_refuses_before_writing() {
+fn declared_first_release_without_a_dated_section_refuses_before_writing() {
     let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
     let root = fixture.path();
     git(root, &["tag", "-d", "v1.2.3"]);
@@ -2327,6 +2327,11 @@ fn declared_release_without_a_previous_tag_refuses_before_writing() {
     let (output, _home) = release_with(root, &["patch", "--no-ai"]);
 
     assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("release.notes の changelog-section を作れません（section_missing:"),
+        "{stderr}"
+    );
     assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
     assert_eq!(git(root, &["status", "--porcelain"]), "");
     assert!(git(root, &["tag", "--list"]).is_empty());
@@ -2394,6 +2399,64 @@ fn section_fixture(notes: &str, changelog: &str) -> Fixture {
     git(root, &["add", "CHANGELOG.md"]);
     git(root, &["commit", "-qm", "changelog"]);
     fixture
+}
+
+#[test]
+fn declared_first_release_annotates_the_tag_with_only_the_version_section() {
+    for notes in [
+        AI_PRIVATE,
+        r#"{"mode":"changelog-additions"}"#,
+        SECTION_MODE,
+    ] {
+        let fixture = section_fixture(notes, SECTION_CHANGELOG);
+        let root = fixture.path();
+        git(root, &["tag", "-d", "v1.2.3"]);
+
+        let (output, _home) = release_with(root, &["patch"]);
+
+        let contents = assert_annotated_v124(root, &output);
+        assert_eq!(
+            contents.trim_end(),
+            "Lineup lists schedules.\n\n- Feature: **Schedule list** lets people pick a schedule from a list.\n- Fix: **Doctor** reports a starting daemon separately."
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("本文: 前 tag が無いため、推論せず CHANGELOG の版の節を抽出"),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
+fn first_release_skips_inference_even_with_complete_ai_settings() {
+    let fixture = section_fixture(AI_PRIVATE, SECTION_CHANGELOG);
+    let root = fixture.path();
+    git(root, &["tag", "-d", "v1.2.3"]);
+    let env = NotesEnv::new(Some(&full_settings()));
+    let transport = CountingTransport::json(serde_json::json!({}));
+    let declared = develop_release::release_notes::declared_notes(root)
+        .unwrap()
+        .unwrap();
+    let prepared = prepare_notes(root, declared, "v1.2.4").unwrap();
+
+    let body = prepared
+        .body(
+            root,
+            "HEAD",
+            false,
+            &env.settings(),
+            &env.runtime(&transport),
+        )
+        .unwrap();
+
+    assert!(
+        body.text.starts_with("Lineup lists schedules.\n"),
+        "{}",
+        body.text
+    );
+    assert_eq!(body.source, BodySource::FirstRelease);
+    assert_eq!(transport.calls.get(), 0);
+    assert!(env.ledger_rows().is_empty());
 }
 
 fn assert_section_body(contents: &str) {

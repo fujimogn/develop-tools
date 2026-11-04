@@ -23,13 +23,26 @@ pub fn contains_bounded_name(text: &str, name: &str, ignore_ascii_case: bool) ->
         })
 }
 
+/// 内部名は大文字小文字を区別せず、英語の複数形 `-s`・`-es` も同じ語とする。
+/// 所有格は apostrophe が既存の語境界になるため、そのまま一致する。
+/// 接尾辞の後にも厳密境界を要求し、別の英単語や CLI 名の部分一致を避ける。
+pub fn contains_internal_name(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    contains_bounded_name(text, name, true)
+        || ["s", "es"]
+            .iter()
+            .any(|suffix| contains_bounded_name(text, &format!("{name}{suffix}"), true))
+}
+
 fn is_name_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
 }
 
 #[cfg(test)]
 mod tests {
-    use super::contains_bounded_name;
+    use super::{contains_bounded_name, contains_internal_name};
 
     /// AI 出力の照合が `ignore_ascii_case = true` で頼る判定の表。
     const BOUNDARY_CASES: &[(&str, &str, bool)] = &[
@@ -54,6 +67,46 @@ mod tests {
                 *expected,
                 "{text} / {name}"
             );
+        }
+    }
+
+    #[test]
+    fn internal_names_keep_boundaries_around_inflections() {
+        for (text, name, expected) in BOUNDARY_CASES {
+            assert_eq!(
+                contains_internal_name(text, name),
+                *expected,
+                "{text} / {name}"
+            );
+        }
+        for text in [
+            "Secret-Repos",
+            "secret-repoes",
+            "secret-repo's",
+            "secret-repos'",
+            "secret-repo’s",
+        ] {
+            assert!(contains_internal_name(text, "secret-repo"), "{text}");
+        }
+        for text in [
+            "secret-repository",
+            "secret-repossession",
+            "secret-repoesque",
+            "my-secret-repos",
+            "secret-repos_x",
+            "secret-repos-tool",
+        ] {
+            assert!(!contains_internal_name(text, "secret-repo"), "{text}");
+        }
+    }
+
+    #[test]
+    fn strict_boundaries_do_not_treat_plurals_as_the_original_name() {
+        for text in ["secret-repos", "secret-repoes", "secret-repos_x"] {
+            assert!(!contains_bounded_name(text, "secret-repo", true), "{text}");
+        }
+        for text in ["secret-repo's", "secret-repo’s", "日本語secret-repo本文"] {
+            assert!(contains_bounded_name(text, "secret-repo", true), "{text}");
         }
     }
 

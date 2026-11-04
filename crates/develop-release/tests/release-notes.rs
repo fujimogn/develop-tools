@@ -77,6 +77,22 @@ fn previous_tag_is_required_even_for_the_first_release() {
 }
 
 #[test]
+fn declared_notes_allow_the_first_release_with_a_dated_section() {
+    let dir = fixture();
+    commit(
+        dir.path(),
+        "# Changelog\n\n## 0.1.0 (2026-11-05)\n\nInitial release.\n",
+        "first release notes",
+    );
+    let declared = develop_release::release_notes::DeclaredNotes {
+        plan: develop_release::release_notes::NotesPlan::Changelog,
+        source: develop_tools_core::develop_tools_manifest::NotesSource::ChangelogAdditions,
+        language: NotesLanguage::En,
+    };
+    assert!(prepare_notes(dir.path(), declared, "v0.1.0").is_ok());
+}
+
+#[test]
 fn only_added_monthly_items_between_adjacent_tags_are_rendered() {
     let dir = fixture();
     git(dir.path(), &["tag", "v0.1.0"]);
@@ -350,6 +366,48 @@ fn internal_names_are_rejected_only_for_public_and_only_as_words() {
         &[("検査を足した", &[1])],
     );
     assert!(check_output(&longer, 3, &checks(Audience::Public)).is_ok());
+}
+
+#[test]
+fn internal_name_inflections_are_rejected_without_matching_other_words() {
+    for text in [
+        "Secret-Repos",
+        "Secret-Repoes",
+        "Secret-Repo's",
+        "Secret-Repos'",
+        "Secret-Repo’s",
+    ] {
+        let value = output(text, &[("Updated checks.", &[1])]);
+        assert_eq!(
+            rejected(&value, Audience::Public),
+            "output_rejected:summary.internal_name",
+            "{text}"
+        );
+        assert!(
+            check_output(&value, 3, &checks(Audience::Private)).is_ok(),
+            "{text}"
+        );
+        let item = output("Updated checks.", &[(text, &[1])]);
+        assert_eq!(
+            rejected(&item, Audience::Public),
+            "output_rejected:items.0.text.internal_name",
+            "{text}"
+        );
+    }
+    for text in [
+        "secret-repository",
+        "secret-reposition",
+        "secret-repossession",
+        "my-secret-repos",
+        "secret-repos_x",
+        "secret-repoesque",
+    ] {
+        let value = output(text, &[("Updated checks.", &[1])]);
+        assert!(
+            check_output(&value, 3, &checks(Audience::Public)).is_ok(),
+            "{text}"
+        );
+    }
 }
 
 #[test]

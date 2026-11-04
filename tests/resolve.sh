@@ -413,6 +413,11 @@ unset FAKE_OS
 printf 'ok: unsupported target modes\n'
 
 fixture parallel
+# uutils 0.8.0 can return success after losing mkdir's creation race.
+# Reproduce that result deterministically; only an actual creation emits -v output.
+# shellcheck disable=SC2016
+printf '#!/bin/sh\n"%s" "$@" && exit 0\nfor directory do :; done\n[ -d "$directory" ]\n' "$(real_command mkdir)" > "$case_dir/fakebin/mkdir"
+chmod +x "$case_dir/fakebin/mkdir"
 CURL_DELAY=0.2
 run_resolver ci parallel &
 first=$!

@@ -51,7 +51,7 @@ fn run() -> Result<(), String> {
                 "release <patch | minor | major | x.y.z> [--no-ai]",
                 "Advance declared version files on the integration branch, fast-forward main, then create a local tag. It does not push. Publish with release push. When .develop-tools.json declares platforms, the latest release check run on HEAD must have a successful job for every declared OS; run release check first. When it declares release.notes, the tag is annotated with the release body; mode ai makes one Anthropic API request for the body and falls back to the CHANGELOG extract when that is not usable. A changelog-section body (mode or fallback) needs exactly one non-empty dated section for the version (## X.Y.Z (YYYY-MM-DD) or ## [X.Y.Z] - YYYY-MM-DD) in CHANGELOG.md at HEAD; otherwise it stops before writing with section_missing, section_duplicate, or section_empty. --no-ai skips the request.",
                 "applies changes when a version bump is supplied; without an argument, exits without writing",
-                "files declared by release.versionFiles, and root CHANGELOG.md when release.changelogStamp is true; creates a git commit, advances main, and creates a v<version> tag (annotated when release.notes is declared); no remote push. With release.notes mode ai and without --no-ai, sends the scrubbed CHANGELOG items to Anthropic once and appends one row to the usage ledger named by usage_ledger in ~/.config/develop-tools/llm.json (without that field, nothing is sent). Publish with release push.",
+                "files declared by release.versionFiles, and root CHANGELOG.md when release.changelogStamp is true; creates a git commit, advances main, and creates a v<version> tag (annotated when release.notes is declared); no remote push. With release.notes mode ai and without --no-ai, sends the scrubbed CHANGELOG items to Anthropic once and appends one row to the usage ledger named by usage_ledger in ~/.config/develop-tools/llm.json (without that field, nothing is sent), except when no previous tag exists, which skips inference and uses the version's CHANGELOG section. Publish with release push.",
             )
             .exit("0 success; 1 invalid input or failed release")
             .render()
@@ -120,10 +120,7 @@ fn run() -> Result<(), String> {
     git(&root, &["commit", "-m", &format!("🔖 v{next}")])?;
     let released = git(&root, &["rev-parse", "HEAD"])?;
     let body = notes
-        .map(|prepared| {
-            let extract = prepared.extract(&root, &released)?;
-            Ok::<_, String>(body(&extract, prepared.plan(), no_ai))
-        })
+        .map(|prepared| body(&prepared, &root, &released, no_ai))
         .transpose()
         .map_err(|err| {
             format!(
@@ -184,10 +181,11 @@ fn run() -> Result<(), String> {
 
 /// 本番の送信で本文を決める。環境側の設定は `~/.config/develop-tools/llm.json`。
 fn body(
-    extract: &release_notes::ReleaseExtract,
-    plan: release_notes::NotesPlan,
+    prepared: &release_notes::PreparedNotes,
+    root: &Path,
+    end: &str,
     no_ai: bool,
-) -> ReleaseBody {
+) -> Result<ReleaseBody, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -202,7 +200,7 @@ fn body(
         home: home.clone(),
     };
     let settings = island_llm::settings::default_path(&home);
-    release_notes::release_body(extract, plan, no_ai, &settings, &runtime)
+    prepared.body(root, end, no_ai, &settings, &runtime)
 }
 
 fn main() {

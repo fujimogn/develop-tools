@@ -145,6 +145,10 @@ fi
 
 mkdir -p "$cache_base" || fail "cache を作れません: $cache_base"
 lock=$cache_dir.lock
+create_lock() {
+  # uutils 0.8.0 may exit 0 on a lost mkdir race, without a creation receipt.
+  created=$(mkdir -v "$1" 2>/dev/null) && [ -n "$created" ]
+}
 old_empty_dir() {
   modified=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null) || return 1
   now=$(date +%s) || return 1
@@ -160,7 +164,7 @@ stale_lock() {
   old_empty_dir "$lock"
 }
 attempt=0
-until mkdir "$lock" 2>/dev/null; do
+until create_lock "$lock"; do
   if ready; then
     write_index
     finish "$@"
@@ -168,7 +172,7 @@ until mkdir "$lock" 2>/dev/null; do
   if [ -d "$lock.reap" ] && old_empty_dir "$lock.reap"; then
     rmdir "$lock.reap" 2>/dev/null || :
   fi
-  if stale_lock && mkdir "$lock.reap" 2>/dev/null; then
+  if stale_lock && create_lock "$lock.reap"; then
     reclaimed=0
     if stale_lock; then
       rm -f "$lock/pid"

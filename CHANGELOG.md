@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-11-05
+
+### Added
+
+- `.config/develop-tools.json` accepts an optional `ci.bun.test` declaration (`command`, `shards`, and optional `prepareUses` and `build`) so the distributed CI can run Bun tests as sharded jobs instead of `test:fast`.
+
+### Changed
+
+- AI release notes are told not to add effect, speed, numeric, or comparison claims that are absent from the input, and not to weaken its limitations or qualifications.
+
+### Fixed
+
+- `release` with `release.notes` declared no longer stops on the first release of a repository without any tag: it skips inference and uses the version's CHANGELOG section as the tag message.
+- Public AI release notes and package checks reject internal names with English plural suffixes while preserving strict word boundaries.
+- Prevent duplicate parallel downloads on Ubuntu 26.04 by requiring a directory creation receipt when acquiring resolver locks with uutils coreutils.
+
 ## [0.6.6] - 2026-11-04
 
 ### Added

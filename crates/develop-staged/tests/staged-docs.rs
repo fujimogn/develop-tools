@@ -331,3 +331,77 @@ fn checker_uses_the_explicit_index_inside_a_linked_worktrees_git_directory() {
     assert!(stderr.contains("TODO.md"), "{stderr}");
     assert!(stderr.contains("[x]"), "{stderr}");
 }
+
+fn write_manifest(root: &Path, source: &str) {
+    fs::create_dir_all(root.join(".config")).unwrap();
+    fs::write(root.join(".config/develop-tools.json"), source).unwrap();
+}
+
+fn compact_changelog() -> &'static str {
+    "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-11\n- **成果** 2026-11-05 ⏳: 要約\n"
+}
+
+#[test]
+fn checker_selects_changelog_shape_from_index_manifest() {
+    for (manifest, changelog, expected) in [
+        (
+            Some(r#"{"release":{"changelogStamp":true}}"#),
+            compact_changelog(),
+            0,
+        ),
+        (
+            Some(r#"{"release":{"changelogStamp":true}}"#),
+            valid_changelog(),
+            1,
+        ),
+        (None, compact_changelog(), 1),
+        (Some("{}"), valid_changelog(), 0),
+        (Some("not JSON"), compact_changelog(), 2),
+        (
+            Some(r#"{"release":{"changelogStamp":"yes"}}"#),
+            compact_changelog(),
+            2,
+        ),
+    ] {
+        let repo = repository();
+        fs::write(repo.path().join("CHANGELOG.md"), changelog).unwrap();
+        if let Some(manifest) = manifest {
+            write_manifest(repo.path(), manifest);
+        }
+        git_ok(repo.path(), &["add", "."]);
+        write_manifest(repo.path(), r#"{"release":{"changelogStamp":false}}"#);
+        let output = run_checker(repo.path(), &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{manifest:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn checker_uses_manifest_from_explicit_index() {
+    let repo = repository();
+    write_manifest(repo.path(), "{}");
+    fs::write(repo.path().join("CHANGELOG.md"), valid_changelog()).unwrap();
+    git_ok(repo.path(), &["add", "."]);
+    let alternate = repo.path().join(".git/alternate-index");
+    fs::copy(repo.path().join(".git/index"), &alternate).unwrap();
+    write_manifest(repo.path(), r#"{"release":{"changelogStamp":true}}"#);
+    fs::write(repo.path().join("CHANGELOG.md"), compact_changelog()).unwrap();
+    assert!(
+        git_with_index(repo.path(), &alternate, &["add", "."])
+            .status
+            .success()
+    );
+    write_manifest(repo.path(), "broken working tree");
+    let output = run_checker_args(repo.path(), &["--index-file", ".git/alternate-index"], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(run_checker(repo.path(), &[]).status.code(), Some(0));
+}

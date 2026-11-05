@@ -190,6 +190,7 @@ pub struct Declaration {
     pub platform_check: PlatformCheck,
     pub preflight_workflow: Option<String>,
     pub release: Option<Value>,
+    pub changelog_stamp: bool,
     /// `release.notes` が無ければ `None`。
     pub release_notes: Option<ReleaseNotes>,
     /// 契約の欄が 1 つも無ければ `None`。
@@ -471,6 +472,14 @@ pub fn declaration(value: &Value) -> Result<Declaration, String> {
         Some(release) if release.is_object() => Some(release.clone()),
         Some(_) => return Err("不正な release".into()),
     };
+    let changelog_stamp = match release
+        .as_ref()
+        .and_then(|release| release.get("changelogStamp"))
+    {
+        None => false,
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(_) => return Err("不正な release.changelogStamp".to_owned()),
+    };
     let release_notes = release.as_ref().map(release_notes).transpose()?.flatten();
     let preflight_workflow = match &release {
         Some(release) => optional_string(release.as_object().expect("object"), "preflightWorkflow")
@@ -547,6 +556,7 @@ pub fn declaration(value: &Value) -> Result<Declaration, String> {
         preflight_workflow,
         release,
         release_notes,
+        changelog_stamp,
         adr_contract,
         ci,
     })
@@ -748,6 +758,26 @@ mod tests {
             std::fs::write(path, "{}").unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn changelog_stamp_declaration_is_boolean_and_defaults_to_false() {
+        assert!(
+            declaration(&json!({"release":{"changelogStamp":true}}))
+                .unwrap()
+                .changelog_stamp
+        );
+        for value in [
+            json!({}),
+            json!({"release":{}}),
+            json!({"release":{"changelogStamp":false}}),
+        ] {
+            assert!(!declaration(&value).unwrap().changelog_stamp);
+        }
+        for value in [json!("true"), json!(1), json!(null), json!([]), json!({})] {
+            let error = declaration(&json!({"release":{"changelogStamp":value}})).unwrap_err();
+            assert!(error.contains("changelogStamp"), "{error}");
+        }
     }
 
     #[test]

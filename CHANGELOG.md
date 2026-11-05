@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-11-05
+
+### Changed
+
+- Repositories that declare `release.changelogStamp: true` use a compact CHANGELOG title: `- **Title** YYYY-MM-DD/vX.Y.Z: summary` once released and `- **Title** YYYY-MM-DD ⏳: summary` while unreleased. `release` rewrites ` ⏳` to `/vX.Y.Z` in the version commit, and the parenthesized stamp form is no longer written.
+- The CHANGELOG checks (`check-staged-docs`, `develop-docs-check`) read `release.changelogStamp` from the manifest and accept only the compact title in those repositories. Repositories without the declaration keep the parenthesized date form and the same messages.
+- `archive-changelog` reads dates from both title forms.
+- Release notes select items by the compact `/vX.Y.Z` stamp and remove compact dates and markers before sending items to the model.
+
 ## [0.6.7] - 2026-11-05
 
 ### Added

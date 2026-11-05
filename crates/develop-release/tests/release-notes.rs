@@ -229,13 +229,13 @@ fn a_fence_whose_info_string_starts_with_the_other_marker_still_excludes_its_ite
 }
 
 #[test]
-fn dates_and_prod_stamps_are_dropped() {
+fn compact_metadata_and_parenthesized_dates_are_dropped() {
     assert_eq!(
-        scrub_for_ai("- **版の刻印を直した（2026-10-05、v0.5.3 で prod 反映）**: 本文"),
+        scrub_for_ai("- **版の刻印を直した** 2026-10-05/v0.5.3: 本文"),
         "- **版の刻印を直した**: 本文"
     );
     assert_eq!(
-        scrub_for_ai("- **未リリースの項目（2026-10-05、未リリース）**: 本文"),
+        scrub_for_ai("- **未リリースの項目** 2026-10-05 ⏳: 本文"),
         "- **未リリースの項目**: 本文"
     );
     assert_eq!(
@@ -970,5 +970,35 @@ fn english_public_output_keeps_the_same_checks() {
             check_output(&value, 1, &checks).unwrap_err(),
             format!("output_rejected:{code}")
         );
+    }
+}
+
+#[test]
+fn compact_versions_select_only_this_release_and_unreleased_items() {
+    use develop_release::release_notes::extract_changelog_additions;
+    let current = "- **今回** 2026-11-05/v0.2.0: 本文";
+    let pending = "- **未公開** 2026-11-05 ⏳: 本文の /v0.1.0 は残す";
+    let ordinary = "- **日付（2026-11-05）**: 本文の /v0.1.0 は残す";
+    let old_style = "- **旧刻印（2026-11-05、v0.1.0 で prod 反映）**: 本文";
+    let diff = format!(
+        "@@ -1 +1,6 @@\n ## 2026-11\n+- **前の版** 2026-11-04/v0.1.0: 除く\n+{current}\n+{pending}\n+{ordinary}\n+{old_style}\n"
+    );
+    assert_eq!(
+        extract_changelog_additions(&diff, "v0.2.0"),
+        [current, pending, ordinary, old_style]
+    );
+}
+
+#[test]
+fn scrub_preserves_body_metadata_and_obsolete_parenthesized_stamps() {
+    assert_eq!(
+        scrub_for_ai("- **題** 2026-11-05 ⏳: 本文の 2026-11-04/v0.1.0 と ⏳"),
+        "- **題**: 本文の 2026-11-04/v0.1.0 と ⏳"
+    );
+    for item in [
+        "- **題（2026-11-05、未リリース）**: 本文",
+        "- **題（2026-11-05、v0.1.0 で prod 反映）**: 本文",
+    ] {
+        assert_eq!(scrub_for_ai(item), item);
     }
 }

@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use develop_core::cli_help::Help;
-use develop_core::git;
-use develop_staged::docs_standard::{Finding, FindingKind, inspect_changelog, inspect_todo};
+use develop_core::{develop_tools_manifest, git};
+use develop_staged::docs_standard::{
+    ChangelogStyle, Finding, FindingKind, inspect_changelog_with_style, inspect_todo,
+};
 use develop_staged::staged_adr::resolve_index_file;
 
 const DOC_PATHS: [&str; 2] = ["TODO.md", "CHANGELOG.md"];
@@ -69,7 +71,13 @@ fn main() {
         };
         let findings = match path {
             "TODO.md" => inspect_todo(&contents),
-            "CHANGELOG.md" => inspect_changelog(&contents),
+            "CHANGELOG.md" => {
+                let style = match changelog_style(&repo, &paths, index_file.as_deref()) {
+                    Ok(style) => style,
+                    Err(message) => fatal(&message),
+                };
+                inspect_changelog_with_style(&contents, style)
+            }
             _ => unreachable!("DOC_PATHS is exhaustive"),
         };
         for finding in findings {
@@ -93,6 +101,24 @@ fn main() {
     if warnings > 0 {
         eprintln!("check-staged-docs: 0 error(s), {warnings} warning(s)");
     }
+}
+
+fn changelog_style(
+    repo: &Path,
+    paths: &StagedPaths,
+    index_file: Option<&Path>,
+) -> Result<ChangelogStyle, String> {
+    let Some(path) =
+        develop_tools_manifest::locate_in(|path| Ok(paths.indexed.contains(path.as_bytes())))?
+    else {
+        return Ok(ChangelogStyle::Parenthesized);
+    };
+    let bytes = read_index_blob(repo, path, index_file)?;
+    let value =
+        serde_json::from_slice(&bytes).map_err(|error| format!("{path}（index）: {error}"))?;
+    let declared = develop_tools_manifest::declaration(&value)
+        .map_err(|error| format!("{path}（index）: {error}"))?;
+    Ok(ChangelogStyle::from_stamp(declared.changelog_stamp))
 }
 
 fn parse_args(args: &[OsString]) -> Result<Option<PathBuf>, String> {

@@ -79,7 +79,7 @@ The command reports template drift, missing README entries, duplicate or missing
 | `cargo-lock` | The `version` of the declared Cargo packages in `Cargo.lock` |
 | `toml-root` | The top-level `version` in a TOML file |
 
-All declared files must hold the same version. Set `release.changelogStamp` to `true` to also stamp the root `CHANGELOG.md` in the version commit.
+All declared files must hold the same version. Set `release.changelogStamp` to `true` to also stamp the root `CHANGELOG.md` in the version commit. With this declaration, use `- **Title** YYYY-MM-DD ⏳: Summary` for unreleased entries; `release` replaces ` ⏳` with `/vX.Y.Z` (for example, `- **Title** 2026-11-04/v0.1.155: Summary`).
 
 ## Release notes
 

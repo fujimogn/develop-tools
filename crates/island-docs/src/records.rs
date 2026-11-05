@@ -123,7 +123,28 @@ pub fn todo_format(text: &str) -> Vec<Finding> {
     findings
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChangelogStyle {
+    #[default]
+    Parenthesized,
+    Compact,
+}
+
+impl ChangelogStyle {
+    pub fn from_stamp(enabled: bool) -> Self {
+        if enabled {
+            Self::Compact
+        } else {
+            Self::Parenthesized
+        }
+    }
+}
+
 pub fn inspect_changelog(content: &[u8]) -> Vec<Finding> {
+    inspect_changelog_with_style(content, ChangelogStyle::Parenthesized)
+}
+
+pub fn inspect_changelog_with_style(content: &[u8], style: ChangelogStyle) -> Vec<Finding> {
     let Ok(text) = str::from_utf8(content) else {
         return vec![finding(
             FindingKind::Error,
@@ -144,12 +165,16 @@ pub fn inspect_changelog(content: &[u8]) -> Vec<Finding> {
         ));
     }
 
-    findings.extend(changelog_format(text));
+    findings.extend(changelog_format_with_style(text, style));
     findings
 }
 
 /// CHANGELOG.md の形式（容量上限は含めない）。
 pub fn changelog_format(text: &str) -> Vec<Finding> {
+    changelog_format_with_style(text, ChangelogStyle::Parenthesized)
+}
+
+pub fn changelog_format_with_style(text: &str, style: ChangelogStyle) -> Vec<Finding> {
     let mut findings = Vec::new();
     let lines = text.split('\n').collect::<Vec<_>>();
     if !lines
@@ -235,7 +260,13 @@ pub fn changelog_format(text: &str) -> Vec<Finding> {
             ));
             continue;
         };
-        match parse_changelog_item(line) {
+        let parsed = match style {
+            ChangelogStyle::Parenthesized => parse_changelog_item(line),
+            ChangelogStyle::Compact => develop_core::changelog_title::parse(line)
+                .map(|item| item.date.to_owned())
+                .ok_or_else(|| "この repo は release.changelogStamp を宣言しているので - **題** YYYY-MM-DD ⏳: 要約 か - **題** YYYY-MM-DD/vX.Y.Z: 要約 にしてください".to_owned()),
+        };
+        match parsed {
             Ok(date) => {
                 if date.get(..7) != Some(month) {
                     findings.push(finding(
@@ -321,7 +352,9 @@ pub fn parse_month_heading(line: &str) -> Option<String> {
 
 /// トップレベル成果項目の完了日。形式が正しくなければ `None`。
 pub fn changelog_item_date(line: &str) -> Option<String> {
-    parse_changelog_item(line).ok()
+    parse_changelog_item(line)
+        .ok()
+        .or_else(|| develop_core::changelog_title::parse(line).map(|item| item.date.to_owned()))
 }
 
 fn parse_changelog_item(line: &str) -> Result<String, String> {
@@ -359,34 +392,7 @@ fn parse_changelog_item(line: &str) -> Result<String, String> {
 }
 
 pub fn valid_date(date: &str) -> bool {
-    if !(date.len() == 10
-        && date.as_bytes().get(4) == Some(&b'-')
-        && date.as_bytes().get(7) == Some(&b'-')
-        && date
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit()))
-    {
-        return false;
-    }
-
-    let Ok(year) = date[..4].parse::<u32>() else {
-        return false;
-    };
-    let Ok(month) = date[5..7].parse::<u32>() else {
-        return false;
-    };
-    let Ok(day) = date[8..10].parse::<u32>() else {
-        return false;
-    };
-    let days_in_month = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
-        2 => 28,
-        _ => return false,
-    };
-    year > 0 && (1..=days_in_month).contains(&day)
+    develop_core::changelog_title::valid_date(date)
 }
 
 /// TODO.md の `##` 見出しの語彙と順（[`TODO_SECTIONS`]）。語彙の外・順番違い・重複を
@@ -462,14 +468,26 @@ pub fn check(input: &Input) -> Vec<RuleFinding> {
         let Ok(text) = text else { continue };
         let (rule, errors) = match path {
             TODO_PATH => (Rule::Todo, todo_format(text)),
-            CHANGELOG_PATH => (Rule::Changelog, changelog_format(text)),
+            CHANGELOG_PATH => (
+                Rule::Changelog,
+                changelog_format_with_style(
+                    text,
+                    ChangelogStyle::from_stamp(input.changelog_stamp),
+                ),
+            ),
             _ => continue,
         };
         for finding in errors
             .into_iter()
             .filter(|finding| finding.kind == FindingKind::Error)
         {
-            let found = RuleFinding::new(rule, path, finding.message);
+            let mut found = RuleFinding::new(rule, path, finding.message);
+            if rule == Rule::Changelog {
+                found = found.related([
+                    develop_core::develop_tools_manifest::PATH,
+                    develop_core::develop_tools_manifest::LEGACY_PATH,
+                ]);
+            }
             findings.push(match finding.line {
                 Some(line) => found.at(line),
                 None => found,
@@ -502,6 +520,44 @@ mod tests {
 
     const TODO: &str = "# TODO\n\n## 進行中\n\n- [ ] **項目**。現在地。\n  - 補足\n";
     const CHANGELOG: &str = "# Changelog\n\n> 古い分は git 履歴に任せる。\n\n## 2026-09\n\n- **成果（2026-09-30）**: 要約。\n";
+
+    #[test]
+    fn compact_changelog_enforces_declared_shape_and_existing_order_rules() {
+        let document = |items: &str| {
+            format!("# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-11\n{items}\n")
+        };
+        let compact =
+            document("- **成果** 2026-11-05 ⏳: 要約\n- **成果** 2026-11-04/v1.2.3: 要約");
+        assert!(
+            inspect_changelog_with_style(compact.as_bytes(), ChangelogStyle::Compact).is_empty()
+        );
+        let old = inspect_changelog(compact.as_bytes());
+        assert!(old.iter().all(|f| f.message == "CHANGELOG.md のトップレベル項目は - **成果（YYYY-MM-DD）**: 要約 の形にしてください"));
+        assert_eq!(old.len(), 2);
+        for item in [
+            "- **成果（2026-11-05）**: 要約",
+            "- **成果** 2026-11-05: 要約",
+        ] {
+            let found =
+                inspect_changelog_with_style(document(item).as_bytes(), ChangelogStyle::Compact);
+            assert_eq!(found.len(), 1);
+            assert!(found[0].message.contains("release.changelogStamp"));
+        }
+        for (items, message) in [
+            ("- **成果** 2026-10-05 ⏳: 要約", "年月が見出し"),
+            (
+                "- **成果** 2026-11-04 ⏳: 要約\n- **成果** 2026-11-05/v1.2.3: 要約",
+                "新しい日付",
+            ),
+        ] {
+            let found =
+                inspect_changelog_with_style(document(items).as_bytes(), ChangelogStyle::Compact);
+            assert!(
+                found.iter().any(|f| f.message.contains(message)),
+                "{found:?}"
+            );
+        }
+    }
 
     #[test]
     fn valid_records_pass() {

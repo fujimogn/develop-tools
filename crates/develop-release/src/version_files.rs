@@ -40,9 +40,6 @@ pub struct Entry {
 struct Release {
     #[serde(rename = "versionFiles")]
     version_files: Vec<Entry>,
-    /// 版 commit の中で root の CHANGELOG に刻印するか。CHANGELOG の慣行は repo の事実なので宣言で決める。
-    #[serde(rename = "changelogStamp", default)]
-    changelog_stamp: bool,
 }
 
 /// 刻印する CHANGELOG。root の 1 つだけを見る。
@@ -281,17 +278,21 @@ impl VersionFiles {
     /// 失敗の報告は [`Self::load`] に任せる。
     pub fn undeclared(root: &Path) -> bool {
         match Self::declared_release(Source::Tree(root)) {
-            Ok((_, None)) => true,
-            Ok((_, Some(mut release))) => match release.as_object_mut() {
-                Some(object) if !object.contains_key("versionFiles") => {
-                    object.insert(
-                        "versionFiles".to_owned(),
-                        serde_json::Value::Array(Vec::new()),
-                    );
-                    serde_json::from_value::<Release>(release).is_ok()
+            Ok((_, declared)) => {
+                let Some(mut release) = declared.release else {
+                    return true;
+                };
+                match release.as_object_mut() {
+                    Some(object) if !object.contains_key("versionFiles") => {
+                        object.insert(
+                            "versionFiles".to_owned(),
+                            serde_json::Value::Array(Vec::new()),
+                        );
+                        serde_json::from_value::<Release>(release).is_ok()
+                    }
+                    _ => false,
                 }
-                _ => false,
-            },
+            }
             Err(_) => false,
         }
     }
@@ -299,7 +300,7 @@ impl VersionFiles {
     /// 版固定 file の path と、その `release` の欄を読む。
     fn declared_release(
         source: Source,
-    ) -> Result<(&'static str, Option<serde_json::Value>), String> {
+    ) -> Result<(&'static str, develop_tools_manifest::Declaration), String> {
         // 作業木か commit の tree か、同じ読み元の中で置き場を決める。作業木は共有の探索と同じ判定
         // （壊れた symlink も在るとみなす）にする。
         let located = match source {
@@ -312,18 +313,18 @@ impl VersionFiles {
             .map_err(|err| format!("{manifest}: JSON が不正です: {err}"))?;
         let declared = develop_tools_manifest::declaration(&value)
             .map_err(|err| format!("{manifest}: {err}"))?;
-        Ok((manifest, declared.release))
+        Ok((manifest, declared))
     }
 
     fn load_from(source: Source) -> Result<Self, String> {
-        let (manifest, release) = Self::declared_release(source)?;
-        let release: Release = serde_json::from_value(release.unwrap_or_default())
+        let (manifest, declared) = Self::declared_release(source)?;
+        let release: Release = serde_json::from_value(declared.release.unwrap_or_default())
             .map_err(|err| format!("{manifest}: release が不正です: {err}"))?;
         if release.version_files.is_empty() {
             return Err("release.versionFiles が空です".to_owned());
         }
         let mut files = Self::from_source(source, release.version_files)?;
-        files.changelog_stamp = release.changelog_stamp;
+        files.changelog_stamp = declared.changelog_stamp;
         Ok(files)
     }
 

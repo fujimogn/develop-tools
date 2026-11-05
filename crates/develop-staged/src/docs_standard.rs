@@ -3,7 +3,8 @@
 
 use island_docs::markdown::fence_mask;
 pub use island_docs::records::{
-    Finding, FindingKind, TODO_ITEM_WARNING_BYTES, inspect_changelog, inspect_todo,
+    ChangelogStyle, Finding, FindingKind, TODO_ITEM_WARNING_BYTES, inspect_changelog,
+    inspect_changelog_with_style, inspect_todo,
 };
 use island_docs::records::{changelog_item_date, is_month_heading, parse_month_heading};
 

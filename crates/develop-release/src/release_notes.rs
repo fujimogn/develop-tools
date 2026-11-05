@@ -106,12 +106,12 @@ fn fence_marker(line: &str) -> Option<(&str, &str)> {
 
 /// code fence の開閉の状態。`step` は fence の印の行で `true` を返し、開閉を進める。
 #[derive(Default)]
-struct Fence {
+pub(crate) struct Fence {
     open: Option<String>,
 }
 
 impl Fence {
-    fn step(&mut self, line: &str) -> bool {
+    pub(crate) fn step(&mut self, line: &str) -> bool {
         let Some((marker, rest)) = fence_marker(line) else {
             return false;
         };
@@ -129,23 +129,21 @@ impl Fence {
         true
     }
 
-    fn is_open(&self) -> bool {
+    pub(crate) fn is_open(&self) -> bool {
         self.open.is_some()
     }
 }
 
 fn released_for_other_tag(item: &str, tag: &str) -> bool {
-    let title = item
-        .strip_prefix(crate::CHANGELOG_TITLE_PREFIX)
-        .unwrap_or(item)
-        .split(crate::CHANGELOG_TITLE_END)
-        .next()
-        .unwrap_or("");
-    let Some(version) = crate::released_version_suffix(title) else {
+    use develop_tools_core::changelog_title::{self, Stamp};
+
+    let Some(parsed) = changelog_title::parse(item) else {
         return false;
     };
-    let marked = format!("v{version}");
-    release_tag(&marked) && marked != tag
+    let Stamp::Released(version) = parsed.stamp else {
+        return false;
+    };
+    format!("v{version}") != tag
 }
 
 /// Each side needs its own heading and fence state: deleted Markdown must not
@@ -585,23 +583,7 @@ fn drop_bare_urls(text: &str) -> String {
     out
 }
 
-/// 「（v<版> で prod 反映）」の括弧の中身。
-fn is_prod_stamp(text: &str) -> bool {
-    text.strip_prefix('v')
-        .and_then(|rest| rest.strip_suffix(crate::CHANGELOG_RELEASED_SUFFIX.trim_end_matches('）')))
-        .is_some_and(|version| version.parse::<crate::Version>().is_ok())
-}
-
-/// 括弧の中身が日付・未リリース・prod 反映の刻印だけか。
-fn is_date_stamp(inner: &str) -> bool {
-    match inner.split_once('、') {
-        Some((date, "未リリース")) => crate::is_date(date),
-        Some((date, stamp)) => crate::is_date(date) && is_prod_stamp(stamp),
-        None => crate::is_date(inner) || inner == "未リリース" || is_prod_stamp(inner),
-    }
-}
-
-/// 中身が日付か刻印だけの全角括弧を落とす。
+/// 中身が日付だけの全角括弧を落とす。
 fn drop_date_stamps(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -612,7 +594,7 @@ fn drop_date_stamps(text: &str) -> String {
         };
         let inner_end = inner_start + close;
         out.push_str(&rest[..open]);
-        if !is_date_stamp(&rest[inner_start..inner_end]) {
+        if !crate::is_date(&rest[inner_start..inner_end]) {
             out.push_str(&rest[open..inner_end + '）'.len_utf8()]);
         }
         rest = &rest[inner_end + '）'.len_utf8()..];
@@ -657,12 +639,17 @@ fn drop_internal_words(text: &str) -> String {
     out
 }
 
-/// AI へ送る前に、利用者に意味の無い社内の印（日付・prod 反映の刻印・commit SHA・
+/// AI へ送る前に、利用者に意味の無い社内の印（日付・短い形の刻印・commit SHA・
 /// lessons の番号・link の URL）を落とす。別の版の項目を除く `released_for_other_tag` とは
 /// 責務が違い、抽出の後に掛ける。
 pub fn scrub_for_ai(item: &str) -> String {
-    let scrubbed =
-        drop_internal_words(&drop_date_stamps(&drop_bare_urls(&drop_link_targets(item))));
+    let mut item = item.to_owned();
+    if let Some(parsed) = develop_tools_core::changelog_title::parse(&item) {
+        item.replace_range(parsed.metadata_range, "");
+    }
+    let scrubbed = drop_internal_words(&drop_date_stamps(&drop_bare_urls(&drop_link_targets(
+        &item,
+    ))));
     let mut out = String::with_capacity(scrubbed.len());
     for word in scrubbed.split(' ').filter(|word| !word.is_empty()) {
         if !out.is_empty() {

@@ -425,3 +425,22 @@ fn archive_takes_the_indented_continuation_after_a_blank_line_with_its_item() {
     assert!(!plan.content.contains("旧の補足"));
     assert!(plan.content.contains("（2026-10-29）"));
 }
+
+#[test]
+fn archive_compact_titles_by_date_without_manifest_or_shape_validation() {
+    let item =
+        |date: &str, stamp: &str| format!("- **成果** {date}{stamp}: {}\n", "x".repeat(30_000));
+    let content = format!(
+        "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-10\n{}{}{}{}",
+        item("2026-10-29", " ⏳"),
+        item("2026-10-20", " ⏳"),
+        item("2026-10-10", "/v1.2.3"),
+        item("2026-10-01", "/v1.2.2")
+    );
+    let plan = plan_changelog_archive(&content, "2026-10", "deadbeef").unwrap();
+    assert_eq!(plan.archived_dates, ["2026-10-01"]);
+    assert!(plan.content.contains("2026-10-29 ⏳"));
+    assert!(plan.content.contains("2026-10-10/v1.2.3"));
+    assert!(!plan.content.contains("2026-10-01/v1.2.2"));
+    assert!(plan.bytes_after <= CHANGELOG_MAX_BYTES * CHANGELOG_ARCHIVE_TARGET_PERCENT / 100);
+}

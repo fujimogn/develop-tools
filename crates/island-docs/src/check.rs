@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::LazyLock;
 
-use develop_core::managed_block;
+use develop_core::{develop_tools_manifest, managed_block};
 use regex::Regex;
 
 use crate::constants::{
@@ -36,6 +36,7 @@ pub struct Input {
     /// GitHub の `owner/name`。定数表の repo 行を選ぶ。
     pub repo: Option<String>,
     pub snapshot: Snapshot,
+    pub changelog_stamp: bool,
     /// 容量上限の対象 path の byte 数。
     pub sizes: BTreeMap<String, usize>,
     /// Markdown 以外で本文を読む file（退役語の registry）。
@@ -156,12 +157,31 @@ pub fn run(repo: &Repo, mode: Mode) -> Result<Outcome, String> {
         changed,
         ..Input::default()
     };
+    let manifest = if entries
+        .iter()
+        .any(|entry| entry.path == crate::constants::CHANGELOG_PATH)
+    {
+        develop_tools_manifest::locate_in(|path| {
+            Ok(entries.iter().any(|entry| entry.path == path))
+        })?
+    } else {
+        None
+    };
+    if let Some(path) = manifest {
+        if entries
+            .iter()
+            .any(|entry| entry.path == path && !entry.is_regular_file())
+        {
+            return Err(format!("{path}: manifest は通常の file にしてください"));
+        }
+    }
     let mut to_read = Vec::new();
     for entry in &entries {
         let wanted = entry.path.ends_with(MARKDOWN_EXTENSION)
             || is_package_path(&entry.path)
             || limit_paths.contains(entry.path.as_str())
-            || entry.path == RETIRED_REGISTRY_PATH;
+            || entry.path == RETIRED_REGISTRY_PATH
+            || manifest == Some(entry.path.as_str());
         if wanted && entry.is_regular_file() {
             to_read.push(entry);
         } else {
@@ -170,6 +190,13 @@ pub fn run(repo: &Repo, mode: Mode) -> Result<Outcome, String> {
     }
     let oids: Vec<&str> = to_read.iter().map(|entry| entry.oid.as_str()).collect();
     for (entry, bytes) in to_read.iter().zip(repo.read_blobs(&oids)?) {
+        if manifest == Some(entry.path.as_str()) {
+            let value = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("{}: {error}", entry.path))?;
+            input.changelog_stamp = develop_tools_manifest::declaration(&value)
+                .map_err(|error| format!("{}: {error}", entry.path))?
+                .changelog_stamp;
+        }
         if limit_paths.contains(entry.path.as_str()) {
             input
                 .sizes

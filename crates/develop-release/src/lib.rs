@@ -260,12 +260,8 @@ pub fn next_version(current: Version, bump: Bump) -> Result<Version, String> {
     Ok(next)
 }
 
-/// CHANGELOG のトップレベル項目の行頭と、太字の題の終わり。刻印を書く側と読む側で共有する。
+/// 月別 CHANGELOG のトップレベル項目の行頭。
 pub(crate) const CHANGELOG_TITLE_PREFIX: &str = "- **";
-pub(crate) const CHANGELOG_TITLE_END: &str = "**";
-const CHANGELOG_UNRELEASED_SUFFIX: &str = "未リリース）";
-/// 刻印の末尾（「（…、v<版> で prod 反映）」の版より後ろ）。release notes はこれで刻印済みを見分ける。
-pub(crate) const CHANGELOG_RELEASED_SUFFIX: &str = " で prod 反映）";
 
 /// 日付の文字列が `YYYY-MM-DD` 形式かを返す。
 pub(crate) fn is_date(text: &str) -> bool {
@@ -276,54 +272,29 @@ pub(crate) fn is_date(text: &str) -> bool {
         })
 }
 
-/// 題の末尾が「（未リリース）」または「…、未リリース）」なら、置換対象となる「未リリース）」の開始位置を返す。
-/// 先行文字が「（」または「、」であること、かつ開き括弧「（」が存在することを検査する。
-pub(crate) fn unreleased_suffix_offset(title: &str) -> Option<usize> {
-    let head = title.strip_suffix(CHANGELOG_UNRELEASED_SUFFIX)?;
-    if (head.ends_with('（') || head.ends_with('、')) && head.contains('（') {
-        Some(head.len())
-    } else {
-        None
-    }
-}
-
-/// 題の末尾が「（v<版> で prod 反映）」または「…、v<版> で prod 反映）」なら、その版の文字列を返す。
-pub(crate) fn released_version_suffix(title: &str) -> Option<&str> {
-    let head = title.strip_suffix(CHANGELOG_RELEASED_SUFFIX)?;
-    let (prefix, version) = head.rsplit_once('v')?;
-    if (prefix.ends_with('（') || prefix.ends_with('、'))
-        && prefix.contains('（')
-        && version.parse::<Version>().is_ok()
-    {
-        Some(version)
-    } else {
-        None
-    }
-}
-
-/// CHANGELOG のトップレベル項目（行頭 `- **`）の太字の題の末尾「、未リリース）」または「（未リリース）」を
-/// 「v<版> で prod 反映）」に置き換え、前の補足（日付・段の説明など）はそのまま残す。
-/// 書き換えた件数を返す。入れ子・本文・見出しと、題の途中の括弧は触らない。
+/// 短い形のトップレベル項目の未リリースの印を `/v<版>` に書き換える。
+/// 日付・本文・改行は保ち、入れ子・見出し・code fence の中は触らない。
 pub fn stamp_changelog(text: &str, version: Version) -> (String, usize) {
+    use develop_tools_core::changelog_title::{self, Stamp};
+
     let mut count = 0;
     let mut out = String::with_capacity(text.len());
+    let mut fence = release_notes::Fence::default();
     for line in text.split_inclusive('\n') {
-        let stamped = line.strip_prefix(CHANGELOG_TITLE_PREFIX).and_then(|rest| {
-            let title_end = rest.find(CHANGELOG_TITLE_END)?;
-            let suffix = unreleased_suffix_offset(&rest[..title_end])?;
-            Some(format!(
-                "{CHANGELOG_TITLE_PREFIX}{}v{version}{CHANGELOG_RELEASED_SUFFIX}{}",
-                &rest[..suffix],
-                &rest[title_end..]
-            ))
-        });
-        match stamped {
-            Some(stamped) => {
-                count += 1;
-                out.push_str(&stamped);
-            }
-            None => out.push_str(line),
+        let parsed = if fence.step(line) || fence.is_open() {
+            None
+        } else {
+            changelog_title::parse(line).filter(|parsed| parsed.stamp == Stamp::Unreleased)
+        };
+        if let Some(parsed) = parsed {
+            out.push_str(&line[..parsed.stamp_range.start]);
+            out.push_str(changelog_title::RELEASED_PREFIX);
+            out.push_str(&version.to_string());
+            out.push_str(&line[parsed.stamp_range.end..]);
+            count += 1;
+            continue;
         }
+        out.push_str(line);
     }
     (out, count)
 }

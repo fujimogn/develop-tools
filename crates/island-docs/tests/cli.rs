@@ -1717,3 +1717,65 @@ fn check_local_version_skips_fields_added_beside_the_version() {
     assert!(text.contains(&newer_pin), "{text}");
     assert!(text.contains("入れ直して"), "{text}");
 }
+
+const COMPACT_CHANGELOG: &str = "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-11\n- **成果** 2026-11-05/v1.2.3: 要約\n";
+
+#[test]
+fn changelog_shape_follows_tracked_manifest_snapshot() {
+    for (manifest, compact, expected) in [
+        (Some(r#"{"release":{"changelogStamp":true}}"#), true, 0),
+        (Some(r#"{"release":{"changelogStamp":true}}"#), false, 1),
+        (None, true, 1),
+        (Some("{}"), false, 0),
+        (Some("not JSON"), true, 2),
+    ] {
+        let dir = island_repo(Some("https://github.com/example/island.git"));
+        if compact {
+            write(dir.path(), "CHANGELOG.md", COMPACT_CHANGELOG);
+        }
+        if let Some(source) = manifest {
+            write(dir.path(), ".config/develop-tools.json", source);
+        }
+        git(dir.path(), &["add", "."]);
+        write(
+            dir.path(),
+            ".config/develop-tools.json",
+            "broken working tree",
+        );
+        let out = run(dir.path(), &["--tracked"]);
+        assert_eq!(
+            out.status.code(),
+            Some(expected),
+            "{manifest:?}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn changelog_shape_follows_range_end_manifest_not_index() {
+    let dir = island_repo(Some("https://github.com/example/island.git"));
+    write(dir.path(), ".config/develop-tools.json", "{}");
+    git(dir.path(), &["add", "."]);
+    git(
+        dir.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "base"],
+    );
+    let base = head(dir.path());
+    write(
+        dir.path(),
+        ".config/develop-tools.json",
+        r#"{"release":{"changelogStamp":true}}"#,
+    );
+    write(dir.path(), "CHANGELOG.md", COMPACT_CHANGELOG);
+    git(dir.path(), &["add", "."]);
+    git(
+        dir.path(),
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "compact"],
+    );
+    let end = head(dir.path());
+    write(dir.path(), ".config/develop-tools.json", "{}");
+    git(dir.path(), &["add", "."]);
+    let out = run(dir.path(), &["--range", &base, &end]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+}

@@ -179,6 +179,12 @@ impl SlotSender {
     }
 }
 impl SlotReceiver {
+    fn resume_slot_polling(&self) -> io::Result<()> {
+        // recvmsg is nonblocking from here on, so the handshake timeouts are
+        // dormant. Clearing them can fail with EINVAL on Darwin if a fast
+        // worker closed its peer after sending the ACK.
+        self.0.set_nonblocking(true)
+    }
     fn receive(&self) -> io::Result<Option<OwnedFd>> {
         let mut control = [0usize; 8];
         let mut byte = [0u8];
@@ -361,9 +367,7 @@ impl Family {
             }
             Ok(())
         })();
-        self.receiver.0.set_read_timeout(None)?;
-        self.receiver.0.set_write_timeout(None)?;
-        self.receiver.0.set_nonblocking(true)?;
+        self.receiver.resume_slot_polling()?;
         result
     }
     pub fn group(&self) -> i32 {
@@ -412,15 +416,11 @@ impl Family {
             }
             break;
         }
-        if unsafe { libc::kill(-self.group, 0) } == 0 {
-            return Ok(false);
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
+        if group_stopped(self.group)? {
             self.slot.take();
             Ok(true)
         } else {
-            Err(error)
+            Ok(false)
         }
     }
     /// An absolute confirmation budget never resets on progress/heartbeat.
@@ -501,15 +501,32 @@ impl Family {
         }
     }
 }
+fn group_stopped(group: i32) -> io::Result<bool> {
+    if unsafe { libc::kill(-group, 0) } == 0 {
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(true),
+        // Darwin killpg1 skips SZOMB members and can return EPERM while
+        // init is still reaping the group. This is pending, never stopped.
+        #[cfg(target_os = "macos")]
+        Some(libc::EPERM) => Ok(false),
+        _ => Err(error),
+    }
+}
 fn send(group: i32, signal: i32) -> io::Result<()> {
     if unsafe { libc::kill(-group, signal) } == 0 {
         return Ok(());
     }
     let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error)
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Ok(()),
+        // A zombie-only Darwin group is not signalable. Keep the original
+        // cancellation and its deadline; only group_stopped may release it.
+        #[cfg(target_os = "macos")]
+        Some(libc::EPERM) => Ok(()),
+        _ => Err(error),
     }
 }
 
@@ -567,4 +584,56 @@ fn peer_pid(socket: &UnixStream) -> io::Result<i32> {
         return Err(handshake_error());
     }
     Ok(pid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_handshake_accepts_closed_peer() {
+        let (receiver, sender) = slot_channel().unwrap();
+        receiver.0.set_nonblocking(false).unwrap();
+        receiver
+            .0
+            .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+            .unwrap();
+        receiver
+            .0
+            .set_write_timeout(Some(HANDSHAKE_TIMEOUT))
+            .unwrap();
+        // The ACK may already be consumed when a short-lived worker exits.
+        drop(sender);
+        receiver.resume_slot_polling().unwrap();
+        assert!(receiver.receive().unwrap().is_none());
+    }
+
+    #[test]
+    fn zombie_group_remains_unconfirmed_until_reaped() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]).process_group(0);
+        let mut child = spawn(&mut command).unwrap();
+        let group = child.id() as i32;
+        // Observe exit without reaping: Darwin reports EPERM for this real
+        // zombie-only group. The supervisor must keep waiting, not fail or free.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let observed = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        let pending = group_stopped(group);
+        let term = send(group, libc::SIGTERM);
+        let kill = send(group, libc::SIGKILL);
+        // Reap before asserting so a RED run cannot leave a fixture zombie.
+        child.wait().unwrap();
+        assert_eq!(observed, 0);
+        assert!(!pending.unwrap(), "unreaped group released early");
+        assert!(term.is_ok(), "zombie TERM must remain pending: {term:?}");
+        assert!(kill.is_ok(), "zombie KILL must remain pending: {kill:?}");
+        assert!(group_stopped(group).unwrap());
+    }
 }

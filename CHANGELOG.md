@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.11] - 2026-11-06
+
+### Fixed
+
+- Fix `run-heavy-check` on macOS reporting a failed stop after cancellation: a process group that only contains unreaped zombies returns `EPERM` there, which is now treated as still stopping until the existing confirmation budget ends. The slot is still held until the group is confirmed gone.
+- Fix the heavy-check handshake failing on macOS when the worker closes its socket right after acknowledging the slot.
+
+### Notes
+
+- Version 0.6.10 has a tag only; no GitHub Release was created because the macOS runtime tests failed.
+
 ## [0.6.10] - 2026-11-06
 
 ### Fixed

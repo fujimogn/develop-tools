@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.10] - 2026-11-06
+
+### Fixed
+
+- Fix the heavy-check harness failing to compile on macOS because its `openpty` arguments used const null pointers instead of mutable null pointers.
+
+### Notes
+
+- Version 0.6.9 has a tag only; no GitHub Release was created because the macOS build failed.
+
 ## [0.6.9] - 2026-11-06
 
 ### Added

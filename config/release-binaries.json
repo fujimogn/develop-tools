@@ -8,6 +8,7 @@
     "release",
     "check-release-version",
     "archive-changelog",
-    "release-notes"
+    "release-notes",
+    "run-heavy-check"
   ]
 }

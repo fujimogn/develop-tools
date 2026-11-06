@@ -1,14 +1,14 @@
 #!/bin/sh
 set -u
 
-resolver=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)/resolve
+resolver=${RESOLVER_UNDER_TEST:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)/resolve}
 test_shell=${TEST_SHELL:-/bin/sh}
 target=x86_64-unknown-linux-gnu
 binary=develop-docs-check
 version=0.1.0
 other_version=0.2.0
 asset=develop-tools-v$version-$target.tar.gz
-root=$(mktemp -d "${TMPDIR:-/tmp}/resolve-test.XXXXXXXX") || exit 1
+root=$(mktemp -d "${TMPDIR:-/tmp}/develop-meta-resolve-test.XXXXXXXX") || exit 1
 trap 'cleanup' 0
 
 cleanup() {
@@ -59,13 +59,9 @@ real_command() {
   return 1
 }
 
-fixture() {
-  case_dir=$root/$1
-  mkdir -p "$case_dir/repo" "$case_dir/releases" "$case_dir/payload" \
-    "$case_dir/fakebin" "$case_dir/cache" "$case_dir/home" || exit 1
-  printf '#!/bin/sh\nprintf "ran:%%s\\n" "$*"\n' > "$case_dir/payload/$binary"
-  chmod +x "$case_dir/payload/$binary"
-  tar -czf "$case_dir/releases/$asset" -C "$case_dir/payload" "$binary" || exit 1
+pack_payload() {
+  [ "$#" -gt 0 ] || set -- "$binary"
+  tar -czf "$case_dir/releases/$asset" -C "$case_dir/payload" "$@" || exit 1
   if command -v sha256sum >/dev/null 2>&1; then
     digest=$(sha256sum "$case_dir/releases/$asset" | awk '{print $1}')
   else
@@ -74,6 +70,15 @@ fixture() {
   printf '%s  %s\n' "$digest" "$asset" > "$case_dir/releases/SHA256SUMS"
   mkdir -p "$case_dir/repo/.config"
   printf '{"version":"%s","sha256":{"%s":"%s"}}\n' "$version" "$target" "$digest" > "$case_dir/repo/.config/develop-tools.json"
+}
+
+fixture() {
+  case_dir=$root/$1
+  mkdir -p "$case_dir/repo" "$case_dir/releases" "$case_dir/payload" \
+    "$case_dir/fakebin" "$case_dir/cache" "$case_dir/home" || exit 1
+  printf '#!/bin/sh\nprintf "ran:%%s\\n" "$*"\n' > "$case_dir/payload/$binary"
+  chmod +x "$case_dir/payload/$binary"
+  pack_payload
   cat > "$case_dir/fakebin/curl" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$CURL_LOG"
@@ -105,7 +110,7 @@ run_resolver() {
     fi
     PATH="${RUN_PATH:-$case_dir/fakebin:$PATH}" XDG_CACHE_HOME="$case_dir/cache" \
     XDG_STATE_HOME="$case_dir/state" \
-    HOME="$case_dir/home" RELEASES="$case_dir/releases" \
+    RUN_LOG="$case_dir/run.log" HOME="$case_dir/home" RELEASES="$case_dir/releases" \
     CURL_LOG="$case_dir/curl.log" JQ_LOG="$case_dir/jq.log" \
     SNAPSHOT_LOG="$case_dir/snapshot.log" CURL_FAIL="${CURL_FAIL:-0}" \
     CURL_DELAY="${CURL_DELAY:-0}" FAKE_OS="${FAKE_OS:-Linux}" \
@@ -122,7 +127,7 @@ run_bin_dir() {
     unset DEVELOP_TOOLS_BIN_DIR
     PATH="${RUN_PATH:-$case_dir/fakebin:$PATH}" XDG_CACHE_HOME="$case_dir/cache" \
     XDG_STATE_HOME="$case_dir/state" \
-    HOME="$case_dir/home" RELEASES="$case_dir/releases" \
+    RUN_LOG="$case_dir/run.log" HOME="$case_dir/home" RELEASES="$case_dir/releases" \
     CURL_LOG="$case_dir/curl.log" CURL_FAIL="${CURL_FAIL:-0}" \
     CURL_DELAY="${CURL_DELAY:-0}" FAKE_OS="${FAKE_OS:-Linux}" \
     FAKE_ARCH="${FAKE_ARCH:-x86_64}" \
@@ -131,6 +136,48 @@ run_bin_dir() {
   result=$?
   return "$result"
 }
+
+# run-heavy-check の payload 境界: resolver は先頭の -- も空引数も保持する。
+binary=run-heavy-check
+fixture heavy_transparency
+cat > "$case_dir/payload/$binary" <<'EOF'
+#!/bin/sh
+printf 'started\n' > "$RUN_LOG"
+for arg do printf '<%s>\n' "$arg"; done
+cat
+exit 37
+EOF
+pack_payload
+printf '\000\377input\n' > "$case_dir/snapshot.log"
+run_resolver ci -- command 'arg with space' '' -- < "$case_dir/snapshot.log"
+[ "$result" -eq 37 ] || fail_test 'resolver changed payload exit code'
+printf '<-->\n<command>\n<arg with space>\n<>\n<-->\n\000\377input\n' > "$case_dir/run.log"
+cmp "$case_dir/run.log" "$case_dir/stdout" || fail_test 'resolver changed argv or binary stdin'
+printf 'ok: run-heavy-check argv, stdin and exit code are transparent\n'
+
+for failure in digest unpublished missing_binary; do
+  fixture "heavy_$failure"
+  cat > "$case_dir/payload/$binary" <<'EOF'
+#!/bin/sh
+printf 'started\n' > "$RUN_LOG"
+EOF
+  pack_payload
+  case "$failure" in
+    digest) printf '{"version":"%s","sha256":{"%s":"%064d"}}\n' "$version" "$target" 0 > "$case_dir/repo/.config/develop-tools.json" ;;
+    unpublished) CURL_FAIL=1 ;;
+    missing_binary)
+      # 公開された旧版を模した、有効な digest だが runner を持たない archive。
+      mv "$case_dir/payload/$binary" "$case_dir/payload/old-tool"
+      pack_payload old-tool
+      ;;
+  esac
+  run_resolver ci -- command
+  unset CURL_FAIL
+  [ "$result" -ne 0 ] || fail_test "$failure unexpectedly succeeded"
+  [ ! -e "$case_dir/run.log" ] || fail_test "$failure started the payload"
+done
+printf 'ok: unavailable run-heavy-check never starts payload\n'
+binary=develop-docs-check
 
 # A killed resolver leaves this directory behind. The next invocation must reclaim it.
 fixture stale_lock

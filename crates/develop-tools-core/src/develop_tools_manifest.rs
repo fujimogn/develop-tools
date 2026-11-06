@@ -113,6 +113,7 @@ pub struct PlatformCheck {
 /// develop-sync は読むだけで書き換えない。
 #[derive(Debug, PartialEq, Eq)]
 pub struct CiDeclaration {
+    pub record_only_skip: bool,
     pub rust: Option<RustCi>,
     pub bun: Option<BunCi>,
 }
@@ -263,8 +264,8 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
     let Some(ci) = object.get("ci") else {
         return Ok(None);
     };
-    let ci = stack(ci, "ci", &["rust", "bun"])?;
-    if ci.is_empty() {
+    let ci = stack(ci, "ci", &["rust", "bun", "recordOnlySkip"])?;
+    if !ci.contains_key("rust") && !ci.contains_key("bun") {
         return Err("ci は rust か bun の片方か両方を持たなければなりません".into());
     }
     let rust = match ci.get("rust") {
@@ -293,7 +294,16 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
             })
         }
     };
-    Ok(Some(CiDeclaration { rust, bun }))
+    let record_only_skip = match ci.get("recordOnlySkip") {
+        None => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return Err("ci.recordOnlySkip は真偽値でなければなりません".into()),
+    };
+    Ok(Some(CiDeclaration {
+        record_only_skip,
+        rust,
+        bun,
+    }))
 }
 
 fn bun_test(value: &Value) -> Result<BunTest, String> {
@@ -1073,6 +1083,7 @@ mod tests {
         assert_eq!(
             declared.ci,
             Some(CiDeclaration {
+                record_only_skip: false,
                 rust: Some(RustCi {
                     workspaces: vec!["tools".into(), "packages/cli".into()],
                     extra_steps: vec!["cargo xtask record-root".into()],
@@ -1108,6 +1119,28 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(ci_install.bun.map(|bun| bun.ci_install), Some(true));
+    }
+
+    #[test]
+    fn record_only_skip_is_strict_and_does_not_replace_a_stack() {
+        for flag in [None, Some(json!(false)), Some(json!(true))] {
+            let mut value = json!({"ci": {"bun": {"dirs": ["."]}}});
+            if let Some(flag) = flag {
+                value["ci"]["recordOnlySkip"] = flag;
+            }
+            assert!(ci_declaration(&value).is_ok(), "{value}");
+        }
+        for flag in [json!(null), json!("true"), json!(1), json!([]), json!({})] {
+            let value = json!({"ci": {"recordOnlySkip": flag, "bun": {"dirs": ["."]}}});
+            assert!(
+                ci_declaration(&value)
+                    .unwrap_err()
+                    .contains("ci.recordOnlySkip")
+            );
+        }
+        for flag in [true, false] {
+            assert!(ci_declaration(&json!({"ci": {"recordOnlySkip": flag}})).is_err());
+        }
     }
 
     #[test]

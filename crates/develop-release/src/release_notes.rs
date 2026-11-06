@@ -1,9 +1,14 @@
 //! tag 間の CHANGELOG 月別項目から GitHub Release 本文を作る。
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// clone 内で共有し、worktree を外しても理由を残す。usage 台帳とは分ける。
+const FALLBACK_LOG: &str = "release-notes-fallback.jsonl";
+
 use develop_tools_core::develop_tools_manifest::{
-    NotesAudience, NotesLanguage, NotesMode, NotesSource, ReleaseNotes,
+    self, NotesAudience, NotesLanguage, NotesMode, NotesSource, ReleaseNotes,
 };
 use island_llm::settings::{self, Audience};
 use island_llm::transport::Transport;
@@ -134,16 +139,55 @@ impl Fence {
     }
 }
 
-fn released_for_other_tag(item: &str, tag: &str) -> bool {
+/// 旧形式は読取だけに使う。本文・入れ子には入らず、最初の太字の末尾だけを読む。
+fn legacy_title_stamp(
+    item: &str,
+) -> Option<(
+    develop_tools_core::changelog_title::Stamp<'_>,
+    std::ops::Range<usize>,
+)> {
+    use develop_tools_core::changelog_title::Stamp;
+
+    let title = item
+        .strip_prefix(crate::CHANGELOG_TITLE_PREFIX)?
+        .split_once("**")?
+        .0;
+    let inner = title.strip_suffix('）')?;
+    let marker_start = inner.rfind(['（', '、'])?;
+    let marker = &inner[marker_start + '（'.len_utf8()..];
+    let stamp = if marker == "未リリース" {
+        Stamp::Unreleased
+    } else {
+        let version = marker.strip_prefix('v')?.strip_suffix(" で prod 反映")?;
+        let mut parts = version.split('.');
+        for _ in 0..3 {
+            let part = parts.next()?;
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+        }
+        if parts.next().is_some() {
+            return None;
+        }
+        Stamp::Released(version)
+    };
+    let start = crate::CHANGELOG_TITLE_PREFIX.len() + title.rfind('（')?;
+    let end = crate::CHANGELOG_TITLE_PREFIX.len() + title.len();
+    Some((stamp, start..end))
+}
+
+fn released_for_other_tag(item: &str, tag: &str) -> Result<bool, String> {
     use develop_tools_core::changelog_title::{self, Stamp};
 
-    let Some(parsed) = changelog_title::parse(item) else {
-        return false;
-    };
-    let Stamp::Released(version) = parsed.stamp else {
-        return false;
-    };
-    format!("v{version}") != tag
+    let compact = changelog_title::parse(item);
+    let legacy = legacy_title_stamp(item);
+    if compact.is_some() && legacy.is_some() {
+        return Err("changelog_stamp_ambiguous: 題に短い刻印と旧刻印が併記されています".to_owned());
+    }
+    let stamp = compact
+        .map(|parsed| parsed.stamp)
+        .or_else(|| legacy.map(|(stamp, _)| stamp));
+    Ok(matches!(stamp, Some(Stamp::Released(version)) if format!("v{version}") != tag))
 }
 
 /// Each side needs its own heading and fence state: deleted Markdown must not
@@ -170,6 +214,7 @@ impl MonthlyItems {
 struct ChangelogAdditions {
     items: Vec<String>,
     edited: Vec<String>,
+    error: Option<String>,
 }
 
 /// Unchanged context or diff metadata ends a change run. If an old monthly item
@@ -206,8 +251,12 @@ fn changelog_additions(diff: &str, tag: &str) -> ChangelogAdditions {
         match prefix {
             "-" => removed_item |= old.step(content),
             "+" => {
-                if new.step(content) && !released_for_other_tag(content, tag) {
-                    pending.push(content.to_owned());
+                if new.step(content) {
+                    match released_for_other_tag(content, tag) {
+                        Ok(false) => pending.push(content.to_owned()),
+                        Ok(true) => {}
+                        Err(error) => result.error = Some(error),
+                    }
                 }
             }
             " " => {
@@ -227,14 +276,34 @@ fn changelog_additions(diff: &str, tag: &str) -> ChangelogAdditions {
 /// 全行の文脈を含む diff から、月別節に純粋に追加された項目を採る。
 /// 旧項目の削除と同じ連続変更区間にある追加は編集とみなし、警告して除く。
 pub fn extract_changelog_additions(diff: &str, tag: &str) -> Vec<String> {
+    checked_changelog_additions(diff, tag).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        Vec::new()
+    })
+}
+
+fn checked_changelog_additions(diff: &str, tag: &str) -> Result<Vec<String>, String> {
+    additions_with_warning(diff, tag, true)
+}
+
+fn additions_with_warning(
+    diff: &str,
+    tag: &str,
+    human_warning: bool,
+) -> Result<Vec<String>, String> {
     let result = changelog_additions(diff, tag);
-    if !result.edited.is_empty() {
+    if let Some(error) = result.error {
+        return Err(error);
+    }
+    if !result.edited.is_empty() && human_warning {
         eprintln!(
             "警告: 既存項目の削除を含む変更区間のため、以下を Release 本文から除外しました。新規項目が混ざっている場合は tag 注釈に補ってください。\n{}",
             result.edited.join("\n")
         );
+    } else if !result.edited.is_empty() {
+        eprintln!("edited_items_excluded: {}", result.edited.len());
     }
-    result.items
+    Ok(result.items)
 }
 
 /// 前 tag から終点の commit までの抽出。AI の入力と fallback の本文はどちらもここから作る。
@@ -244,13 +313,120 @@ pub struct ReleaseExtract {
     pub tag: String,
     pub repo: String,
     pub items: Vec<String>,
+    /// 元項目と同じ順の Git 検証済み link。link 無しも番号を保持する。
+    pub commit_links: Vec<Option<VerifiedCommitLink>>,
     /// 版の節の抽出（`changelog-section`）のときの節の中身。`items` はその節の箇条。
     pub section: Option<String>,
     /// 本文の言語。compare の行の見出しを決める。宣言が無いときは日本語。
     pub language: NotesLanguage,
 }
 
+/// 固定終点の履歴への包含まで検証した末尾 link。生成は抽出時だけ行う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedCommitLink {
+    oid: String,
+    suffix: String,
+}
+
+/// Git の失敗時も URL・stderr を診断へ混ぜない。
+fn link_git(root: &Path, args: &[&str]) -> Result<String, String> {
+    git(root, args).map_err(|_| "commit_link: Git の証拠を確認できません".to_owned())
+}
+
+fn verified_links(
+    root: &Path,
+    end: &str,
+    items: &[String],
+) -> Result<Vec<Option<VerifiedCommitLink>>, String> {
+    use develop_tools_core::changelog_commit_link::parse;
+    let parsed = items
+        .iter()
+        .map(|item| parse(item).map_err(|_| "commit_link: 末尾 link の形式が不正です".to_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if parsed.iter().all(Option::is_none) {
+        return Ok(vec![None; items.len()]);
+    }
+    let origin = link_git(root, &["remote", "get-url", "origin"])?;
+    let repo = develop_tools_core::github_repo(&origin)
+        .filter(|repo| valid_repo(repo))
+        .ok_or("commit_link: origin の repo を確認できません")?;
+    if link_git(root, &["rev-parse", "--show-object-format"])? != "sha1" {
+        return Err("commit_link: SHA-1 以外の repository は対象外です".to_owned());
+    }
+    if link_git(root, &["rev-parse", "--is-shallow-repository"])? != "false" {
+        return Err("commit_link: shallow の履歴は検証できません".to_owned());
+    }
+    let mut prefixes = BTreeMap::new();
+    let mut ancestors = BTreeSet::new();
+    let mut suffixes = BTreeMap::new();
+    parsed
+        .into_iter()
+        .zip(items)
+        .map(|(link, item)| {
+            let Some(link) = link else { return Ok(None) };
+            if !format!("{}/{}", link.owner, link.repo).eq_ignore_ascii_case(&repo) {
+                return Err("commit_link: origin の repo と一致しません".to_owned());
+            }
+            let oid = if let Some(oid) = prefixes.get(link.sha) {
+                String::clone(oid)
+            } else {
+                let resolved = link_git(
+                    root,
+                    &["rev-parse", &format!("--disambiguate={}", link.sha)],
+                )?;
+                let mut candidates = resolved.lines();
+                let oid = candidates
+                    .next()
+                    .filter(|_| candidates.next().is_none())
+                    .ok_or("commit_link: SHA を一意に解決できません")?
+                    .to_owned();
+                if link_git(root, &["cat-file", "-t", &oid])? != "commit" {
+                    return Err("commit_link: commit 以外の object は参照できません".to_owned());
+                }
+                link_git(
+                    root,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        &format!("{oid}^{{commit}}"),
+                    ],
+                )?;
+                prefixes.insert(link.sha.to_owned(), oid.clone());
+                oid
+            };
+            if ancestors.insert(oid.clone()) {
+                link_git(root, &["merge-base", "--is-ancestor", &oid, end]).map_err(|_| {
+                    "commit_link: 固定終点の祖先であることを確認できません".to_owned()
+                })?;
+            }
+            let suffix = suffixes
+                .entry(oid.clone())
+                .or_insert_with(|| item[link.suffix_range].to_owned())
+                .clone();
+            Ok(Some(VerifiedCommitLink { oid, suffix }))
+        })
+        .collect()
+}
+
 impl ReleaseExtract {
+    /// 照合済み sources の昇順で link を付ける。同じ OID は最初の入力表記へ揃える。
+    pub(crate) fn links_for_sources(&self, sources: &[usize]) -> String {
+        let ordered: BTreeSet<_> = sources.iter().copied().collect();
+        let mut seen = BTreeSet::new();
+        let mut suffix = String::new();
+        for number in ordered {
+            if let Some(Some(link)) = number
+                .checked_sub(1)
+                .and_then(|index| self.commit_links.get(index))
+                && seen.insert(&link.oid)
+            {
+                suffix.push_str(&link.suffix);
+            }
+        }
+        suffix
+    }
+
     /// 前 tag から今回の tag への compare の link（`[範囲](URL)`）。
     pub fn compare_link(&self) -> String {
         let Self {
@@ -296,16 +472,20 @@ pub fn release_base(root: &Path, parent: &str) -> Result<ReleaseBase, String> {
 }
 
 fn resolve_base(root: &Path, parent: &str, repo_arg: Option<&str>) -> Result<ReleaseBase, String> {
-    let repo = match repo_arg {
-        Some(repo) if valid_repo(repo) => repo.to_owned(),
-        Some(repo) => return Err(format!("repo は owner/name で指定してください: {repo}")),
-        None => remote_repo(root)?,
-    };
+    let repo = resolve_repo(root, repo_arg)?;
     let previous = git(root, &["describe", "--tags", "--abbrev=0", parent])?;
     if !release_tag(&previous) {
         return Err(format!("前 tag を安全に決定できません: {previous}"));
     }
     Ok(ReleaseBase { previous, repo })
+}
+
+fn resolve_repo(root: &Path, repo_arg: Option<&str>) -> Result<String, String> {
+    match repo_arg {
+        Some(repo) if valid_repo(repo) => Ok(repo.to_owned()),
+        Some(repo) => Err(format!("repo は owner/name で指定してください: {repo}")),
+        None => remote_repo(root),
+    }
 }
 
 /// 決めておいた起点から終点の commit までを抽出する。版 commit の後はこの diff だけを読む。
@@ -316,19 +496,54 @@ pub fn extract_from(
     tag: &str,
     language: NotesLanguage,
 ) -> Result<ReleaseExtract, String> {
+    extract_range(root, base, &base.previous, end, tag, language)
+}
+
+fn extract_range(
+    root: &Path,
+    base: &ReleaseBase,
+    from: &str,
+    end: &str,
+    tag: &str,
+    language: NotesLanguage,
+) -> Result<ReleaseExtract, String> {
+    extract_range_with_warning(root, base, from, end, tag, language, true)
+}
+
+fn extract_range_with_warning(
+    root: &Path,
+    base: &ReleaseBase,
+    from: &str,
+    end: &str,
+    tag: &str,
+    language: NotesLanguage,
+    human_warning: bool,
+) -> Result<ReleaseExtract, String> {
     let ReleaseBase { previous, repo } = base;
+    let end = git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{end}^{{commit}}"),
+        ],
+    )?;
     let diff = git(
         root,
         &[
             "diff",
             "--unified=99999",
-            &format!("{previous}..{end}"),
+            &format!("{from}..{end}"),
             "--",
             "CHANGELOG.md",
         ],
     )?;
+    let items = additions_with_warning(&diff, tag, human_warning)?;
+    let commit_links = verified_links(root, &end, &items)?;
     Ok(ReleaseExtract {
-        items: extract_changelog_additions(&diff, tag),
+        items,
+        commit_links,
         previous: previous.clone(),
         tag: tag.to_owned(),
         repo: repo.clone(),
@@ -639,13 +854,19 @@ fn drop_internal_words(text: &str) -> String {
     out
 }
 
-/// AI へ送る前に、利用者に意味の無い社内の印（日付・短い形の刻印・commit SHA・
+/// AI へ送る前に、利用者に意味の無い社内の印（日付・短い形と旧形式の刻印・commit SHA・
 /// lessons の番号・link の URL）を落とす。別の版の項目を除く `released_for_other_tag` とは
 /// 責務が違い、抽出の後に掛ける。
 pub fn scrub_for_ai(item: &str) -> String {
     let mut item = item.to_owned();
+    if let Ok(Some(link)) = develop_tools_core::changelog_commit_link::parse(&item) {
+        item.replace_range(link.suffix_range, "");
+    }
     if let Some(parsed) = develop_tools_core::changelog_title::parse(&item) {
         item.replace_range(parsed.metadata_range, "");
+    }
+    if let Some((_, range)) = legacy_title_stamp(&item) {
+        item.replace_range(range, "");
     }
     let scrubbed = drop_internal_words(&drop_date_stamps(&drop_bare_urls(&drop_link_targets(
         &item,
@@ -676,6 +897,30 @@ pub struct AiRuntime<'a> {
     pub op_program: PathBuf,
     pub op_service_account_token: Option<String>,
     pub transport: &'a dyn Transport,
+}
+
+/// 両 CLI で共有する本番の送信先・待ち時間・環境設定。構築だけでは送信も op 起動もしない。
+pub fn with_default_ai_runtime<T>(run: impl FnOnce(&Path, &AiRuntime<'_>) -> T) -> T {
+    use island_llm::transport::HttpTransport;
+    use std::time::Duration;
+
+    const API_TIMEOUT: Duration = Duration::from_secs(60);
+    const API_BASE_URL: &str = "https://api.anthropic.com";
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let transport = HttpTransport {
+        base_url: API_BASE_URL.to_owned(),
+        timeout: API_TIMEOUT,
+    };
+    let runtime = AiRuntime {
+        op_program: PathBuf::from("op"),
+        op_service_account_token: std::env::var("OP_SERVICE_ACCOUNT_TOKEN").ok(),
+        transport: &transport,
+        home: home.clone(),
+    };
+    run(&settings::default_path(&home), &runtime)
 }
 
 /// 宣言から決めた本文の作り方。指示文の言語は抽出の宣言に従う。
@@ -714,17 +959,21 @@ pub fn declared_notes(root: &Path) -> Result<Option<DeclaredNotes>, String> {
     let Some(notes) = crate::preflight::read_declaration(root)?.release_notes else {
         return Ok(None);
     };
+    normalize_notes(&notes).map(Some)
+}
+
+fn normalize_notes(notes: &ReleaseNotes) -> Result<DeclaredNotes, String> {
     let source = match notes.mode {
         NotesMode::Changelog(source)
         | NotesMode::Ai {
             fallback: source, ..
         } => source,
     };
-    Ok(Some(DeclaredNotes {
-        plan: NotesPlan::from_declaration(&notes)?,
+    Ok(DeclaredNotes {
+        plan: NotesPlan::from_declaration(notes)?,
         source,
         language: notes.language,
-    }))
+    })
 }
 
 /// 版 commit の前に決めた本文の材料。書いた後に失敗しうる処理を減らすため、前 tag・repo と
@@ -765,7 +1014,30 @@ pub fn prepare_notes(
         tag: tag.to_owned(),
     };
     if prepared.base.is_none() || declared.source == NotesSource::ChangelogSection {
-        prepared.section_at(root, "HEAD")?;
+        let head = git(
+            root,
+            &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
+        )?;
+        let section = prepared.section_at(root, &head)?;
+        verified_links(root, &head, &section.items)?;
+    } else {
+        // 版 commit を作る前に、追記に含まれる刻印の構造エラーも検出する。
+        prepared.extract(root, "HEAD")?;
+        if crate::preflight::read_declaration(root)?.changelog_stamp {
+            // 前 tag から変わっていない ⏳ も、版の刻印で新たな変更行になる。
+            // stamp と同じ短い印を読み、抽出対象の月別項目だけを事前検証する。
+            use develop_tools_core::changelog_title::{self, Stamp};
+            let changelog = git_raw(root, &["show", "HEAD:CHANGELOG.md"])?;
+            let mut monthly = MonthlyItems::default();
+            for line in changelog.lines() {
+                if monthly.step(line)
+                    && changelog_title::parse(line)
+                        .is_some_and(|parsed| parsed.stamp == Stamp::Unreleased)
+                {
+                    released_for_other_tag(line, tag)?;
+                }
+            }
+        }
     }
     Ok(prepared)
 }
@@ -781,20 +1053,29 @@ impl PreparedNotes {
         runtime: &AiRuntime<'_>,
     ) -> Result<ReleaseBody, String> {
         if self.base.is_none() {
-            let section = self.section_at(root, end)?;
+            let end = git(
+                root,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{end}^{{commit}}"),
+                ],
+            )?;
+            let section = self.section_at(root, &end)?;
+            verified_links(root, &end, &section.items)?;
             return Ok(ReleaseBody {
                 text: format!("{}\n", section.body),
                 source: BodySource::FirstRelease,
             });
         }
         let extract = self.extract(root, end)?;
-        Ok(release_body(
-            &extract,
-            self.plan(),
-            no_ai,
-            settings_path,
-            runtime,
-        ))
+        let body = release_body(&extract, self.plan(), no_ai, settings_path, runtime);
+        let rendered = finalize_body(root, &self.tag, body);
+        if rendered.diagnostic.get("recording_warning").is_some() {
+            eprintln!("release: fallback_reason_unrecorded（fallback 理由を保存できませんでした）");
+        }
+        Ok(rendered.body)
     }
 
     pub fn plan(&self) -> NotesPlan {
@@ -807,35 +1088,101 @@ impl PreparedNotes {
             .base
             .as_ref()
             .ok_or("前 tag の無い初回は本文の節を使ってください")?;
-        if self.declared.source == NotesSource::ChangelogAdditions {
-            return extract_from(root, base, end, &self.tag, self.declared.language);
-        }
-        let ChangelogSection { body, items } = self.section_at(root, end)?;
-        let ReleaseBase { previous, repo } = base;
-        Ok(ReleaseExtract {
-            previous: previous.clone(),
-            tag: self.tag.clone(),
-            repo: repo.clone(),
-            items,
-            section: Some(body),
-            language: self.declared.language,
-        })
+        extract_declared(
+            root,
+            base,
+            &base.previous,
+            end,
+            &self.tag,
+            self.declared,
+            true,
+        )
     }
 
     fn section_at(&self, root: &Path, commit: &str) -> Result<ChangelogSection, String> {
-        let path = format!("{commit}:CHANGELOG.md");
-        let version = self.tag.strip_prefix('v').unwrap_or(&self.tag);
-        let section = match git(root, &["cat-file", "-e", &path]) {
-            Ok(_) => extract_changelog_section(&git_raw(root, &["show", &path])?, version),
-            Err(_) => Err(SectionError::NoChangelog),
-        };
-        section.map_err(|error| {
-            format!(
-                "release.notes の changelog-section を作れません（{}）",
-                error
-            )
-        })
+        section_at(root, commit, &self.tag)
     }
+}
+
+fn extract_declared(
+    root: &Path,
+    base: &ReleaseBase,
+    from: &str,
+    end: &str,
+    tag: &str,
+    declared: DeclaredNotes,
+    human_warning: bool,
+) -> Result<ReleaseExtract, String> {
+    if declared.source == NotesSource::ChangelogAdditions {
+        return extract_range_with_warning(
+            root,
+            base,
+            from,
+            end,
+            tag,
+            declared.language,
+            human_warning,
+        );
+    }
+    let end = git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{end}^{{commit}}"),
+        ],
+    )?;
+    let ChangelogSection { body, items } = section_at(root, &end, tag)?;
+    let commit_links = verified_links(root, &end, &items)?;
+    Ok(ReleaseExtract {
+        previous: base.previous.clone(),
+        tag: tag.to_owned(),
+        repo: base.repo.clone(),
+        items,
+        commit_links,
+        section: Some(body),
+        language: declared.language,
+    })
+}
+
+fn section_at(root: &Path, commit: &str, tag: &str) -> Result<ChangelogSection, String> {
+    let path = format!("{commit}:CHANGELOG.md");
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let section = match git(root, &["cat-file", "-e", &path]) {
+        Ok(_) => extract_changelog_section(&git_raw(root, &["show", &path])?, version),
+        Err(_) => Err(SectionError::NoChangelog),
+    };
+    section.map_err(|error| format!("release.notes の changelog-section を作れません（{error}）"))
+}
+
+/// 本文や環境設定を受け取らず、既存の code と対象 tag だけを保存する。
+fn record_fallback(root: &Path, tag: &str, code: &str) -> std::io::Result<()> {
+    let common = git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map_err(std::io::Error::other)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_secs();
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "timestamp_unix_seconds": timestamp,
+        "tag": tag,
+        "reason_code": code,
+    }))
+    .map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(Path::new(&common).join(FALLBACK_LOG))?
+        .write_all(&line)
+}
+
+fn fallback_recording_failed(root: &Path, tag: &str, body: &ReleaseBody) -> bool {
+    matches!(&body.source, BodySource::Fallback(code) if record_fallback(root, tag, code).is_err())
 }
 
 /// 本文の出どころ。`release` は本文と一緒にこれを 1 行で出す。
@@ -875,6 +1222,53 @@ impl std::fmt::Display for BodySource {
 pub struct ReleaseBody {
     pub text: String,
     pub source: BodySource,
+}
+
+/// 全検証・usage と fallback 理由記録を終えた本文と、秘密を含まない終端診断。
+pub struct RenderedNotes {
+    pub body: ReleaseBody,
+    pub diagnostic: serde_json::Value,
+}
+
+/// release と render の理由記録・診断を同じ箇所で確定する。
+fn finalize_body(root: &Path, tag: &str, body: ReleaseBody) -> RenderedNotes {
+    let mut diagnostic = match &body.source {
+        BodySource::Ai { dictionary_missing } => serde_json::json!({
+            "source": "ai", "reason_code": null, "dictionary_missing": dictionary_missing,
+        }),
+        BodySource::Fallback(code) => {
+            serde_json::json!({"source":"fallback","reason_code":code})
+        }
+        BodySource::NoAi => serde_json::json!({"source":"no_ai","reason_code":null}),
+        BodySource::Changelog | BodySource::FirstRelease => {
+            serde_json::json!({"source":"changelog","reason_code":null})
+        }
+    };
+    if fallback_recording_failed(root, tag, &body) {
+        diagnostic["recording_warning"] = "fallback_reason_unrecorded".into();
+    }
+    RenderedNotes { body, diagnostic }
+}
+
+#[cfg(test)]
+mod render_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn shared_body_finalization_preserves_budget_failure_code_without_body() {
+        let root = tempfile::tempdir().unwrap();
+        let rendered = finalize_body(
+            root.path(),
+            "v1.2.3",
+            ReleaseBody {
+                text: "secret body".to_owned(),
+                source: BodySource::Fallback(Failure::BudgetExceeded.code().to_owned()),
+            },
+        );
+        assert_eq!(rendered.diagnostic["source"], "fallback");
+        assert_eq!(rendered.diagnostic["reason_code"], "budget_exceeded");
+        assert!(!rendered.diagnostic.to_string().contains("secret"));
+    }
 }
 
 /// 注釈付き tag の本文を決める。AI の経路の失敗は全部 fallback の本文にし、error を返さない
@@ -1040,5 +1434,133 @@ mod rewritten_item_tests {
         let result = changelog_additions(diff, "v1.0.0");
         assert!(result.items.is_empty());
         assert_eq!(result.edited, ["- **replacement**"]);
+    }
+}
+
+/// 明示した範囲の固定入力。解決後は移動可能な ref や作業 tree を読み直さない。
+#[derive(Debug)]
+pub struct FixedNotes {
+    root: PathBuf,
+    base: ReleaseBase,
+    from: String,
+    to: String,
+    tag: String,
+    declared: DeclaredNotes,
+}
+
+impl FixedNotes {
+    /// 固定範囲の本文を生成する。本文入りの人向け警告は出さず、Git の状態は変更しない。
+    pub fn render(
+        &self,
+        no_ai: bool,
+        settings_path: &Path,
+        runtime: &AiRuntime<'_>,
+    ) -> Result<RenderedNotes, String> {
+        let extract = self.extract_with_warning(false)?;
+        let body = release_body(&extract, self.plan(), no_ai, settings_path, runtime);
+        Ok(finalize_body(&self.root, &self.tag, body))
+    }
+
+    /// 前 tag と完全な終点 commit OID を検証し、終点の宣言を読む。Git を変更しない。
+    pub fn resolve(
+        root: &Path,
+        from: &str,
+        to: &str,
+        tag: &str,
+        repo: Option<&str>,
+    ) -> Result<Self, String> {
+        let repo_root = git(root, &["rev-parse", "--show-toplevel"])?;
+        let root = Path::new(&repo_root);
+        if !release_tag(from) || !release_tag(tag) || from == tag {
+            return Err("from と tag は異なる v<semver> が必要です".to_owned());
+        }
+        let oid_length = match git(root, &["rev-parse", "--show-object-format"])?.as_str() {
+            "sha1" => 40,
+            "sha256" => 64,
+            other => return Err(format!("未対応の object format: {other}")),
+        };
+        if to.len() != oid_length || !to.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("to は完全な commit OID が必要です".to_owned());
+        }
+        let from_oid = git(
+            root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("refs/tags/{from}^{{commit}}"),
+            ],
+        )?;
+        let to_oid = git(
+            root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{to}^{{commit}}"),
+            ],
+        )?;
+        if !to_oid.eq_ignore_ascii_case(to) {
+            return Err("to は tag object ではなく commit OID が必要です".to_owned());
+        }
+        if from_oid == to_oid {
+            return Err("from と to は同一 commit にできません".to_owned());
+        }
+        git(root, &["merge-base", "--is-ancestor", &from_oid, &to_oid])
+            .map_err(|_| "from は to の祖先である必要があります".to_owned())?;
+        let repo = resolve_repo(root, repo)?;
+        let paths = git(
+            root,
+            &[
+                "ls-tree",
+                "--name-only",
+                &to_oid,
+                "--",
+                develop_tools_manifest::PATH,
+                develop_tools_manifest::LEGACY_PATH,
+            ],
+        )?;
+        let path =
+            develop_tools_manifest::locate_in(|path| Ok(paths.lines().any(|entry| entry == path)))?
+                .ok_or("終点 commit に release.notes の宣言がありません")?;
+        let raw = git_raw(root, &["show", &format!("{to_oid}:{path}")])?;
+        let value = serde_json::from_str(&raw)
+            .map_err(|error| format!("{path}: JSON が不正です: {error}"))?;
+        let declaration = develop_tools_manifest::declaration(&value)?;
+        let notes = declaration
+            .release_notes
+            .ok_or("終点 commit に release.notes の宣言がありません")?;
+        Ok(Self {
+            root: root.to_owned(),
+            base: ReleaseBase {
+                previous: from.to_owned(),
+                repo,
+            },
+            from: from_oid,
+            to: to_oid,
+            tag: tag.to_owned(),
+            declared: normalize_notes(&notes)?,
+        })
+    }
+
+    /// 解決済みの OID と宣言だけから抽出する。compare の表示には入力の tag 名を保つ。
+    pub fn extract(&self) -> Result<ReleaseExtract, String> {
+        self.extract_with_warning(true)
+    }
+
+    fn extract_with_warning(&self, human_warning: bool) -> Result<ReleaseExtract, String> {
+        extract_declared(
+            &self.root,
+            &self.base,
+            &self.from,
+            &self.to,
+            &self.tag,
+            self.declared,
+            human_warning,
+        )
+    }
+
+    pub fn plan(&self) -> NotesPlan {
+        self.declared.plan
     }
 }

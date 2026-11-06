@@ -174,6 +174,49 @@ pub fn changelog_format(text: &str) -> Vec<Finding> {
     changelog_format_with_style(text, ChangelogStyle::Parenthesized)
 }
 
+/// 成果項目ごとの任意link。構文だけを解析し、Gitには触れない。
+/// fence内のトップレベル風の行を項目境界にしない。
+pub fn changelog_commit_links(
+    text: &str,
+) -> Vec<(
+    usize,
+    Result<
+        develop_core::changelog_commit_link::CommitLink<'_>,
+        develop_core::changelog_commit_link::MalformedCommitLink,
+    >,
+)> {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let plain: Vec<&str> = lines
+        .iter()
+        .map(|line| line.trim_end_matches(['\r', '\n']))
+        .collect();
+    let fenced = fence_mask(&plain);
+    let mut start = None;
+    let mut offset = 0;
+    let mut links = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let item = !fenced[index] && line.starts_with("- ");
+        let boundary = item || (!fenced[index] && line.starts_with('#'));
+        if boundary && let Some((line_number, byte)) = start.take() {
+            match develop_core::changelog_commit_link::parse(&text[byte..offset]) {
+                Ok(None) => {}
+                result => links.push((line_number, result.map(Option::unwrap))),
+            }
+        }
+        if item {
+            start = Some((index + 1, offset));
+        }
+        offset += line.len();
+    }
+    if let Some((line_number, byte)) = start {
+        match develop_core::changelog_commit_link::parse(&text[byte..]) {
+            Ok(None) => {}
+            result => links.push((line_number, result.map(Option::unwrap))),
+        }
+    }
+    links
+}
+
 pub fn changelog_format_with_style(text: &str, style: ChangelogStyle) -> Vec<Finding> {
     let mut findings = Vec::new();
     let lines = text.split('\n').collect::<Vec<_>>();
@@ -317,6 +360,9 @@ pub fn changelog_format_with_style(text: &str, style: ChangelogStyle) -> Vec<Fin
             ));
         }
     }
+    findings.extend(changelog_commit_links(text).into_iter().filter_map(|(line, link)| {
+        link.err().map(|_| finding(FindingKind::Error, Some(line), "commit link の形式が不正です（成果の先頭行の末尾に同じSHAのHTTPS linkを1本だけ置いてください）"))
+    }));
     findings
 }
 
@@ -492,6 +538,28 @@ pub fn check(input: &Input) -> Vec<RuleFinding> {
                 Some(line) => found.at(line),
                 None => found,
             });
+        }
+        if rule == Rule::Changelog {
+            for (line, link) in changelog_commit_links(text) {
+                let Ok(link) = link else { continue };
+                let linked_repo = format!("{}/{}", link.owner, link.repo);
+                let problem = if !input
+                    .repo
+                    .as_deref()
+                    .is_some_and(|origin| origin.eq_ignore_ascii_case(&linked_repo))
+                {
+                    Some("commit link の宛先が origin の GitHub repo と一致しません".to_owned())
+                } else {
+                    match input.changelog_commits.get(link.sha) {
+                        Some(Ok(_)) => None,
+                        Some(Err(problem)) => Some(problem.clone()),
+                        None => Some("commit link の Git 証拠がありません".to_owned()),
+                    }
+                };
+                if let Some(problem) = problem {
+                    findings.push(RuleFinding::new(Rule::Changelog, path, problem).at(line));
+                }
+            }
         }
         if rule == Rule::Todo {
             for (line, message) in todo_layout(text) {

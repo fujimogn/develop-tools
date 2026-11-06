@@ -226,3 +226,35 @@ fn escaped_fragments_match_html_anchors() {
     )]);
     assert!(found.is_empty(), "{found:?}");
 }
+
+/// commit linkの構文はsnapshotだけで判定し、Git I/Oを必要としない。
+#[test]
+fn commit_link_syntax_is_checked_without_git_and_fenced_examples_are_ignored() {
+    use island_docs::records::{ChangelogStyle, FindingKind, changelog_format_with_style};
+    let document =
+        |body: &str| format!("# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-09\n{body}\n");
+    let link = "[abcdef0](https://github.com/example/small/commit/abcdef0)";
+    for style in [ChangelogStyle::Parenthesized, ChangelogStyle::Compact] {
+        let item = match style {
+            ChangelogStyle::Parenthesized => "- **成果（2026-09-30）**: 要約。",
+            ChangelogStyle::Compact => "- **成果** 2026-09-30 ⏳: 要約。",
+        };
+        for body in [
+            format!("{item} {link} 後置"),
+            format!("{item}\n  {link}"),
+            format!("{item} {link} {link}"),
+        ] {
+            let findings = changelog_format_with_style(&document(&body), style);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.kind == FindingKind::Error && f.message.contains("commit link")),
+                "{findings:?}"
+            );
+        }
+        let body = format!(
+            "{item} {link}\n  詳細。\n\n```text\n- **例** [abcdef0](../commit/abcdef0)\n```\n\n{item} `[abcdef0](../commit/abcdef0)`"
+        );
+        assert!(changelog_format_with_style(&document(&body), style).is_empty());
+    }
+}

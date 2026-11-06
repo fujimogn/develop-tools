@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-11-06
+
+### Added
+
+- Add `run-heavy-check` to the prebuilt archives. It queues heavy checks in FIFO order for the OS account, validates inherited slots for nested checks, and keeps the slot while supervised descendants remain alive.
+- Preserve command arguments, binary standard input and payload output through `run-heavy-check`, with waiting progress on stderr and optional JSON Lines timing events on a dedicated file descriptor.
+- Add `release-notes render --from <tag> --to <full-commit-SHA> --tag <version>` to generate a release body from fixed inputs without creating commits, tags or GitHub Releases. Standard output contains only the body; the final stderr line contains a JSON diagnostic.
+- Record AI release-note fallback reasons in `release-notes-fallback.jsonl` in the common Git directory. Each entry contains only a timestamp, tag and reason code; a warning identifies recording failures.
+- Accept the optional `ci.recordOnlySkip` declaration for repositories that use generated CI to skip heavy jobs for qualifying documentation-only pushes.
+
+- Validate trailing CHANGELOG commit links against fixed Git history, including staged documentation checks.
+- Add verified commit links to AI-generated Release notes from cited input items, and reject invalid links before creating the release commit or tag.
+
+### Fixed
+
+- Select legacy CHANGELOG stamps by release version and remove their metadata before AI summarization. Reject ambiguous legacy stamps before creating a version commit, including stamps carried over from the previous tag.
+- Read fixed release-note inputs from the repository root when invoked from a subdirectory, and use stable diagnostic codes for invalid inputs.
+
+### Notes
+
+- Store the account-wide heavy-check state in `~/.cache/develop-tools/heavy-check`.
+
+- Checks only share the account slot when their entry points invoke `run-heavy-check`. Explicit headless sandbox execution uses an isolated slot, and GitHub Actions runs the payload without the local account lock.
+- Terminal foreground restoration covers normal completion and INT/TERM/HUP exit paths. Coordinated job-control stop/resume handling is not guaranteed.
+
 ## [0.6.8] - 2026-11-05
 
 ### Changed

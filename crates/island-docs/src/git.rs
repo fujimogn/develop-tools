@@ -4,7 +4,7 @@
 //! pre-commit が使う一時 index は `--index-file` で明示されたときだけ `GIT_INDEX_FILE` に入れる
 //! （`bin/check-staged-docs.ts` と同じ扱い）。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -163,7 +163,7 @@ impl Repo {
             .collect())
     }
 
-    fn commit_oid(&self, oid: &str, label: &str) -> Result<String, String> {
+    pub(crate) fn commit_oid(&self, oid: &str, label: &str) -> Result<String, String> {
         if !valid_oid(oid) {
             return Err(format!(
                 "{label} は 40 桁または 64 桁の commit ID にしてください"
@@ -181,6 +181,85 @@ impl Repo {
             &format!("{rev}^{{commit}}"),
         ]))
         .ok()
+    }
+
+    /// 呼出し開始時のHEADを固定する。失敗診断にはremoteやGitのstderrを含めない。
+    pub fn head_oid(&self) -> Result<String, String> {
+        self.resolve_commit("HEAD")
+            .ok_or_else(|| "commit link を検査する HEAD commit がありません".to_owned())
+    }
+
+    /// parserで構文確認したprefixだけを解決し、固定済みbasisへの包含を採取する。
+    /// globalな検査不能とprefixごとの失敗を区別し、credentialを含むstderrは返さない。
+    pub fn commit_link_evidence(
+        &self,
+        prefixes: &BTreeSet<&str>,
+        basis: &str,
+    ) -> Result<BTreeMap<String, Result<String, String>>, String> {
+        if prefixes.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let shallow = output_text(self.git().args(["rev-parse", "--is-shallow-repository"]))
+            .map_err(|_| "commit link の shallow 状態を確認できません".to_owned())?;
+        if shallow != "false" {
+            return Err(
+                "commit link は shallow repository では検査できません（full historyが必要です）"
+                    .to_owned(),
+            );
+        }
+        if basis.len() == 64 {
+            return Err("commit link は SHA-256 repository に未対応です".to_owned());
+        }
+        let basis = self
+            .commit_oid(basis, "基準")
+            .map_err(|_| "commit link の基準 commit を確認できません".to_owned())?;
+        Ok(prefixes
+            .iter()
+            .map(|prefix| {
+                (
+                    (*prefix).to_owned(),
+                    self.commit_link_prefix(prefix, &basis),
+                )
+            })
+            .collect())
+    }
+
+    fn commit_link_prefix(&self, prefix: &str, basis: &str) -> Result<String, String> {
+        let objects = output_text(
+            self.git()
+                .args(["rev-parse", &format!("--disambiguate={prefix}")]),
+        )
+        .map_err(|_| "commit link の object を一意に解決できません".to_owned())?;
+        let mut objects = objects.lines();
+        let oid = objects.next().filter(|oid| valid_oid(oid)).ok_or_else(|| {
+            "commit link の object を一意に解決できません（未取得または不明）".to_owned()
+        })?;
+        if objects.next().is_some() {
+            return Err("commit link の object を一意に解決できません（曖昧なprefix）".to_owned());
+        }
+        let kind = output_text(self.git().args(["cat-file", "-t", oid]))
+            .map_err(|_| "commit link の object 型を確認できません".to_owned())?;
+        if kind != "commit" {
+            return Err("commit link は commit 型の object を指してください".to_owned());
+        }
+        let commit = output_text(self.git().args([
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{oid}^{{commit}}"),
+        ]))
+        .map_err(|_| "commit link の commit を確認できません".to_owned())?;
+        let out = self
+            .git()
+            .args(["merge-base", "--is-ancestor", &commit, basis])
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|_| "commit link の祖先検査を起動できません".to_owned())?;
+        match out.status.code() {
+            Some(0) => Ok(commit),
+            Some(1) => Err("commit link が検査対象 commit の祖先ではありません".to_owned()),
+            _ => Err("commit link の祖先を確認できません".to_owned()),
+        }
     }
 
     /// blob の本文を `oids` と同じ順に返す。1 回の `git cat-file --batch` で読む。

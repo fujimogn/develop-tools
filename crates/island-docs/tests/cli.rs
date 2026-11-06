@@ -1779,3 +1779,281 @@ fn changelog_shape_follows_range_end_manifest_not_index() {
     let out = run(dir.path(), &["--range", &base, &end]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
 }
+
+fn commit_link(sha: &str) -> String {
+    format!("[{sha}](https://github.com/example/small/commit/{sha})")
+}
+
+fn stage_commit_link(dir: &Path, suffix: &str) {
+    write(
+        dir,
+        "CHANGELOG.md",
+        &format!(
+            "# Changelog\n\n> 古い分は git 履歴に任せる。\n\n## 2026-09\n\n- **成果（2026-09-30）**: 要約。 {suffix}\n"
+        ),
+    );
+    git(dir, &["add", "CHANGELOG.md"]);
+}
+
+fn linked_repo() -> tempfile::TempDir {
+    linked_repo_format("sha1")
+}
+
+fn linked_repo_format(format: &str) -> tempfile::TempDir {
+    // このtest群で作ったfixtureだけをTempDirのdropで回収する。
+    let dir = tempfile::Builder::new()
+        .prefix("develop-meta-link-")
+        .tempdir()
+        .unwrap();
+    git(
+        dir.path(),
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            &format!("--object-format={format}"),
+        ],
+    );
+    git(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/small",
+        ],
+    );
+    let scopes =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/scope-fixture.json"))
+            .unwrap();
+    write(dir.path(), "config/island-docs-scopes.json", &scopes);
+    for (path, text) in [
+        ("README.md", "# 入口\n"),
+        ("AGENTS.md", "# agents\n"),
+        ("CLAUDE.md", "# claude\n"),
+        ("CONTEXT.md", "# context\n"),
+        ("docs/README.md", "# docs\n\n[ADR](adr/README.md)\n"),
+        ("docs/adr/README.md", "# ADR\n"),
+        (
+            "TODO.md",
+            "# TODO\n\n## 進行中\n\n- [ ] **項目**。現在地。\n",
+        ),
+    ] {
+        write(dir.path(), path, text);
+    }
+    stage_commit_link(dir.path(), "通常の記録。");
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "base"]);
+    dir
+}
+
+fn assert_link_failure(dir: &Path, args: &[&str], problem: &str) {
+    let out = run(dir, args);
+    assert!(
+        !out.status.success(),
+        "link should fail ({problem}): {}",
+        stderr(&out)
+    );
+    assert!(stderr(&out).contains(problem), "{}", stderr(&out));
+}
+
+#[test]
+fn commit_links_local_staged_then_integration_ci_and_snapshot_boundaries() {
+    let dir = linked_repo();
+    let d = dir.path();
+    let base = head(d);
+    git(d, &["checkout", "-qb", "work"]);
+    // 宣言のintegrationBranchは祖先検査の基準を上書きしない。
+    write(
+        d,
+        ".config/develop-tools.json",
+        r#"{"version":"0.1.0","sha256":{},"integrationBranch":"missing-integration","release":{"versionFiles":[]}}"#,
+    );
+    write(d, "implementation", "implemented");
+    git(d, &["add", "."]);
+    git(d, &["commit", "-qm", "implementation"]);
+    let implementation = head(d);
+    stage_commit_link(d, &commit_link(&implementation[..7]));
+    // 統合先はまだbase。indexだけを読み、working treeの壊れたlinkは見ない。
+    write(d, "CHANGELOG.md", "broken working tree");
+    for mode in ["--staged", "--tracked"] {
+        let out = run(d, &[mode]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    git(d, &["commit", "-qm", "record"]);
+    let record = head(d);
+    git(d, &["restore", "CHANGELOG.md"]);
+    git(d, &["checkout", "-q", "main"]);
+    // rangeは現在のHEAD/indexではなくhead treeとその履歴を見る。
+    let out = run(d, &["--range", &base, &record]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    git(d, &["merge", "--ff-only", "work"]);
+    let out = run(d, &["--tracked"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // HEADに無い対象をindexへ置くとstaged/trackedは拒否する。
+    git(d, &["checkout", "-q", "-b", "other", &base]);
+    stage_commit_link(d, &commit_link(&implementation));
+    for mode in ["--staged", "--tracked"] {
+        assert_link_failure(d, &[mode], "祖先");
+    }
+}
+
+#[test]
+fn commit_links_reject_other_branch_rewritten_history_and_cherry_pick_source() {
+    let dir = linked_repo();
+    let d = dir.path();
+    let base = head(d);
+    git(d, &["checkout", "-qb", "source"]);
+    write(d, "implementation", "implemented");
+    git(d, &["add", "."]);
+    git(d, &["commit", "-qm", "implementation"]);
+    let source = head(d);
+    // 旧Iをsourceで保持し、新しい統合履歴A→Jを作る。実repoのrefは動かさない。
+    git(d, &["checkout", "-q", "main"]);
+    write(d, "other-change", "diverged");
+    git(d, &["add", "."]);
+    git(d, &["commit", "-qm", "new integration history"]);
+    stage_commit_link(d, &commit_link(&source));
+    git(d, &["commit", "-qm", "record removed commit"]);
+    let rewritten = head(d);
+    assert_link_failure(d, &["--tracked"], "祖先");
+
+    assert_link_failure(d, &["--range", &base, &rewritten], "祖先");
+    git(d, &["cherry-pick", &source]);
+    let picked = head(d);
+    assert_ne!(source, picked);
+    assert_link_failure(d, &["--tracked"], "祖先");
+    stage_commit_link(d, &commit_link(&picked));
+    let out = run(d, &["--staged"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // head treeは元OIDのままなので、indexの修正ではrangeを隠せない。
+    assert_link_failure(d, &["--range", &base, &rewritten], "祖先");
+}
+
+#[test]
+fn commit_links_require_origin_identity_and_canonical_syntax() {
+    let dir = linked_repo();
+    let d = dir.path();
+    let oid = head(d);
+    for (suffix, problem) in [
+        (
+            commit_link(&oid).replace("example/small", "other/repo"),
+            "origin",
+        ),
+        (format!("{} 後置", commit_link(&oid)), "形式"),
+        (
+            format!("{} {}", commit_link(&oid), commit_link(&oid)),
+            "形式",
+        ),
+        (format!("[{oid}](../commit/{oid})"), "形式"),
+        (
+            commit_link(&oid).replace(&format!("[{oid}]"), "[abcdef0]"),
+            "形式",
+        ),
+    ] {
+        stage_commit_link(d, &suffix);
+        assert_link_failure(d, &["--staged"], problem);
+    }
+    stage_commit_link(d, &commit_link(&oid));
+    git(d, &["remote", "remove", "origin"]);
+    assert_link_failure(d, &["--tracked"], "origin");
+    // originが無くてもlink無しは従来どおり。
+    stage_commit_link(d, "通常の記録。");
+    let out = run(d, &["--tracked"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+fn write_git_object(dir: &Path, text: &str) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = develop_core::git(dir)
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn commit_links_reject_ambiguous_missing_blob_and_tag_objects() {
+    let dir = linked_repo();
+    let d = dir.path();
+    // SHA-1 blobの既知の7桁衝突。全履歴や大量objectを作らない。
+    let a = write_git_object(d, "changelog-prefix-16584");
+    let b = write_git_object(d, "changelog-prefix-26430");
+    assert_ne!(a, b);
+    assert_eq!(&a[..7], &b[..7]);
+    stage_commit_link(d, &commit_link(&a[..7]));
+    assert_link_failure(d, &["--tracked"], "一意");
+    stage_commit_link(d, &commit_link(&a));
+    assert_link_failure(d, &["--tracked"], "commit 型");
+    git(d, &["tag", "-a", "annotated", "-m", "tag"]);
+    let out = develop_core::git(d)
+        .args(["rev-parse", "refs/tags/annotated"])
+        .output()
+        .unwrap();
+    let tag = String::from_utf8(out.stdout).unwrap();
+    stage_commit_link(d, &commit_link(tag.trim()));
+    assert_link_failure(d, &["--tracked"], "commit 型");
+    stage_commit_link(d, &commit_link("0000000"));
+    assert_link_failure(d, &["--tracked"], "一意");
+}
+
+#[test]
+fn commit_links_fail_closed_in_shallow_and_unborn_but_no_link_still_passes() {
+    let dir = linked_repo();
+    let d = dir.path();
+    let oid = head(d);
+    // fixture自身だけをshallow境界にする。fetchや実remoteへの通信は行わない。
+    write(d, ".git/shallow", &format!("{oid}\n"));
+    stage_commit_link(d, &commit_link(&oid));
+    assert_link_failure(d, &["--tracked"], "shallow");
+    stage_commit_link(d, "通常の記録。");
+    let out = run(d, &["--tracked"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    git(d, &["checkout", "--orphan", "unborn"]);
+    stage_commit_link(d, &commit_link(&oid));
+    assert_link_failure(d, &["--staged"], "HEAD");
+    stage_commit_link(d, "通常の記録。");
+    let out = run(d, &["--staged"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[test]
+fn commit_links_accept_origin_case_and_explicit_index_only() {
+    let dir = linked_repo();
+    let d = dir.path();
+    let oid = head(d);
+    stage_commit_link(
+        d,
+        &commit_link(&oid).replace("example/small", "EXAMPLE/SMALL"),
+    );
+    let index = d.join(".git/link-index");
+    fs::copy(d.join(".git/index"), &index).unwrap();
+    stage_commit_link(d, &commit_link("0000000"));
+    let out = run(d, &["--staged", "--index-file", index.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_link_failure(d, &["--staged"], "一意");
+}
+
+#[test]
+fn commit_links_reject_sha256_repository_only_when_linked() {
+    let dir = linked_repo_format("sha256");
+    let d = dir.path();
+    let oid = head(d);
+    assert_eq!(oid.len(), 64);
+    let out = run(d, &["--tracked"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    stage_commit_link(d, &commit_link(&oid[..7]));
+    assert_link_failure(d, &["--tracked"], "SHA-256");
+}

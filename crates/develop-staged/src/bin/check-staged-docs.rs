@@ -8,7 +8,7 @@ use std::process::Command;
 use develop_core::cli_help::Help;
 use develop_core::{develop_tools_manifest, git};
 use develop_staged::docs_standard::{
-    ChangelogStyle, Finding, FindingKind, inspect_changelog_with_style, inspect_todo,
+    ChangelogStyle, Finding, FindingKind, inspect_changelog_with_git, inspect_todo,
 };
 use develop_staged::staged_adr::resolve_index_file;
 
@@ -65,6 +65,17 @@ fn main() {
         if !paths.changed.contains(path.as_bytes()) || !paths.indexed.contains(path.as_bytes()) {
             continue;
         }
+        // 変更された CHANGELOG だけが Git 証拠を必要とする。本文より先に HEAD を固定する。
+        let evidence = if path == "CHANGELOG.md" {
+            let repo = match island_docs::git::Repo::discover(&repo, index_file.as_deref()) {
+                Ok(repo) => repo,
+                Err(message) => fatal(&message),
+            };
+            let basis = repo.head_oid();
+            Some((repo, basis))
+        } else {
+            None
+        };
         let contents = match read_index_blob(&repo, path, index_file.as_deref()) {
             Ok(contents) => contents,
             Err(message) => fatal(&message),
@@ -76,7 +87,10 @@ fn main() {
                     Ok(style) => style,
                     Err(message) => fatal(&message),
                 };
-                inspect_changelog_with_style(&contents, style)
+                let (repo, basis) = evidence
+                    .as_ref()
+                    .expect("changed CHANGELOG has evidence context");
+                inspect_changelog_with_git(&contents, style, repo, basis)
             }
             _ => unreachable!("DOC_PATHS is exhaustive"),
         };

@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+libc = { workspace = true }
 # managed_block が区画の本文を marker の hash と照合する
 sha2 = { workspace = true }
 serde_json = { workspace = true }

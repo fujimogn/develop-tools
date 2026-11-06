@@ -274,3 +274,35 @@ fn snapshot_declarations_preserve_twelve_eight_and_four_member_archives() {
         );
     }
 }
+
+/// 公開 tree だけで実際の台帳と artifact を照合する。
+#[test]
+fn public_inventory_ships_runner_without_the_example_harness() {
+    let dir = tempfile::tempdir().unwrap();
+    let declared: serde_json::Value =
+        serde_json::from_str(include_str!("../../../config/release-binaries.json")).unwrap();
+    let mut manifest = declared.clone();
+    manifest["includePublic"] = serde_json::json!(false);
+    config(dir.path(), &manifest.to_string());
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    // 登録漏れの場合も build 済みの runner は存在する。
+    std::fs::write(bin.join("run-heavy-check"), "runner").unwrap();
+    std::fs::write(bin.join("heavy-check-harness"), "example only").unwrap();
+    for name in declared["binaries"].as_array().unwrap() {
+        let name = name.as_str().unwrap();
+        std::fs::write(bin.join(name), name).unwrap();
+    }
+    let archive = dir.path().join("archive.tar.gz");
+    create_release_tarball(dir.path(), &bin, &archive).unwrap();
+    let output = std::process::Command::new("tar")
+        .arg("-tzf")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let listing = String::from_utf8(output.stdout).unwrap();
+    assert!(listing.lines().any(|name| name == "run-heavy-check"));
+    assert!(!listing.lines().any(|name| name == "heavy-check-harness"));
+    assert_eq!(listing.lines().count(), 10);
+}

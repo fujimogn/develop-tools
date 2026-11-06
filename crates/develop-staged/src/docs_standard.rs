@@ -1,12 +1,72 @@
 //! 島標準の TODO / CHANGELOG の判定は `island_docs::records` が 1 か所で持つ。ここは pre-commit
 //! （`check-staged-docs`）と `archive-changelog` が使う入口と、CHANGELOG の退避だけを持つ。
 
-use island_docs::markdown::fence_mask;
+use std::collections::{BTreeSet, HashSet};
+
 pub use island_docs::records::{
     ChangelogStyle, Finding, FindingKind, TODO_ITEM_WARNING_BYTES, inspect_changelog,
     inspect_changelog_with_style, inspect_todo,
 };
 use island_docs::records::{changelog_item_date, is_month_heading, parse_month_heading};
+use island_docs::{check::Input, git::Repo, markdown::fence_mask, records};
+
+/// staged 本文を共通の parser / Git 証拠 / records 判定へ渡す。
+/// 既存入口の容量診断と warning はそのまま保ち、共通判定の error は重複させない。
+/// 呼出側は CHANGELOG が変更されたときだけ呼び、snapshot 読取前の HEAD を渡す。
+pub fn inspect_changelog_with_git(
+    content: &[u8],
+    style: ChangelogStyle,
+    repo: &Repo,
+    basis: &Result<String, String>,
+) -> Vec<Finding> {
+    let mut findings = inspect_changelog_with_style(content, style);
+    let Ok(text) = std::str::from_utf8(content) else {
+        return findings;
+    };
+    let prefixes: BTreeSet<&str> = records::changelog_commit_links(text)
+        .into_iter()
+        .filter_map(|(_, link)| link.ok().map(|link| link.sha))
+        .collect();
+    if prefixes.is_empty() {
+        return findings;
+    }
+    let mut input = Input {
+        repo: repo.github_name(),
+        changelog_stamp: style == ChangelogStyle::Compact,
+        ..Input::default()
+    };
+    input
+        .snapshot
+        .add_markdown("CHANGELOG.md", content.to_vec());
+    input.changelog_commits = match basis
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|basis| repo.commit_link_evidence(&prefixes, basis))
+    {
+        Ok(evidence) => evidence,
+        Err(problem) => prefixes
+            .into_iter()
+            .map(|prefix| (prefix.to_owned(), Err(problem.clone())))
+            .collect(),
+    };
+    let mut seen: HashSet<_> = findings
+        .iter()
+        .filter(|finding| finding.kind == FindingKind::Error)
+        .map(|finding| (finding.line, finding.message.clone()))
+        .collect();
+    for found in records::check(&input) {
+        if !seen.insert((found.line, found.message.clone())) {
+            continue;
+        }
+        let finding = Finding {
+            kind: FindingKind::Error,
+            line: found.line,
+            message: found.message,
+        };
+        findings.push(finding);
+    }
+    findings
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangelogArchivePlan {

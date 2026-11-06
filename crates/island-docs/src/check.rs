@@ -37,6 +37,8 @@ pub struct Input {
     pub repo: Option<String>,
     pub snapshot: Snapshot,
     pub changelog_stamp: bool,
+    /// prefixごとの固定基準commitへの包含証拠（full OIDまたは安全な診断）。
+    pub changelog_commits: BTreeMap<String, Result<String, String>>,
     /// 容量上限の対象 path の byte 数。
     pub sizes: BTreeMap<String, usize>,
     /// Markdown 以外で本文を読む file（退役語の registry）。
@@ -134,7 +136,15 @@ pub fn scope_table(repo: &Repo, entries: &[Entry]) -> Result<ScopeTable, String>
 }
 
 /// `repo` の index を読んで検査する。
-pub fn run(repo: &Repo, mode: Mode) -> Result<Outcome, String> {
+pub fn run(repo: &Repo, mut mode: Mode) -> Result<Outcome, String> {
+    // snapshotの読取りより前に固定する。unbornはlink無しなら従来どおり許す。
+    let basis = match &mut mode {
+        Mode::Range { head, .. } => {
+            *head = repo.commit_oid(head, "head")?;
+            Ok(head.clone())
+        }
+        _ => repo.head_oid(),
+    };
     let changed = match &mode {
         Mode::Tracked => None,
         Mode::Staged => Some(repo.staged_changes()?),
@@ -215,6 +225,27 @@ pub fn run(repo: &Repo, mode: Mode) -> Result<Outcome, String> {
                 input.data.insert(entry.path.clone(), bytes);
             }
         }
+    }
+    let prefixes: BTreeSet<&str> = input
+        .snapshot
+        .markdown()
+        .filter(|(path, _)| *path == crate::constants::CHANGELOG_PATH)
+        .filter_map(|(_, text)| text.ok())
+        .flat_map(records::changelog_commit_links)
+        .filter_map(|(_, link)| link.ok().map(|link| link.sha))
+        .collect();
+    if !prefixes.is_empty() {
+        let evidence = basis
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|basis| repo.commit_link_evidence(&prefixes, basis));
+        input.changelog_commits = match evidence {
+            Ok(evidence) => evidence,
+            Err(problem) => prefixes
+                .into_iter()
+                .map(|prefix| (prefix.to_owned(), Err(problem.clone())))
+                .collect(),
+        };
     }
     Ok(evaluate(&input))
 }

@@ -405,3 +405,262 @@ fn checker_uses_manifest_from_explicit_index() {
     );
     assert_eq!(run_checker(repo.path(), &[]).status.code(), Some(0));
 }
+
+fn commit(root: &Path, message: &str) -> String {
+    git_ok(
+        root,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            message,
+        ],
+    );
+    String::from_utf8(git(root, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+fn link_history() -> (tempfile::TempDir, String, String) {
+    let repo = repository();
+    git_ok(repo.path(), &["checkout", "-q", "-b", "work"]);
+    git_ok(
+        repo.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/current.git",
+        ],
+    );
+    fs::create_dir(repo.path().join("config")).unwrap();
+    fs::write(repo.path().join("config/island-docs-scopes.json"), r#"{"version":1,"byteLimits":[{"scope":"all","path":"CHANGELOG.md","maxBytes":120000}],"linkSourceExclusions":[],"hostPathLinkAllowScopes":[],"indexRecordDirs":[{"scope":"all","dirs":["reviews"]}],"indexRequirements":[],"docsLayouts":[]}"#).unwrap();
+    git_ok(repo.path(), &["add", "."]);
+    commit(repo.path(), "base");
+    git_ok(repo.path(), &["checkout", "-q", "-b", "side"]);
+    let side = commit(repo.path(), "side implementation");
+    git_ok(repo.path(), &["checkout", "-q", "work"]);
+    let head = commit(repo.path(), "work implementation");
+    (repo, head, side)
+}
+
+fn linked_changelog(sha: &str) -> String {
+    format!(
+        "{} [{}](https://github.com/example/current/commit/{sha})\n",
+        valid_changelog().trim_end(),
+        sha
+    )
+}
+
+fn stage_changelog(root: &Path, text: &str) {
+    fs::write(root.join("CHANGELOG.md"), text).unwrap();
+    git_ok(root, &["add", "CHANGELOG.md"]);
+}
+
+/// Compare the actual develop-docs-check engine's changelog errors, excluding unrelated rules.
+fn assert_changelog_parity(root: &Path, index: Option<&Path>, expected: i32) {
+    // The engine initializes its process-wide scope table once, just like its CLI.
+    let mut probe = Command::new(std::env::current_exe().unwrap());
+    probe
+        .args([
+            "--ignored",
+            "--exact",
+            "docs_checker_parity_probe",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("STAGED_DOCS_PARITY_ROOT", root);
+    if let Some(index) = index {
+        probe.env("STAGED_DOCS_PARITY_INDEX", index);
+    } else {
+        probe.env_remove("STAGED_DOCS_PARITY_INDEX");
+    }
+    let probe = probe.output().unwrap();
+    assert!(
+        probe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let common: Vec<(Option<usize>, String)> = String::from_utf8_lossy(&probe.stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("parity:"))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let args: Vec<_> = index
+        .map(|p| vec!["--index-file", p.to_str().unwrap()])
+        .unwrap_or_default();
+    let output = run_checker_args(root, &args, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(expected), "{stderr}");
+    assert_eq!(common.is_empty(), expected == 0, "{common:?}");
+    for (line, message) in &common {
+        assert!(
+            stderr.contains(&format!("CHANGELOG.md:{}: {message}", line.unwrap())),
+            "{stderr}"
+        );
+    }
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("error:"))
+            .count(),
+        common.len(),
+        "{stderr}"
+    );
+}
+
+#[test]
+#[ignore = "subprocess probe: each checker invocation owns one scope table"]
+fn docs_checker_parity_probe() {
+    use island_docs::{check, git::Repo, rules::Rule};
+    let root = std::env::var_os("STAGED_DOCS_PARITY_ROOT").expect("probe root");
+    let index = std::env::var_os("STAGED_DOCS_PARITY_INDEX");
+    let repo = Repo::discover(Path::new(&root), index.as_deref().map(Path::new)).unwrap();
+    let outcome = check::run(&repo, check::Mode::Staged).unwrap();
+    for finding in outcome.findings {
+        if let check::Finding::Rule(f) = finding
+            && f.rule == Rule::Changelog
+        {
+            eprintln!(
+                "parity:{}",
+                serde_json::to_string(&(f.line, f.message)).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn commit_links_use_index_and_head_with_common_checker_parity() {
+    let (repo, head, side) = link_history();
+    // The implementation is HEAD; its parent does not contain it.
+    let good = linked_changelog(&head[..8]);
+    let bad = linked_changelog(&side[..8]);
+    stage_changelog(repo.path(), &good);
+    fs::write(repo.path().join("CHANGELOG.md"), &bad).unwrap();
+    assert_changelog_parity(repo.path(), None, 0);
+
+    stage_changelog(repo.path(), &bad);
+    fs::write(repo.path().join("CHANGELOG.md"), &good).unwrap();
+    assert_changelog_parity(repo.path(), None, 1);
+    let output = run_checker(repo.path(), &[]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("祖先ではありません"));
+
+    stage_changelog(repo.path(), &good);
+    let alternate = repo.path().join(".git/link-index");
+    fs::copy(repo.path().join(".git/index"), &alternate).unwrap();
+    fs::write(repo.path().join("CHANGELOG.md"), &bad).unwrap();
+    assert!(
+        git_with_index(repo.path(), &alternate, &["add", "CHANGELOG.md"])
+            .status
+            .success()
+    );
+    fs::write(repo.path().join("CHANGELOG.md"), "broken working tree").unwrap();
+    assert_changelog_parity(repo.path(), None, 0);
+    assert_changelog_parity(repo.path(), Some(&alternate), 1);
+    // An inherited index must not replace either explicitly selected snapshot.
+    let output = run_checker(
+        repo.path(),
+        &[("GIT_INDEX_FILE", alternate.to_str().unwrap())],
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
+#[test]
+fn commit_link_errors_and_optional_links_match_common_checker() {
+    let (repo, head, _) = link_history();
+    for (text, expected) in [
+        (linked_changelog(&head[..7]), 0),
+        (
+            linked_changelog(&head).replace("example/current", "other/repo"),
+            1,
+        ),
+        (linked_changelog("0000000"), 1),
+        (
+            linked_changelog(&head[..8]).replace(&format!("[{}]", &head[..8]), "[abcdef0]"),
+            1,
+        ),
+        (
+            format!(
+                "{} [資料](https://example.invalid/docs)\n",
+                valid_changelog().trim_end()
+            ),
+            0,
+        ),
+        (valid_changelog().to_owned(), 0),
+    ] {
+        stage_changelog(repo.path(), &text);
+        assert_changelog_parity(repo.path(), None, expected);
+    }
+}
+
+#[test]
+fn unchanged_changelog_does_not_block_staged_todo_with_bad_commit_link() {
+    let (repo, _, side) = link_history();
+    stage_changelog(repo.path(), &linked_changelog(&side[..8]));
+    commit(repo.path(), "pre-existing invalid link");
+    fs::write(repo.path().join("TODO.md"), valid_todo()).unwrap();
+    git_ok(repo.path(), &["add", "TODO.md"]);
+    assert_eq!(run_checker(repo.path(), &[]).status.code(), Some(0));
+}
+
+#[test]
+fn commit_link_bytes_still_count_towards_warning_and_limit() {
+    let (repo, head, _) = link_history();
+    for (length, expected) in [(500, 0), (120_000, 1)] {
+        let text = linked_changelog(&head[..8]).replace("要約", &"x".repeat(length));
+        stage_changelog(repo.path(), &text);
+        let output = run_checker(repo.path(), &[]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(expected), "{stderr}");
+        assert!(
+            stderr.contains("warning:") && stderr.contains("500"),
+            "{stderr}"
+        );
+        if expected == 1 {
+            assert!(stderr.contains("120000"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn archive_changelog_preserves_retained_commit_link_suffix_bytes() {
+    let (repo, head, _) = link_history();
+    let retained = format!(
+        "- **残す（2099-12-31）**: 要約 [{}](https://github.com/example/current/commit/{})\n",
+        &head[..8],
+        &head[..8]
+    );
+    let text = format!(
+        "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2099-12\n{retained}\n## 2000-01\n- **古い成果（2000-01-01）**: {}\n",
+        "x".repeat(121_000)
+    );
+    fs::write(repo.path().join("CHANGELOG.md"), text).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_archive-changelog"))
+        .current_dir(repo.path())
+        .arg("--yes")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let archived = fs::read_to_string(repo.path().join("CHANGELOG.md")).unwrap();
+    assert!(archived.ends_with(&format!("{retained}\n")), "{archived}");
+    assert!(!archived.contains("## 2000-01"));
+    // Exercise the protected-month date pruning path as well.
+    let text = format!(
+        "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2099-12\n{retained}- **古い成果（2099-12-01）**: {}\n",
+        "x".repeat(121_000)
+    );
+    let plan =
+        develop_staged::docs_standard::plan_changelog_archive(&text, "2099-12", &head).unwrap();
+    assert_eq!(plan.archived_dates, ["2099-12-01"]);
+    assert!(plan.content.ends_with(&retained));
+}

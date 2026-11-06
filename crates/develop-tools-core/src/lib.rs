@@ -15,9 +15,11 @@ mod github_repo;
 pub use github_repo::github_repo;
 
 pub mod bounded_name;
+pub mod changelog_commit_link;
 pub mod changelog_title;
 pub mod cli_help;
 pub mod develop_tools_manifest;
+pub mod heavy_check;
 pub mod managed_block;
 #[cfg(test)]
 mod managed_block_tests;

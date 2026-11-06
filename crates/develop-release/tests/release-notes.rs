@@ -60,8 +60,12 @@ fn fixture() -> tempfile::TempDir {
 }
 
 fn notes(root: &Path, tag: &str) -> std::process::Output {
+    notes_args(root, &[tag])
+}
+
+fn notes_args(root: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_release-notes"))
-        .arg(tag)
+        .args(args)
         .current_dir(root)
         .output()
         .unwrap()
@@ -538,6 +542,7 @@ fn extract() -> ReleaseExtract {
             "- **三つ目**".to_owned(),
         ],
         section: None,
+        commit_links: vec![None; 3],
         language: NotesLanguage::Ja,
     }
 }
@@ -985,7 +990,7 @@ fn compact_versions_select_only_this_release_and_unreleased_items() {
     );
     assert_eq!(
         extract_changelog_additions(&diff, "v0.2.0"),
-        [current, pending, ordinary, old_style]
+        [current, pending, ordinary]
     );
 }
 
@@ -999,6 +1004,1062 @@ fn scrub_preserves_body_metadata_and_obsolete_parenthesized_stamps() {
         "- **題（2026-11-05、未リリース）**: 本文",
         "- **題（2026-11-05、v0.1.0 で prod 反映）**: 本文",
     ] {
-        assert_eq!(scrub_for_ai(item), item);
+        assert_eq!(scrub_for_ai(item), "- **題**: 本文");
     }
+}
+
+fn fixed_manifest(root: &Path, path: &str, notes: &str) {
+    let file = root.join(path);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, format!(r#"{{"release":{{"notes":{notes}}}}}"#)).unwrap();
+    git(root, &["add", path]);
+}
+
+fn fixed_fixture() -> (tempfile::TempDir, String) {
+    let dir = fixture();
+    let root = dir.path();
+    annotate(root, "v0.1.0");
+    fixed_manifest(
+        root,
+        ".config/develop-tools.json",
+        r#"{"mode":"changelog-additions","language":"en"}"#,
+    );
+    commit(
+        root,
+        "# Changelog\n\n## 2026-09\n- **以前の項目**\n- **固定終点**\n",
+        "end",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    (dir, end)
+}
+
+#[test]
+fn fixed_inputs_keep_both_oids_and_the_endpoint_declaration_after_refs_move() {
+    use develop_release::release_notes::FixedNotes;
+    let (dir, end) = fixed_fixture();
+    let root = dir.path();
+    let fixed = FixedNotes::resolve(root, "v0.1.0", &end, "v0.3.0", None).unwrap();
+    fixed_manifest(
+        root,
+        ".config/develop-tools.json",
+        r#"{"mode":"changelog-section","language":"ja"}"#,
+    );
+    commit(
+        root,
+        "# Changelog\n\n## 0.3.0 (2026-11-06)\n\n- later\n",
+        "later",
+    );
+    let resolved_later = FixedNotes::resolve(root, "v0.1.0", &end, "v0.3.0", None).unwrap();
+    assert_eq!(
+        resolved_later.extract().unwrap().language,
+        NotesLanguage::En
+    );
+    assert_eq!(resolved_later.extract().unwrap().items, ["- **固定終点**"]);
+    git(root, &["tag", "-f", "v0.1.0"]);
+    std::fs::write(
+        root.join(".config/develop-tools.json"),
+        "invalid dirty JSON",
+    )
+    .unwrap();
+    std::fs::write(root.join("CHANGELOG.md"), "dirty").unwrap();
+    let result = fixed.extract().unwrap();
+    assert_eq!(result.previous, "v0.1.0");
+    assert_eq!(result.tag, "v0.3.0");
+    assert_eq!(result.language, NotesLanguage::En);
+    assert_eq!(result.items, ["- **固定終点**"]);
+    // 後続 HEAD と dirty file だけでなく、解決時にも終点の宣言を使う。
+    assert_eq!(
+        FixedNotes::resolve(root, "v0.1.0", &end, "v0.3.0", None).unwrap_err(),
+        "from は to の祖先である必要があります"
+    );
+}
+
+#[test]
+fn fixed_inputs_reject_equal_divergent_and_non_commit_ranges() {
+    use develop_release::release_notes::FixedNotes;
+    let (dir, end) = fixed_fixture();
+    let root = dir.path();
+    git(root, &["tag", "v0.2.0"]);
+    assert!(
+        FixedNotes::resolve(root, "v0.2.0", &end, "v0.3.0", None)
+            .unwrap_err()
+            .contains("同一")
+    );
+    for (from, to, tag) in [
+        ("v0.2.0", end.as_str(), "v0.3.0"),
+        ("v0.1.0", end.as_str(), "v0.1.0"),
+        ("v9.9.9", end.as_str(), "v0.3.0"),
+        ("HEAD", end.as_str(), "v0.3.0"),
+        ("--help", end.as_str(), "v0.3.0"),
+        ("v0.1.0", "HEAD", "v0.3.0"),
+        ("v0.1.0", &end[..12], "v0.3.0"),
+        ("v0.1.0", "--help", "v0.3.0"),
+        ("v0.1.0", end.as_str(), "invalid"),
+    ] {
+        assert!(
+            FixedNotes::resolve(root, from, to, tag, None).is_err(),
+            "{from} {to} {tag}"
+        );
+    }
+    let base = git(root, &["rev-parse", "v0.1.0^{commit}"]);
+    git(root, &["checkout", "--detach", &base]);
+    commit(root, "# Changelog\n\n## 2026-09\n- **別枝**\n", "divergent");
+    git(root, &["tag", "v0.1.1"]);
+    assert!(FixedNotes::resolve(root, "v0.1.1", &end, "v0.3.0", None).is_err());
+    let tree = git(root, &["rev-parse", "HEAD^{tree}"]);
+    assert!(FixedNotes::resolve(root, "v0.1.0", &tree, "v0.3.0", None).is_err());
+}
+
+#[test]
+fn fixed_inputs_locate_manifest_only_in_endpoint_tree() {
+    use develop_release::release_notes::FixedNotes;
+    use develop_tools_core::develop_tools_manifest::{LEGACY_PATH, PATH};
+    for (paths, notes, reason) in [
+        (vec![], r#"{"mode":"changelog-additions"}"#, "release.notes"),
+        (
+            vec![LEGACY_PATH],
+            r#"{"mode":"changelog-additions"}"#,
+            "manifest_legacy",
+        ),
+        (
+            vec![PATH, LEGACY_PATH],
+            r#"{"mode":"changelog-additions"}"#,
+            "manifest_duplicated",
+        ),
+        (vec![PATH], r#"{"mode":"unknown"}"#, "release.notes.mode"),
+    ] {
+        let dir = fixture();
+        let root = dir.path();
+        git(root, &["tag", "v0.1.0"]);
+        for path in paths {
+            fixed_manifest(root, path, notes);
+        }
+        commit(root, "# Changelog\n\n## 2026-09\n- **追加**\n", "end");
+        let end = git(root, &["rev-parse", "HEAD"]);
+        fixed_manifest(root, PATH, r#"{"mode":"changelog-additions"}"#);
+        let error = FixedNotes::resolve(root, "v0.1.0", &end, "v0.2.0", None).unwrap_err();
+        assert!(error.contains(reason), "{error}");
+    }
+}
+
+#[test]
+fn fixed_inputs_read_section_and_ai_fallback_from_endpoint() {
+    use develop_release::release_notes::{FixedNotes, NotesPlan};
+    for notes in [
+        r#"{"mode":"changelog-section","language":"en"}"#,
+        r#"{"mode":"ai","fallback":"changelog-section","audience":"public","language":"en"}"#,
+    ] {
+        let dir = fixture();
+        let root = dir.path();
+        git(root, &["tag", "v0.1.0"]);
+        fixed_manifest(root, ".config/develop-tools.json", notes);
+        commit(
+            root,
+            "# Changelog\n\n## 0.2.0 (2026-11-06)\n\nEndpoint summary.\n\n- Fixed.\n",
+            "end",
+        );
+        let end = git(root, &["rev-parse", "HEAD"]);
+        commit(root, "later", "later");
+        let fixed =
+            FixedNotes::resolve(root, "v0.1.0", &end, "v0.2.0", Some("other/project")).unwrap();
+        assert_eq!(
+            fixed.extract().unwrap().render(),
+            "Compare: [v0.1.0...v0.2.0](https://github.com/other/project/compare/v0.1.0...v0.2.0)\n\nEndpoint summary.\n\n- Fixed.\n"
+        );
+        assert_eq!(
+            matches!(fixed.plan(), NotesPlan::Ai { .. }),
+            notes.contains("audience")
+        );
+    }
+}
+
+#[test]
+fn legacy_tag_cli_keeps_grammar_and_exit_codes_without_reading_declarations() {
+    let (dir, _) = fixed_fixture();
+    let root = dir.path();
+    annotate(root, "v0.2.0");
+    std::fs::write(root.join(".config/develop-tools.json"), "invalid JSON").unwrap();
+    let expected = notes(root, "v0.2.0");
+    assert_eq!(expected.status.code(), Some(0));
+    for args in [
+        vec!["v0.2.0", "--repo", "example/project"],
+        vec!["--repo", "example/project", "v0.2.0"],
+    ] {
+        let output = notes_args(root, &args);
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, expected.stdout);
+    }
+    for args in [
+        vec![],
+        vec!["--repo"],
+        vec!["--unknown"],
+        vec!["v0.2.0", "extra"],
+        vec!["v0.2.0", "--repo", "bad"],
+        vec!["v9.9.9"],
+        vec!["render"],
+    ] {
+        let output = notes_args(root, &args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+    assert_eq!(notes_args(root, &["--help"]).status.code(), Some(0));
+}
+
+#[test]
+fn fixed_inputs_accept_full_sha256_commit_oids() {
+    use develop_release::release_notes::FixedNotes;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q", "--object-format=sha256"]);
+    commit(root, "# Changelog\n\n## 2026-11\n- **以前**\n", "initial");
+    annotate(root, "v0.1.0");
+    fixed_manifest(
+        root,
+        ".config/develop-tools.json",
+        r#"{"mode":"changelog-additions"}"#,
+    );
+    commit(
+        root,
+        "# Changelog\n\n## 2026-11\n- **以前**\n- **追加**\n",
+        "end",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    assert_eq!(end.len(), 64);
+    let fixed =
+        FixedNotes::resolve(root, "v0.1.0", &end, "v0.2.0", Some("example/project")).unwrap();
+    assert_eq!(fixed.extract().unwrap().items, ["- **追加**"]);
+    assert!(
+        FixedNotes::resolve(
+            root,
+            "v0.1.0",
+            &end[..40],
+            "v0.2.0",
+            Some("example/project")
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn fixed_inputs_use_repo_root_from_subdirectories_even_with_decoy_files() {
+    use develop_release::release_notes::FixedNotes;
+    for with_decoy in [false, true] {
+        let (dir, mut end) = fixed_fixture();
+        let root = dir.path();
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        if with_decoy {
+            fixed_manifest(
+                root,
+                "sub/.config/develop-tools.json",
+                r#"{"mode":"changelog-section","language":"ja"}"#,
+            );
+            std::fs::write(sub.join("CHANGELOG.md"), "decoy").unwrap();
+            git(root, &["add", "sub/CHANGELOG.md"]);
+            commit(
+                root,
+                "# Changelog\n\n## 2026-09\n- **以前の項目**\n- **固定終点**\n",
+                "decoys",
+            );
+            end = git(root, &["rev-parse", "HEAD"]);
+        }
+        let fixed = FixedNotes::resolve(&sub, "v0.1.0", &end, "v0.2.0", None).unwrap();
+        let extract = fixed.extract().unwrap();
+        assert_eq!(extract.language, NotesLanguage::En);
+        assert_eq!(extract.items, ["- **固定終点**"]);
+    }
+}
+
+#[test]
+fn legacy_stamp_fixture_selects_items_without_writing_changelog() {
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["tag", "v0.1.0"]);
+    let current = "- **今回（2026-11-05、v0.2.0 で prod 反映）**: 本文";
+    let pending = "- **予定（未リリース）**: 本文";
+    let dated = "- **日付付き（2026-11-05、未リリース）**: 本文";
+    let ordinary = "- **印なし**: 本文の（2026-11-05、v0.1.0 で prod 反映）は残す";
+    let middle = "- **説明（未リリース）の続き**: 本文";
+    let changelog = format!(
+        "# Changelog\n\n## 2026-11\n{current}\n{pending}\n{dated}\n{ordinary}\n{middle}\n- **旧版（2026-11-05、v0.1.0 で prod 反映）**: 除く\n  - **入れ子（未リリース）** 2026-11-05/v0.1.0: 説明\n```md\n- **fence（未リリース）** 2026-11-05/v0.1.0: 例\n```\n\n## 2026-09\n- **以前の項目**\n"
+    );
+    commit(root, &changelog, "legacy fixture");
+    let before = std::fs::read(root.join("CHANGELOG.md")).unwrap();
+    let head = git(root, &["rev-parse", "HEAD"]);
+    let result = extract_release(root, &head, "v0.2.0", None).unwrap();
+    assert_eq!(result.items, [current, pending, dated, ordinary, middle]);
+    assert_eq!(std::fs::read(root.join("CHANGELOG.md")).unwrap(), before);
+    assert_eq!(scrub_for_ai(current), "- **今回**: 本文");
+    assert_eq!(scrub_for_ai(pending), "- **予定**: 本文");
+    assert_eq!(scrub_for_ai(dated), "- **日付付き**: 本文");
+    assert_eq!(scrub_for_ai(ordinary), ordinary);
+    assert_eq!(scrub_for_ai(middle), middle);
+    let nested = "  - **入れ子（未リリース）**: 本文";
+    // scrub の既存の空白正規化だけを許す。
+    assert_eq!(scrub_for_ai(nested), nested.trim_start());
+}
+
+#[test]
+fn legacy_and_compact_stamps_are_an_extraction_error() {
+    for stamp in ["2026-11-05 ⏳", "2026-11-05/v0.2.0", "2026-11-05/v0.1.0"] {
+        let dir = fixture();
+        let root = dir.path();
+        git(root, &["tag", "v0.1.0"]);
+        commit(
+            root,
+            &format!(
+                "# Changelog\n\n## 2026-11\n- **曖昧（未リリース）** {stamp}: 本文\n\n## 2026-09\n- **以前の項目**\n"
+            ),
+            "ambiguous fixture",
+        );
+        let before = std::fs::read(root.join("CHANGELOG.md")).unwrap();
+        let head = git(root, &["rev-parse", "HEAD"]);
+        assert!(
+            extract_release(root, &head, "v0.2.0", None)
+                .unwrap_err()
+                .contains("changelog_stamp_ambiguous")
+        );
+        git(root, &["tag", "v0.2.0"]);
+        let output = notes(root, "v0.2.0");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(std::fs::read(root.join("CHANGELOG.md")).unwrap(), before);
+    }
+}
+
+#[test]
+fn release_rejects_ambiguous_stamps_before_writing_version_commit() {
+    assert_release_rejects_ambiguous_stamps(false);
+}
+
+#[test]
+fn release_rejects_pending_ambiguous_stamps_already_present_in_previous_tag() {
+    assert_release_rejects_ambiguous_stamps(true);
+}
+
+fn assert_release_rejects_ambiguous_stamps(present_in_previous_tag: bool) {
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["branch", "-M", "main"]);
+    git(root, &["config", "user.name", "Test"]);
+    git(root, &["config", "user.email", "test@example.com"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    git(root, &["config", "tag.gpgSign", "false"]);
+    if present_in_previous_tag {
+        commit(
+            root,
+            "# Changelog\n\n## 2026-11\n- **曖昧（未リリース）** 2026-11-05 ⏳: 本文\n\n## 2026-09\n- **以前の項目**\n",
+            "pending stamp before previous tag",
+        );
+    }
+    git(root, &["tag", "v0.1.0"]);
+    git(root, &["checkout", "-b", "develop"]);
+    std::fs::create_dir(root.join(".config")).unwrap();
+    std::fs::write(
+        root.join(".config/develop-tools.json"),
+        r#"{
+        "integrationBranch":"develop",
+        "release":{
+            "versionFiles":[{"path":"package.json","kind":"package-json"}],
+            "changelogStamp":true,
+            "notes":{"mode":"changelog-additions"}
+        }
+    }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("package.json"), "{\"version\":\"0.1.0\"}\n").unwrap();
+    git(root, &["add", ".config/develop-tools.json", "package.json"]);
+    commit(
+        root,
+        "# Changelog\n\n## 2026-11\n- **曖昧（未リリース）** 2026-11-05 ⏳: 本文\n\n## 2026-09\n- **以前の項目**\n",
+        "ambiguous release input",
+    );
+    let before_head = git(root, &["rev-parse", "HEAD"]);
+    let before_main = git(root, &["rev-parse", "main"]);
+    let before_changelog = std::fs::read(root.join("CHANGELOG.md")).unwrap();
+    let before_package = std::fs::read(root.join("package.json")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_release"))
+        .args(["patch", "--no-ai"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("changelog_stamp_ambiguous"));
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), before_head);
+    assert_eq!(git(root, &["rev-parse", "main"]), before_main);
+    assert_eq!(
+        std::fs::read(root.join("CHANGELOG.md")).unwrap(),
+        before_changelog
+    );
+    assert_eq!(
+        std::fs::read(root.join("package.json")).unwrap(),
+        before_package
+    );
+    assert!(git(root, &["tag", "--list", "v0.1.1"]).is_empty());
+    assert!(git(root, &["status", "--porcelain"]).is_empty());
+}
+
+fn render_args(end: &str) -> Vec<&str> {
+    vec!["render", "--from", "v0.1.0", "--to", end, "--tag", "v0.3.0"]
+}
+
+fn diagnostic(output: &std::process::Output) -> serde_json::Value {
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    serde_json::from_str(stderr.lines().last().expect("終端 JSON")).unwrap()
+}
+
+fn snapshot(root: &Path) -> (String, String, Vec<u8>, Vec<u8>, Vec<u8>) {
+    (
+        git(root, &["show-ref"]),
+        git(root, &["rev-parse", "HEAD"]),
+        std::fs::read(root.join(".git/index")).unwrap(),
+        std::fs::read(root.join("CHANGELOG.md")).unwrap(),
+        std::fs::read(root.join("package.json")).unwrap(),
+    )
+}
+
+#[test]
+fn render_reads_fixed_commit_in_detached_dirty_tree_without_mutation() {
+    let (dir, end) = fixed_fixture();
+    let root = dir.path();
+    git(root, &["checkout", "--detach"]);
+    std::fs::write(root.join("CHANGELOG.md"), "secret dirty body").unwrap();
+    std::fs::write(root.join("package.json"), "dirty version file").unwrap();
+    std::fs::write(
+        root.join(".config/develop-tools.json"),
+        "invalid dirty JSON",
+    )
+    .unwrap();
+    git(root, &["add", "package.json"]);
+    let before = snapshot(root);
+    let output = notes_args(root, &render_args(&end));
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout.clone()).unwrap(),
+        "Compare: [v0.1.0...v0.3.0](https://github.com/example/project/compare/v0.1.0...v0.3.0)\n\n- **固定終点**\n"
+    );
+    assert_eq!(
+        diagnostic(&output),
+        serde_json::json!({"source":"changelog","reason_code":null})
+    );
+    assert_eq!(snapshot(root), before);
+    let mut bad = render_args("HEAD");
+    bad.extend(["--repo", "secret-invalid-repo"]);
+    let output = notes_args(root, &bad);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(diagnostic(&output)["source"], "error");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("secret"));
+    assert_eq!(snapshot(root), before);
+}
+
+#[test]
+fn render_rejects_duplicate_unknown_missing_and_positional_options() {
+    let (dir, end) = fixed_fixture();
+    for extra in [
+        vec!["--from", "v0.1.0"],
+        vec!["--to", &end],
+        vec!["--tag", "v0.4.0"],
+        vec!["--repo", "a/b", "--repo", "a/b"],
+        vec!["--no-ai", "--no-ai"],
+        vec!["--unknown"],
+        vec!["extra"],
+        vec!["--repo"],
+        vec!["--repo", "--no-ai"],
+    ] {
+        let mut args = render_args(&end);
+        args.extend(extra);
+        let output = notes_args(dir.path(), &args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            diagnostic(&output),
+            serde_json::json!({"source":"error","reason_code":"arguments_invalid"})
+        );
+    }
+    for args in [
+        vec!["render"],
+        vec!["render", "--from"],
+        vec!["render", "--to", "--tag", "v0.3.0"],
+    ] {
+        let output = notes_args(dir.path(), &args);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(diagnostic(&output)["reason_code"], "arguments_invalid");
+    }
+}
+
+#[test]
+fn render_reports_fallback_and_no_ai_without_exposing_body_in_stderr() {
+    let (dir, _) = fixed_fixture();
+    let root = dir.path();
+    fixed_manifest(
+        root,
+        ".config/develop-tools.json",
+        r#"{"mode":"ai","fallback":"changelog-additions","audience":"private"}"#,
+    );
+    commit(
+        root,
+        "# Changelog\n\n## 2026-09\n- **以前の項目**\n- **固定終点**\n",
+        "ai declaration",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    let home = tempfile::tempdir().unwrap();
+    for no_ai in [false, true] {
+        let mut args = render_args(&end);
+        if no_ai {
+            args.push("--no-ai");
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_release-notes"))
+            .args(args)
+            .current_dir(root)
+            .env("HOME", home.path())
+            .env_remove("OP_SERVICE_ACCOUNT_TOKEN")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("固定終点"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("固定終点"));
+        assert_eq!(
+            diagnostic(&output),
+            if no_ai {
+                serde_json::json!({"source":"no_ai","reason_code":null})
+            } else {
+                serde_json::json!({"source":"fallback","reason_code":"key_missing"})
+            }
+        );
+    }
+}
+
+#[test]
+fn render_redacts_edited_items_and_structural_errors() {
+    let (dir, _) = fixed_fixture();
+    let root = dir.path();
+    commit(
+        root,
+        "# Changelog\n\n## 2026-09\n- **secret edited body**\n",
+        "edit",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    let output = notes_args(root, &render_args(&end));
+    assert_eq!(output.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("secret"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("edited_items_excluded"));
+    assert_eq!(diagnostic(&output)["source"], "changelog");
+    commit(
+        root,
+        "# Changelog\n\n## 2026-09\n- **以前の項目**\n- **secret（未リリース）** 2026-11-05 ⏳: 本文\n",
+        "ambiguous",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    let output = notes_args(root, &render_args(&end));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        diagnostic(&output)["reason_code"],
+        "changelog_stamp_ambiguous"
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("secret"));
+}
+
+#[test]
+fn render_does_not_take_a_structural_reason_code_from_an_input_value() {
+    let (dir, end) = fixed_fixture();
+    for repo in ["manifest_legacy", "manifest_duplicated", "section_missing"] {
+        let mut args = render_args(&end);
+        args.extend(["--repo", repo]);
+        let output = notes_args(dir.path(), &args);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(diagnostic(&output)["reason_code"], "fixed_input_invalid");
+    }
+}
+
+#[test]
+fn render_section_keeps_structural_codes_and_explicit_repo() {
+    let (dir, _) = fixed_fixture();
+    let root = dir.path();
+    fixed_manifest(
+        root,
+        ".config/develop-tools.json",
+        r#"{"mode":"changelog-section","language":"en"}"#,
+    );
+    commit(root, "# Changelog\n", "missing section");
+    let end = git(root, &["rev-parse", "HEAD"]);
+    let output = notes_args(root, &render_args(&end));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(diagnostic(&output)["reason_code"], "section_missing");
+
+    commit(
+        root,
+        "# Changelog\n\n## 0.3.0 (2026-11-06)\n\nFixed section.\n",
+        "section",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    let mut args = render_args(&end);
+    args.extend(["--repo", "other/project"]);
+    let output = notes_args(root, &args);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout.clone()).unwrap(),
+        "Compare: [v0.1.0...v0.3.0](https://github.com/other/project/compare/v0.1.0...v0.3.0)\n\nFixed section.\n"
+    );
+    assert_eq!(diagnostic(&output)["source"], "changelog");
+}
+
+#[test]
+fn help_publishes_both_entry_points_and_render_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = notes_args(dir.path(), &["--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let help = String::from_utf8(output.stdout).unwrap();
+    for contract in [
+        "release-notes <vX.Y.Z> [--repo owner/name]",
+        "release-notes render --from <vX.Y.Z> --to <full-commit-SHA> --tag <vA.B.C> [--repo owner/name] [--no-ai]",
+        "stderr の最後の 1 行が JSON",
+        "API の最大 1 回の送信、usage 台帳と fallback JSONL への追記だけ",
+        "版 file・CHANGELOG・index・commit・branch・tag・remote・GitHub Release・prod は変更しません",
+        "AI 成功では常に dictionary_missing boolean（private 辞書欠落時 true、それ以外 false）",
+        "help は release-notes --help で表示（render --help は文法エラー）",
+        "source=ai/changelog/no_ai/fallback",
+        "source=error",
+        "旧刻印の他版項目を除外",
+    ] {
+        assert!(help.contains(contract), "help に公開契約がない: {contract}");
+    }
+    let output = notes_args(dir.path(), &["render", "--help"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        diagnostic(&output),
+        serde_json::json!({"source":"error","reason_code":"arguments_invalid"})
+    );
+}
+
+#[test]
+fn render_contract_accepts_reordered_options_and_rejects_missing_required_options() {
+    let (dir, end) = fixed_fixture();
+    let output = notes_args(
+        dir.path(),
+        &[
+            "render",
+            "--no-ai",
+            "--tag",
+            "v0.3.0",
+            "--repo",
+            "example/project",
+            "--to",
+            &end,
+            "--from",
+            "v0.1.0",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        diagnostic(&output),
+        serde_json::json!({"source":"changelog","reason_code":null})
+    );
+    let body = std::str::from_utf8(&output.stdout).unwrap();
+    assert!(body.ends_with('\n'));
+    assert!(body.contains("https://github.com/example/project/compare/v0.1.0...v0.3.0"));
+    for missing in ["--from", "--to", "--tag"] {
+        let args = render_args(&end);
+        let mut reduced = vec!["render"];
+        for pair in args[1..].chunks_exact(2) {
+            if pair[0] != missing {
+                reduced.extend_from_slice(pair);
+            }
+        }
+        let output = notes_args(dir.path(), &reduced);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            diagnostic(&output),
+            serde_json::json!({"source":"error","reason_code":"arguments_invalid"})
+        );
+    }
+}
+
+fn commit_link(sha: &str) -> String {
+    format!("[{sha}](https://github.com/example/project/commit/{sha})")
+}
+
+fn linked_extract() -> (tempfile::TempDir, ReleaseExtract, Vec<String>) {
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["tag", "v0.1.0"]);
+    let first = git(root, &["rev-parse", "HEAD"]);
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "implementation",
+        ],
+    );
+    let second = git(root, &["rev-parse", "HEAD"]);
+    let links = vec![
+        commit_link(&first[..7]),
+        commit_link(&second[..8]),
+        commit_link(&first[..12]),
+    ];
+    commit(
+        root,
+        &format!(
+            "# Changelog\n\n## 2026-09\n- **以前の項目**\n- **一つ目** {}\n- **linkなし**\n- **三つ目** {}\n- **同じcommit** {}\n- **未参照** {}\n",
+            links[0],
+            links[1],
+            links[2],
+            commit_link(&second)
+        ),
+        "record",
+    );
+    let extracted = extract_release(root, "HEAD", "v0.2.0", None).unwrap();
+    (dir, extracted, links)
+}
+
+#[test]
+fn commit_links_follow_checked_sources_and_deduplicate_full_oids() {
+    let (_dir, extract, links) = linked_extract();
+    let value = output(
+        "改善しました。",
+        &[
+            ("結合", &[4, 3, 1, 1, 2]),
+            ("再参照", &[4]),
+            ("linkなし", &[2]),
+        ],
+    );
+    let notes = check_output(&value, 5, &Checks::default()).unwrap();
+    let rendered = notes.render(&extract);
+    assert!(
+        rendered.contains(&format!("- 結合 {} {}\n", links[0], links[1])),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("- 再参照 {}\n", links[0])),
+        "{rendered}"
+    );
+    assert!(rendered.contains("- linkなし\n"));
+    assert!(!rendered.contains(&links[2]));
+    assert_eq!(rendered.lines().next(), Some("改善しました。"));
+    assert!(rendered.contains("その他の変更は"));
+    let last = extract.items[4]
+        .split_once("](")
+        .unwrap()
+        .0
+        .rsplit('[')
+        .next()
+        .unwrap();
+    assert!(!rendered.contains(&commit_link(last)));
+}
+
+#[test]
+fn commit_link_suffix_is_removed_before_scrubbing_without_losing_numbers() {
+    for sha in [
+        "1234567",
+        "abcdefa",
+        "1234567890123456789012345678901234567890",
+        "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+    ] {
+        assert_eq!(
+            scrub_for_ai(&format!("- **成果** {}\n  継続", commit_link(sha))),
+            "- **成果**\n 継続"
+        );
+        assert_eq!(scrub_for_ai(&format!("- {}", commit_link(sha))), "-");
+    }
+    assert_eq!(
+        numbered_ai_input(&[String::new(), "本文".to_owned()]),
+        "[1] \n[2] 本文\n"
+    );
+}
+
+#[test]
+fn commit_links_require_origin_even_with_repo_override_only_when_present() {
+    let (dir, extract, _) = linked_extract();
+    let root = dir.path();
+    git(root, &["remote", "remove", "origin"]);
+    let error = extract_release(root, "HEAD", "v0.2.0", Some("example/project")).unwrap_err();
+    assert!(error.contains("commit_link"), "{error}");
+    commit(
+        root,
+        "# Changelog\n\n## 2026-09\n- **以前の項目**\n- **linkなし**\n",
+        "without links",
+    );
+    assert!(extract_release(root, "HEAD", "v0.2.0", Some(&extract.repo)).is_ok());
+}
+
+#[test]
+fn commit_links_outside_fixed_endpoint_are_extraction_errors() {
+    use develop_release::release_notes::FixedNotes;
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["tag", "v0.1.0"]);
+    let base = git(root, &["rev-parse", "HEAD"]);
+    commit(root, "other branch", "outside");
+    let outside = git(root, &["rev-parse", "HEAD"]);
+    git(root, &["checkout", "--detach", &base]);
+    fixed_manifest(
+        root,
+        ".config/develop-tools.json",
+        r#"{"mode":"ai","fallback":"changelog-additions","audience":"private"}"#,
+    );
+    commit(
+        root,
+        &format!(
+            "# Changelog\n\n## 2026-09\n- **以前の項目**\n- **範囲外** {}\n",
+            commit_link(&outside[..7])
+        ),
+        "endpoint",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "merge",
+            "--no-edit",
+            "-s",
+            "ours",
+            &outside,
+        ],
+    );
+    let fixed = FixedNotes::resolve(root, "v0.1.0", &end, "v0.2.0", None).unwrap();
+    let error = fixed.extract().unwrap_err();
+    assert!(error.contains("commit_link"), "{error}");
+}
+
+struct LinkTransport {
+    value: serde_json::Value,
+    input: std::cell::RefCell<Option<serde_json::Value>>,
+}
+
+impl island_llm::transport::Transport for LinkTransport {
+    fn send(
+        &self,
+        request: &island_llm::transport::ApiRequest<'_>,
+    ) -> Result<island_llm::transport::ApiResponse, island_llm::transport::TransportError> {
+        *self.input.borrow_mut() = Some(request.body.clone());
+        Ok(island_llm::transport::ApiResponse {
+            status: 200,
+            request_id: Some("fixture".to_owned()),
+            body: serde_json::json!({"content": [{"type": "text", "text": self.value.to_string()}], "usage": {"input_tokens": 10, "output_tokens": 3}}).to_string(),
+        })
+    }
+}
+
+#[test]
+fn commit_links_survive_modes_and_mock_ai_without_entering_ai_input() {
+    use develop_release::release_notes::{
+        AiRuntime, BodySource, DeclaredNotes, NotesPlan, release_body,
+    };
+    use develop_tools_core::develop_tools_manifest::NotesSource;
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, additions, links) = linked_extract();
+    let root = dir.path();
+    let env = tempfile::tempdir().unwrap();
+    let settings = env.path().join("settings.json");
+    std::fs::write(&settings, serde_json::json!({"anthropic_api_key_ref": "op://test/key/value", "forbidden_terms": [], "internal_names": [], "usage_ledger": env.path().join("usage.jsonl")}).to_string()).unwrap();
+    let op = env.path().join("fake-op");
+    std::fs::write(&op, "#!/bin/sh\nprintf 'test-api-key'\n").unwrap();
+    std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plan = NotesPlan::Ai {
+        audience: Audience::Private,
+    };
+    let transport = LinkTransport {
+        value: output("改善しました。", &[("結合", &[3, 1, 2])]),
+        input: Default::default(),
+    };
+    let runtime = AiRuntime {
+        home: env.path().join("home"),
+        op_program: op,
+        op_service_account_token: Some("fixture".to_owned()),
+        transport: &transport,
+    };
+    commit(
+        root,
+        &format!(
+            "# Changelog\n\n## 0.2.0 (2026-11-06)\n\nSummary.\n\n- **一つ目** {}\n- **linkなし**\n- **三つ目** {}\n",
+            links[0], links[1]
+        ),
+        "section",
+    );
+    let section = prepare_notes(
+        root,
+        DeclaredNotes {
+            plan,
+            source: NotesSource::ChangelogSection,
+            language: NotesLanguage::Ja,
+        },
+        "v0.2.0",
+    )
+    .unwrap()
+    .extract(root, "HEAD")
+    .unwrap();
+    for extract in [additions, section] {
+        for (mode, no_ai, path, expected) in [
+            (
+                NotesPlan::Changelog,
+                false,
+                settings.clone(),
+                BodySource::Changelog,
+            ),
+            (plan, true, settings.clone(), BodySource::NoAi),
+            (
+                plan,
+                false,
+                env.path().join("missing"),
+                BodySource::Fallback("settings_missing".to_owned()),
+            ),
+        ] {
+            let body = release_body(&extract, mode, no_ai, &path, &runtime);
+            assert_eq!(body.text, extract.render());
+            assert!(body.text.contains(&links[0]));
+            // fallback の code は既存の設定 reader の契約に委ねる。
+            if matches!(expected, BodySource::Fallback(_)) {
+                assert!(matches!(body.source, BodySource::Fallback(_)));
+            } else {
+                assert_eq!(body.source, expected);
+            }
+        }
+        let body = release_body(&extract, plan, false, &settings, &runtime);
+        assert!(
+            matches!(body.source, BodySource::Ai { .. }),
+            "{:?}",
+            body.source
+        );
+        assert!(
+            body.text
+                .contains(&format!("- 結合 {} {}\n", links[0], links[1])),
+            "{}",
+            body.text
+        );
+        let input = transport.input.borrow();
+        let input = input.as_ref().unwrap()["messages"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            input.contains("[1] - **一つ目**\n[2] - **linkなし**\n[3] - **三つ目**\n"),
+            "{input}"
+        );
+        for link in &links {
+            let sha = link.split(']').next().unwrap().trim_start_matches('[');
+            assert!(!input.contains(sha), "{input}");
+        }
+        assert!(!input.contains("https://"));
+    }
+    let malicious = LinkTransport {
+        value: output(
+            "改善",
+            &[("https://github.com/example/project/commit/abcdefa", &[1])],
+        ),
+        input: Default::default(),
+    };
+    let runtime = AiRuntime {
+        transport: &malicious,
+        ..runtime
+    };
+    let (_dir, extract, _) = linked_extract();
+    let body = release_body(&extract, plan, false, &settings, &runtime);
+    assert_eq!(
+        body.source,
+        BodySource::Fallback("output_rejected:items.0.text.url".to_owned())
+    );
+    assert_eq!(body.text, extract.render());
+}
+
+#[test]
+fn commit_links_in_sections_are_checked_before_writing_a_version_commit() {
+    use develop_release::release_notes::{DeclaredNotes, NotesPlan};
+    use develop_tools_core::develop_tools_manifest::NotesSource;
+    for first_release in [true, false] {
+        let dir = fixture();
+        let root = dir.path();
+        if !first_release {
+            git(root, &["tag", "v0.1.0"]);
+        }
+        let oid = git(root, &["rev-parse", "HEAD"]);
+        let link = commit_link(&oid[..7]).replace("example/project", "other/project");
+        commit(
+            root,
+            &format!("# Changelog\n\n## 0.2.0 (2026-11-06)\n\n- **成果** {link}\n"),
+            "section",
+        );
+        let before = git(root, &["rev-parse", "HEAD"]);
+        let error = prepare_notes(
+            root,
+            DeclaredNotes {
+                plan: NotesPlan::Changelog,
+                source: NotesSource::ChangelogSection,
+                language: NotesLanguage::Ja,
+            },
+            "v0.2.0",
+        )
+        .unwrap_err();
+        assert!(error.contains("commit_link"), "{error}");
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), before);
+        assert_eq!(git(root, &["status", "--porcelain"]), "");
+    }
+}
+
+#[test]
+fn commit_links_match_origin_repository_ignoring_ascii_case() {
+    let (dir, expected, links) = linked_extract();
+    git(
+        dir.path(),
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:Example/PROJECT.git",
+        ],
+    );
+    let extract = extract_release(dir.path(), "HEAD", "v0.2.0", None).unwrap();
+    assert_eq!(extract.items, expected.items);
+    let notes = check_output(
+        &output("改善", &[("成果", &[1])]),
+        extract.items.len(),
+        &Checks::default(),
+    )
+    .unwrap();
+    assert!(notes.render(&extract).contains(&links[0]));
+}
+
+#[test]
+fn commit_links_reject_sha256_repositories_without_rejecting_old_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q", "--object-format=sha256"]);
+    git(
+        root,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:example/project.git",
+        ],
+    );
+    commit(root, "# Changelog\n\n## 2026-11\n- **以前**\n", "initial");
+    git(root, &["tag", "v0.1.0"]);
+    let oid = git(root, &["rev-parse", "HEAD"]);
+    commit(
+        root,
+        &format!(
+            "# Changelog\n\n## 2026-11\n- **以前**\n- **成果** {}\n",
+            commit_link(&oid[..7])
+        ),
+        "record",
+    );
+    let error = extract_release(root, "HEAD", "v0.2.0", None).unwrap_err();
+    assert!(error.contains("commit_link"), "{error}");
 }

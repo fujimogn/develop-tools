@@ -24,7 +24,10 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version-file: .bun-version
-      - run: cargo test --locked
+      # I1〜I6 の runtime 契約は test 専用 example を使い、Release の bin 一覧には含めない。
+      - run: cargo build --locked -p develop-tools-core --example heavy-check-harness
+      - name: Run tests including heavy-check runtime contracts
+        run: HEAVY_CHECK_TEST_HARNESS="$PWD/target/debug/examples/heavy-check-harness" cargo test --locked
       - name: Release の一覧を workspace の binary target と照合
         run: |
           set -euo pipefail

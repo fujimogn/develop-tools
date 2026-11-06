@@ -256,7 +256,13 @@ impl AiNotes {
         let items: String = self
             .items
             .iter()
-            .map(|item| format!("- {}\n", item.text))
+            .map(|item| {
+                format!(
+                    "- {}{}\n",
+                    item.text,
+                    extract.links_for_sources(&item.sources)
+                )
+            })
             .collect();
         let tail = if self.unreferenced.is_empty() {
             extract.compare_line()

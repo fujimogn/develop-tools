@@ -5,14 +5,8 @@
 use develop_release::release_notes::{self, ReleaseBody};
 use develop_release::{Bump, next_version, version_files::VersionFiles};
 use develop_tools_core::{RELEASE_BRANCH, cli_help::Help, release_integration_branch};
-use island_llm::transport::HttpTransport;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
-
-/// 推論の待ち時間の上限。超えたら `api_timeout` で fallback の本文にする。
-const API_TIMEOUT: Duration = Duration::from_secs(60);
-const API_BASE_URL: &str = "https://api.anthropic.com";
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = Command::new("git");
@@ -51,7 +45,7 @@ fn run() -> Result<(), String> {
                 "release <patch | minor | major | x.y.z> [--no-ai]",
                 "Advance declared version files on the integration branch, fast-forward main, then create a local tag. It does not push. Publish with release push. When .develop-tools.json declares platforms, the latest release check run on HEAD must have a successful job for every declared OS; run release check first. When it declares release.notes, the tag is annotated with the release body; mode ai makes one Anthropic API request for the body and falls back to the CHANGELOG extract when that is not usable. A changelog-section body (mode or fallback) needs exactly one non-empty dated section for the version (## X.Y.Z (YYYY-MM-DD) or ## [X.Y.Z] - YYYY-MM-DD) in CHANGELOG.md at HEAD; otherwise it stops before writing with section_missing, section_duplicate, or section_empty. --no-ai skips the request.",
                 "applies changes when a version bump is supplied; without an argument, exits without writing",
-                "files declared by release.versionFiles, and root CHANGELOG.md when release.changelogStamp is true; creates a git commit, advances main, and creates a v<version> tag (annotated when release.notes is declared); no remote push. With release.notes mode ai and without --no-ai, sends the scrubbed CHANGELOG items to Anthropic once and appends one row to the usage ledger named by usage_ledger in ~/.config/develop-tools/llm.json (without that field, nothing is sent), except when no previous tag exists, which skips inference and uses the version's CHANGELOG section. Publish with release push.",
+                "files declared by release.versionFiles, and root CHANGELOG.md when release.changelogStamp is true; creates a git commit, advances main, and creates a v<version> tag (annotated when release.notes is declared); no remote push. With release.notes mode ai and without --no-ai, sends the scrubbed CHANGELOG items to Anthropic once and records AI fallback reasons (timestamp_unix_seconds, tag, reason_code only) in release-notes-fallback.jsonl in the common Git directory, warning with fallback_reason_unrecorded if recording fails while continuing the release; appends one row per API request to the usage ledger named by usage_ledger in ~/.config/develop-tools/llm.json (without that field, nothing is sent), except when no previous tag exists, which skips inference and uses the version's CHANGELOG section. Publish with release push.",
             )
             .exit("0 success; 1 invalid input or failed release")
             .render()
@@ -186,21 +180,9 @@ fn body(
     end: &str,
     no_ai: bool,
 ) -> Result<ReleaseBody, String> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let transport = HttpTransport {
-        base_url: API_BASE_URL.to_owned(),
-        timeout: API_TIMEOUT,
-    };
-    let runtime = release_notes::AiRuntime {
-        op_program: PathBuf::from("op"),
-        op_service_account_token: std::env::var("OP_SERVICE_ACCOUNT_TOKEN").ok(),
-        transport: &transport,
-        home: home.clone(),
-    };
-    let settings = island_llm::settings::default_path(&home);
-    prepared.body(root, end, no_ai, &settings, &runtime)
+    release_notes::with_default_ai_runtime(|settings, runtime| {
+        prepared.body(root, end, no_ai, settings, runtime)
+    })
 }
 
 fn main() {

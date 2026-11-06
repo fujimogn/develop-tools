@@ -1,6 +1,6 @@
 use develop_release::release_notes::{
-    AiRuntime, BodySource, DeclaredNotes, NotesPlan, ReleaseBody, annotate_tag, extract_release,
-    prepare_notes, release_body,
+    AiRuntime, BodySource, DeclaredNotes, FixedNotes, NotesPlan, ReleaseBody, annotate_tag,
+    extract_release, prepare_notes, release_body,
 };
 use develop_tools_core::develop_tools_manifest::{NotesLanguage, NotesSource};
 use island_llm::settings::Audience;
@@ -2238,10 +2238,453 @@ fn ai_release_without_settings_annotates_with_the_fallback_and_its_reason() {
     let contents = assert_annotated_v124(root, &output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("本文: fallback（key_missing）"), "{stdout}");
+    let rows = fallback_rows(root);
+    assert_eq!(rows.len(), 1);
+    assert_fallback_row(&rows[0], "key_missing");
     assert!(
         contents.contains("予定を一覧で選べるようにした"),
         "{contents}"
     );
+}
+
+fn fallback_log(root: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ))
+    .join("release-notes-fallback.jsonl")
+}
+
+fn fallback_rows(root: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(fallback_log(root))
+        .expect("fallback の理由を後から読める")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn assert_fallback_row(row: &serde_json::Value, code: &str) {
+    assert_eq!(row.as_object().unwrap().len(), 3, "本文・秘密を残さない");
+    assert_eq!(row["tag"], "v1.2.4");
+    assert_eq!(row["reason_code"], code);
+    let timestamp = row["timestamp_unix_seconds"].as_u64().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!((1_700_000_000..=now).contains(&timestamp), "{row}");
+}
+
+fn prepared_body(
+    root: &Path,
+    no_ai: bool,
+    env: &NotesEnv,
+    transport: &CountingTransport,
+) -> ReleaseBody {
+    let declared = develop_release::release_notes::declared_notes(root)
+        .unwrap()
+        .unwrap();
+    prepare_notes(root, declared, "v1.2.4")
+        .unwrap()
+        .body(
+            root,
+            "HEAD",
+            no_ai,
+            &env.settings(),
+            &env.runtime(transport),
+        )
+        .unwrap()
+}
+
+/// 保存呼出しを外すと落ちる。推論前と検査拒否後を同じログへ追記し、usage は送信分だけ。
+#[test]
+fn fallback_log_appends_pre_request_and_output_check_reasons_without_content() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let root = fixture.path();
+    let missing = NotesEnv::new(None);
+    let env = NotesEnv::new(Some(&full_settings()));
+    let transport = CountingTransport::json(serde_json::json!({
+        "summary": "応答本文は保存しない",
+        "items": [{"text": "https://private.example/secret", "sources": [1]}],
+    }));
+
+    let first = prepared_body(root, false, &missing, &transport);
+    assert_eq!(first.source, BodySource::Fallback("key_missing".to_owned()));
+    assert!(!missing.ledger().exists());
+    let second = prepared_body(root, false, &env, &transport);
+    assert_eq!(
+        second.source,
+        BodySource::Fallback("output_rejected:items.0.text.url".to_owned())
+    );
+    assert_eq!(second.text, first.text);
+    assert_eq!(env.ledger_rows().len(), 1);
+    let rows = fallback_rows(root);
+    assert_eq!(rows.len(), 2);
+    assert_fallback_row(&rows[0], "key_missing");
+    assert_fallback_row(&rows[1], "output_rejected:items.0.text.url");
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn fallback_log_uses_the_common_git_directory_from_a_linked_worktree() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let root = fixture.path();
+    let linked = fixture._temp.path().join("linked");
+    git(
+        root,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let env = NotesEnv::new(None);
+    let transport = CountingTransport::json(serde_json::json!({}));
+
+    let body = prepared_body(&linked, false, &env, &transport);
+
+    assert_eq!(body.source, BodySource::Fallback("key_missing".to_owned()));
+    assert_fallback_row(&fallback_rows(root)[0], "key_missing");
+    assert_eq!(fallback_log(&linked), fallback_log(root));
+    let private_git = git(&linked, &["rev-parse", "--absolute-git-dir"]);
+    assert!(
+        !Path::new(&private_git)
+            .join("release-notes-fallback.jsonl")
+            .exists()
+    );
+    git(root, &["worktree", "remove", linked.to_str().unwrap()]);
+    assert_fallback_row(&fallback_rows(root)[0], "key_missing");
+}
+
+#[test]
+fn fallback_log_failure_warns_without_stopping_release_or_exposing_details() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let root = fixture.path();
+    std::fs::create_dir(fallback_log(root)).unwrap();
+
+    let (output, _home) = release_with(root, &["patch"]);
+
+    assert_annotated_v124(root, &output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("fallback_reason_unrecorded"), "{stderr}");
+    assert!(!stderr.contains(root.to_str().unwrap()), "{stderr}");
+    assert!(!stderr.contains("Is a directory"), "{stderr}");
+    assert!(fallback_log(root).is_dir());
+}
+
+fn fixed_notes(fixture: &Fixture) -> FixedNotes {
+    let end = git(fixture.path(), &["rev-parse", "HEAD"]);
+    FixedNotes::resolve(fixture.path(), "v1.2.3", &end, "v1.2.4", None).unwrap()
+}
+
+fn render_json_field<'a>(
+    rendered: &'a develop_release::release_notes::RenderedNotes,
+    field: &str,
+) -> &'a serde_json::Value {
+    &rendered.diagnostic[field]
+}
+
+/// 固定 OID の render は検証済み本文と終端診断を返し、AI 成功時も推論を 1 回だけ行う。
+#[test]
+fn fixed_render_ai_success_returns_body_and_terminal_diagnostic() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let fixed = fixed_notes(&fixture);
+    let env = NotesEnv::new(Some(&full_settings()));
+    let transport = CountingTransport::json(serde_json::json!({
+        "summary": "予定の選び方を改善しました。",
+        "items": [{"text": "予定を一覧から選べるようになりました。", "sources": [1]}],
+    }));
+
+    let rendered = fixed
+        .render(false, &env.settings(), &env.runtime(&transport))
+        .unwrap();
+
+    assert_eq!(transport.calls.get(), 1);
+    assert_eq!(
+        rendered.body.source,
+        BodySource::Ai {
+            dictionary_missing: false
+        }
+    );
+    assert!(
+        rendered
+            .body
+            .text
+            .contains("予定を一覧から選べるようになりました。")
+    );
+    assert_eq!(render_json_field(&rendered, "source"), "ai");
+    assert!(rendered.diagnostic["reason_code"].is_null());
+    assert_eq!(env.ledger_rows().len(), 1);
+}
+
+/// JSON の形が正しくても入力番号を越える sources は拒否し、推論は 1 回だけにする。
+#[test]
+fn fixed_render_rejects_out_of_range_sources_after_one_request() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let fixed = fixed_notes(&fixture);
+    let env = NotesEnv::new(Some(&full_settings()));
+    let transport = CountingTransport::json(serde_json::json!({
+        "summary": "改善しました。",
+        "items": [{"text": "予定を選べます。", "sources": [2]}],
+    }));
+
+    let rendered = fixed
+        .render(false, &env.settings(), &env.runtime(&transport))
+        .unwrap();
+
+    assert_eq!(transport.calls.get(), 1);
+    assert_eq!(
+        rendered.body.source,
+        BodySource::Fallback("output_rejected:items.0.sources.out_of_range".to_owned())
+    );
+    assert_eq!(
+        render_json_field(&rendered, "reason_code"),
+        "output_rejected:items.0.sources.out_of_range"
+    );
+    assert_eq!(fallback_rows(fixture.path()).len(), 1);
+    assert_fallback_row(
+        &fallback_rows(fixture.path())[0],
+        "output_rejected:items.0.sources.out_of_range",
+    );
+}
+
+/// usage 台帳への保存に失敗した送信は AI 本文を採用せず、理由を fallback として記録する。
+#[test]
+fn fixed_render_usage_recording_failure_falls_back_after_one_request() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let fixed = fixed_notes(&fixture);
+    let env = NotesEnv::new(Some(&full_settings()));
+    std::fs::create_dir_all(env.ledger().parent().unwrap()).unwrap();
+    std::fs::create_dir(env.ledger()).unwrap();
+    let transport = CountingTransport::json(serde_json::json!({
+        "summary": "改善しました。",
+        "items": [{"text": "予定を選べます。", "sources": [1]}],
+    }));
+
+    let rendered = fixed
+        .render(false, &env.settings(), &env.runtime(&transport))
+        .unwrap();
+
+    assert_eq!(transport.calls.get(), 1);
+    assert_eq!(
+        rendered.body.source,
+        BodySource::Fallback("usage_unrecorded".to_owned())
+    );
+    assert_eq!(
+        render_json_field(&rendered, "reason_code"),
+        "usage_unrecorded"
+    );
+    assert_fallback_row(&fallback_rows(fixture.path())[0], "usage_unrecorded");
+}
+
+/// private の辞書欠落は送信を止めず、AI 成功診断にだけ dictionary_missing を残す。
+#[test]
+fn fixed_render_private_dictionary_missing_keeps_ai_success() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let fixed = fixed_notes(&fixture);
+    let env = NotesEnv::new(Some(&format!(
+        r#"{{"anthropic_api_key_ref":"{NOTES_KEY_REF}","usage_ledger":"{LEDGER_MARK}"}}"#
+    )));
+    let transport = CountingTransport::json(serde_json::json!({
+        "summary": "改善しました。",
+        "items": [{"text": "予定を選べます。", "sources": [1]}],
+    }));
+
+    let rendered = fixed
+        .render(false, &env.settings(), &env.runtime(&transport))
+        .unwrap();
+
+    assert_eq!(transport.calls.get(), 1);
+    assert_eq!(
+        rendered.body.source,
+        BodySource::Ai {
+            dictionary_missing: true
+        }
+    );
+    assert_eq!(render_json_field(&rendered, "source"), "ai");
+    assert_eq!(render_json_field(&rendered, "dictionary_missing"), true);
+    assert!(rendered.diagnostic["reason_code"].is_null());
+}
+
+/// purpose の入力上限を越える本文は推論せず input_rejected fallback にする。
+#[test]
+fn fixed_render_rejects_input_over_limit_without_sending() {
+    let item = format!("- **巨大な項目**: {}", "x".repeat(70_000));
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(&item));
+    let fixed = fixed_notes(&fixture);
+    let env = NotesEnv::new(Some(&full_settings()));
+    let transport = CountingTransport::json(serde_json::json!({}));
+
+    let rendered = fixed
+        .render(false, &env.settings(), &env.runtime(&transport))
+        .unwrap();
+
+    assert_eq!(transport.calls.get(), 0);
+    assert_eq!(
+        rendered.body.source,
+        BodySource::Fallback("input_rejected".to_owned())
+    );
+    assert_eq!(
+        render_json_field(&rendered, "reason_code"),
+        "input_rejected"
+    );
+    assert_fallback_row(&fallback_rows(fixture.path())[0], "input_rejected");
+}
+
+/// key・usage・public 辞書の欠落は送信せず、固定 fallback と理由を記録する。
+#[test]
+fn fixed_render_pre_request_failures_do_not_send_and_report_reason() {
+    let cases = [
+        (None, "key_missing"),
+        (
+            Some("{\"anthropic_api_key_ref\":\"op://test-vault/test-item/api-key\"}"),
+            "usage_unrecorded",
+        ),
+    ];
+    for (settings, reason) in cases {
+        let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+        let fixed = fixed_notes(&fixture);
+        let env = NotesEnv::new(settings);
+        let transport = CountingTransport::json(serde_json::json!({}));
+        let rendered = fixed
+            .render(false, &env.settings(), &env.runtime(&transport))
+            .unwrap();
+
+        assert_eq!(transport.calls.get(), 0, "{reason}");
+        assert_eq!(
+            rendered.body.source,
+            BodySource::Fallback(reason.to_owned())
+        );
+        assert_eq!(render_json_field(&rendered, "source"), "fallback");
+        assert_eq!(render_json_field(&rendered, "reason_code"), reason);
+        assert_eq!(rendered.body.text, fallback_text(&fixture));
+    }
+
+    let fixture = notes_fixture(
+        Some(r#"{"mode":"ai","fallback":"changelog-additions","audience":"public"}"#),
+        Some(NOTES_ITEM),
+    );
+    let fixed = fixed_notes(&fixture);
+    let env = NotesEnv::new(Some(&format!(
+        r#"{{"anthropic_api_key_ref":"{NOTES_KEY_REF}","usage_ledger":"{LEDGER_MARK}"}}"#
+    )));
+    let transport = CountingTransport::json(serde_json::json!({}));
+    let rendered = fixed
+        .render(false, &env.settings(), &env.runtime(&transport))
+        .unwrap();
+    assert_eq!(transport.calls.get(), 0);
+    assert_eq!(
+        rendered.body.source,
+        BodySource::Fallback("dictionary_missing".to_owned())
+    );
+    assert_eq!(
+        render_json_field(&rendered, "reason_code"),
+        "dictionary_missing"
+    );
+}
+
+/// API timeout と出力拒否は各々 1 回送信して fallback し、推論の再試行をしない。
+#[test]
+fn fixed_render_api_failures_send_once_and_fall_back() {
+    let cases = [
+        (
+            Err(TransportError { kind: FailureKind::Timeout, request_id: None }),
+            "api_timeout",
+        ),
+        (
+            Ok(ApiResponse { status: 200, request_id: Some("req_rejected".to_owned()), body: serde_json::json!({"content":[{"type":"text","text":"not-json"}],"usage":{"input_tokens":1,"output_tokens":1}}).to_string() }),
+            "response_rejected",
+        ),
+    ];
+    for (reply, reason) in cases {
+        let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+        let fixed = fixed_notes(&fixture);
+        let env = NotesEnv::new(Some(&full_settings()));
+        let transport = CountingTransport::with(reply);
+        let rendered = fixed
+            .render(false, &env.settings(), &env.runtime(&transport))
+            .unwrap();
+
+        assert_eq!(transport.calls.get(), 1, "{reason}");
+        assert!(matches!(rendered.body.source, BodySource::Fallback(_)));
+        assert_eq!(render_json_field(&rendered, "source"), "fallback");
+        assert_eq!(render_json_field(&rendered, "reason_code"), reason);
+    }
+}
+
+/// --no-ai は API/op を呼ばず、fallback 本文と no_ai の診断だけを返す。
+#[test]
+fn fixed_render_no_ai_skips_inference() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let fixed = fixed_notes(&fixture);
+    let env = NotesEnv::new(Some(&full_settings()));
+    let transport = CountingTransport::json(serde_json::json!({}));
+
+    let mut runtime = env.runtime(&transport);
+    runtime.op_program = std::path::PathBuf::from("/path/that/does/not/exist");
+    let rendered = fixed.render(true, &env.settings(), &runtime).unwrap();
+
+    assert_eq!(transport.calls.get(), 0);
+    assert_eq!(rendered.body.source, BodySource::NoAi);
+    assert_eq!(render_json_field(&rendered, "source"), "no_ai");
+    assert!(rendered.diagnostic["reason_code"].is_null());
+    assert!(!fallback_log(fixture.path()).exists());
+}
+
+/// fallback 理由の保存に失敗しても本文は返し、診断だけへ警告を載せる。
+#[test]
+fn fixed_render_records_fallback_reason_warning_without_exposing_error() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let fixed = fixed_notes(&fixture);
+    std::fs::create_dir(fallback_log(fixture.path())).unwrap();
+    let env = NotesEnv::new(None);
+    let transport = CountingTransport::json(serde_json::json!({}));
+
+    let rendered = fixed
+        .render(false, &env.settings(), &env.runtime(&transport))
+        .unwrap();
+
+    assert_eq!(transport.calls.get(), 0);
+    assert_eq!(
+        rendered.body.source,
+        BodySource::Fallback("key_missing".to_owned())
+    );
+    assert_eq!(
+        render_json_field(&rendered, "recording_warning"),
+        "fallback_reason_unrecorded"
+    );
+    assert!(rendered.body.text.contains("v1.2.3...v1.2.4"));
+}
+
+#[test]
+fn non_fallback_bodies_do_not_append_a_fallback_log() {
+    for (notes, no_ai, source) in [
+        (
+            AI_PRIVATE,
+            false,
+            BodySource::Ai {
+                dictionary_missing: false,
+            },
+        ),
+        (AI_PRIVATE, true, BodySource::NoAi),
+        (
+            r#"{"mode":"changelog-additions"}"#,
+            false,
+            BodySource::Changelog,
+        ),
+    ] {
+        let fixture = notes_fixture(Some(notes), Some(NOTES_ITEM));
+        let env = NotesEnv::new(Some(&full_settings()));
+        let transport = CountingTransport::json(serde_json::json!({
+            "summary": "予定を選べます。",
+            "items": [{"text": "予定を一覧から選べます。", "sources": [1]}],
+        }));
+        let body = prepared_body(fixture.path(), no_ai, &env, &transport);
+        assert_eq!(body.source, source);
+        assert!(!fallback_log(fixture.path()).exists());
+    }
 }
 
 #[test]
@@ -2430,6 +2873,7 @@ fn first_release_skips_inference_even_with_complete_ai_settings() {
     assert_eq!(body.source, BodySource::FirstRelease);
     assert_eq!(transport.calls.get(), 0);
     assert!(env.ledger_rows().is_empty());
+    assert!(!fallback_log(root).exists());
 }
 
 fn assert_section_body(contents: &str) {

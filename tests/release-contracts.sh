@@ -24,7 +24,7 @@ test "$resolver_asset" = "$fixture_asset"
 test "$resolver_asset" = "$workflow_asset"
 
 # Release の実際の一覧から梱包し、example が bin と並んでいても収録しない。
-jq -e '.binaries | index("run-heavy-check") != null and index("heavy-check-harness") == null' "$root/config/release-binaries.json" > /dev/null
+jq -e '.binaries | index("run-heavy-check") != null and (map(select(. == "ci-change-scope")) | length) == 1 and index("heavy-check-harness") == null' "$root/config/release-binaries.json" > /dev/null
 # 名前の形式は workflow と同じ制約で検査し、word splitting は binary 名だけに限る。
 jq -e '.binaries | all(.[]; test("^[A-Za-z0-9_-]+$"))' "$root/config/release-binaries.json" > /dev/null
 artifact_fixture=$(mktemp -d "${TMPDIR:-/tmp}/develop-meta-release-contract.XXXXXXXX")
@@ -39,7 +39,8 @@ COPYFILE_DISABLE=1 tar -czf "$artifact_fixture/artifact.tar.gz" -C "$artifact_fi
 listing=$(tar -tzf "$artifact_fixture/artifact.tar.gz" | sort)
 test "$listing" = "$(jq -r '.binaries[]' "$root/config/release-binaries.json" | sort)"
 printf '%s\n' "$listing" | awk '$0 == "run-heavy-check" { found = 1 } END { exit !found }' > /dev/null
+printf '%s\n' "$listing" | awk '$0 == "ci-change-scope" { count++ } END { exit count != 1 }' > /dev/null
 if printf '%s\n' "$listing" | awk '$0 == "heavy-check-harness" { found = 1 } END { exit !found }' > /dev/null; then
   exit 1
 fi
-printf 'ok: public archive includes run-heavy-check and excludes the example harness\n'
+printf 'ok: public archive includes ci-change-scope and run-heavy-check, excludes the example harness\n'

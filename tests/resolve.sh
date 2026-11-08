@@ -12,6 +12,10 @@ root=$(mktemp -d "${TMPDIR:-/tmp}/develop-meta-resolve-test.XXXXXXXX") || exit 1
 trap 'cleanup' 0
 
 cleanup() {
+  if [ -n "${server_pid:-}" ]; then
+    kill "$server_pid" 2>/dev/null || :
+    wait "$server_pid" 2>/dev/null || :
+  fi
   for case_dir in "$root"/*; do
     [ -d "$case_dir" ] || continue
     rm -f "$case_dir"/repo/.develop-tools.json "$case_dir"/repo/.develop-tools-next.json \
@@ -25,7 +29,8 @@ cleanup() {
       "$case_dir"/cache/develop-tools/.manifest-$target-* \
       "$case_dir"/cache/develop-tools/$version/$target.lock/pid \
       "$case_dir"/state/mise/tracked-configs/* \
-      "$case_dir"/curl.log "$case_dir"/tar.log "$case_dir"/run.log \
+      "$case_dir"/curl.log "$case_dir"/tar.log "$case_dir"/run.log "$case_dir"/attempts \
+      "$case_dir"/server.py "$case_dir"/server.log "$case_dir"/port "$case_dir"/leak \
       "$case_dir"/stdout "$case_dir"/stderr "$case_dir"/jq.log "$case_dir"/snapshot.log
     rmdir "$case_dir"/cache/develop-tools/$version/$target.lock.reap \
       "$case_dir"/cache/develop-tools/$version/$target.lock \
@@ -81,14 +86,51 @@ fixture() {
   pack_payload
   cat > "$case_dir/fakebin/curl" <<'EOF'
 #!/bin/sh
-printf '%s\n' "$*" >> "$CURL_LOG"
+if [ "$1" = --help ]; then printf '%s\n' '--retry-all-errors'; exit 0; fi
+safe_args=
+skip=0
+header=
+for arg do
+  if [ "$skip" -eq 1 ]; then
+    case "$arg" in Authorization:*) header=$arg ;; esac
+    skip=0
+    continue
+  fi
+  case "$arg" in
+    -H|--header) safe_args="$safe_args $arg [redacted]"; skip=1 ;;
+    *) safe_args="$safe_args $arg" ;;
+  esac
+done
+printf '%s\n' "$safe_args" >> "$CURL_LOG"
+if [ "${FAKE_HTTP_STATUS:-}" = 401 ]; then printf '401'; exit 22; fi
+if [ "${EXPECT_TOKEN+x}" = x ]; then
+  if [ -n "$EXPECT_TOKEN" ]; then
+    [ "$header" = "Authorization: Bearer $EXPECT_TOKEN" ] || exit 71
+  else
+    [ -z "$header" ] || exit 72
+  fi
+else
+  [ -z "$header" ] || exit 72
+fi
 [ "${CURL_FAIL:-0}" = 0 ] || exit 22
 [ "${CURL_DELAY:-0}" = 0 ] || /bin/sleep "$CURL_DELAY"
 out=
+prev=
 for arg do
   case "$prev" in -o) out=$arg; prev=; continue ;; esac
   case "$arg" in -o) prev=-o ;; *) url=$arg ;; esac
 done
+case "$url" in
+  */releases/tags/*)
+    case "${FAKE_ASSETS:-unique}" in
+      duplicate) printf '{"assets":[{"name":"%s","id":11},{"name":"%s","id":12}]}' "$asset" "$asset" > "$out" ;;
+      missing) printf '{"assets":[]}' > "$out" ;;
+      *) printf '{"assets":[{"name":"%s","id":11},{"name":"SHA256SUMS","id":12}]}' "$asset" > "$out" ;;
+    esac
+    exit 0 ;;
+  */releases/assets/11) cp "$RELEASES/$asset" "$out"; exit $? ;;
+  */releases/assets/12) cp "$RELEASES/SHA256SUMS" "$out"; exit $? ;;
+esac
 cp "$RELEASES/${url##*/}" "$out"
 EOF
   cat > "$case_dir/fakebin/uname" <<'EOF'
@@ -113,7 +155,11 @@ run_resolver() {
     RUN_LOG="$case_dir/run.log" HOME="$case_dir/home" RELEASES="$case_dir/releases" \
     CURL_LOG="$case_dir/curl.log" JQ_LOG="$case_dir/jq.log" \
     SNAPSHOT_LOG="$case_dir/snapshot.log" CURL_FAIL="${CURL_FAIL:-0}" \
-    CURL_DELAY="${CURL_DELAY:-0}" FAKE_OS="${FAKE_OS:-Linux}" \
+    CURL_DELAY="${CURL_DELAY:-0}" FAKE_ASSETS="${FAKE_ASSETS:-unique}" asset="$asset" FAKE_OS="${FAKE_OS:-Linux}" \
+    GITHUB_TOKEN="${TEST_GITHUB_TOKEN:-}" GH_TOKEN="${TEST_GH_TOKEN:-}" \
+    EXPECT_TOKEN="${EXPECT_TOKEN:-}" \
+    TEST_SERVER_PORT="${TEST_SERVER_PORT:-}" SERVER_DIR="$case_dir" REAL_CURL="${REAL_CURL:-}" \
+    FAKE_HTTP_STATUS="${FAKE_HTTP_STATUS:-}" \
     FAKE_ARCH="${FAKE_ARCH:-x86_64}" \
     "$test_shell" "$resolver" "$mode" "$binary" "$@") \
     > "$case_dir/stdout" 2> "$case_dir/stderr"
@@ -129,7 +175,11 @@ run_bin_dir() {
     XDG_STATE_HOME="$case_dir/state" \
     RUN_LOG="$case_dir/run.log" HOME="$case_dir/home" RELEASES="$case_dir/releases" \
     CURL_LOG="$case_dir/curl.log" CURL_FAIL="${CURL_FAIL:-0}" \
-    CURL_DELAY="${CURL_DELAY:-0}" FAKE_OS="${FAKE_OS:-Linux}" \
+    CURL_DELAY="${CURL_DELAY:-0}" FAKE_ASSETS="${FAKE_ASSETS:-unique}" asset="$asset" FAKE_OS="${FAKE_OS:-Linux}" \
+    GITHUB_TOKEN="${TEST_GITHUB_TOKEN:-}" GH_TOKEN="${TEST_GH_TOKEN:-}" \
+    EXPECT_TOKEN="${EXPECT_TOKEN:-}" \
+    TEST_SERVER_PORT="${TEST_SERVER_PORT:-}" SERVER_DIR="$case_dir" REAL_CURL="${REAL_CURL:-}" \
+    FAKE_HTTP_STATUS="${FAKE_HTTP_STATUS:-}" \
     FAKE_ARCH="${FAKE_ARCH:-x86_64}" \
     "$test_shell" "$resolver" bin-dir "$mode") \
     > "$case_dir/stdout" 2> "$case_dir/stderr"
@@ -150,7 +200,7 @@ EOF
 pack_payload
 printf '\000\377input\n' > "$case_dir/snapshot.log"
 run_resolver ci -- command 'arg with space' '' -- < "$case_dir/snapshot.log"
-[ "$result" -eq 37 ] || fail_test 'resolver changed payload exit code'
+[ "$result" -eq 37 ] || fail_test "resolver changed payload exit code ($result): $(cat "$case_dir/stderr")"
 printf '<-->\n<command>\n<arg with space>\n<>\n<-->\n\000\377input\n' > "$case_dir/run.log"
 cmp "$case_dir/run.log" "$case_dir/stdout" || fail_test 'resolver changed argv or binary stdin'
 printf 'ok: run-heavy-check argv, stdin and exit code are transparent\n'
@@ -226,7 +276,7 @@ for format in text binary; do
   run_resolver ci 'arg with space'
   [ "$result" -eq 0 ] || fail_test "SHA256SUMS $format was rejected: $(cat "$case_dir/stderr")"
   assert_contains "$(cat "$case_dir/stdout")" 'ran:arg with space'
-  assert_contains "$(cat "$case_dir/curl.log")" '--connect-timeout 5 --max-time 30 --retry 2'
+  assert_contains "$(cat "$case_dir/curl.log")" '--retry 3 --retry-all-errors --connect-timeout 5 --max-time 30'
 done
 printf 'ok: SHA256SUMS formats and curl options\n'
 
@@ -490,6 +540,141 @@ wait "$second" || fail_test 'second stale-lock invocation failed'
 unset CURL_DELAY
 [ "$(wc -l < "$case_dir/curl.log")" -eq 2 ] || fail_test 'stale-lock callers fetched twice'
 printf 'ok: parallel stale lock recovery\n'
+
+for source in github gh anonymous; do
+  fixture "auth_$source"
+  case "$source" in
+    github) TEST_GITHUB_TOKEN=fake-github-token TEST_GH_TOKEN=fake-gh-token EXPECT_TOKEN=$TEST_GITHUB_TOKEN ;;
+    gh) TEST_GITHUB_TOKEN='' TEST_GH_TOKEN=fake-gh-token EXPECT_TOKEN=$TEST_GH_TOKEN ;;
+    anonymous) TEST_GITHUB_TOKEN='' TEST_GH_TOKEN='' EXPECT_TOKEN='' ;;
+  esac
+  run_resolver ci
+  [ "$result" -eq 0 ] || fail_test "$source download failed: $(cat "$case_dir/stderr")"
+  if [ "$source" = anonymous ]; then
+    [ "$(wc -l < "$case_dir/curl.log")" -eq 2 ] || fail_test 'anonymous did not use two public URLs'
+    ! grep -Fq '/releases/tags/' "$case_dir/curl.log" || fail_test 'anonymous used API'
+  else
+    [ "$(wc -l < "$case_dir/curl.log")" -eq 3 ] || fail_test "$source did not fetch metadata and both assets"
+    grep -Fq '/releases/tags/' "$case_dir/curl.log" || fail_test "$source did not use API"
+  fi
+done
+unset TEST_GITHUB_TOKEN TEST_GH_TOKEN EXPECT_TOKEN
+printf 'ok: token selection and anonymous fallback\n'
+
+fixture auth_rejected
+TEST_GITHUB_TOKEN=fake-token EXPECT_TOKEN=fake-token FAKE_HTTP_STATUS=401
+run_resolver pre-commit
+[ "$result" -ne 0 ] || fail_test 'authenticated 401 skipped pre-commit'
+assert_contains "$(cat "$case_dir/stderr")" '認証が拒否されました'
+! grep -Fq 'https://github.com/' "$case_dir/curl.log" || fail_test '401 downgraded to public URL'
+unset TEST_GITHUB_TOKEN EXPECT_TOKEN FAKE_HTTP_STATUS
+printf 'ok: authenticated rejection fails closed in pre-commit\n'
+
+for condition in duplicate missing; do
+  fixture "auth_$condition"
+  TEST_GITHUB_TOKEN=fake-token EXPECT_TOKEN=fake-token FAKE_ASSETS=$condition
+  run_resolver ci
+  [ "$result" -ne 0 ] || fail_test "$condition metadata was accepted"
+  [ ! -e "$case_dir/cache/develop-tools/$version/$target/.sha256" ] || fail_test "$condition was cached"
+  ! grep -Fq 'https://github.com/' "$case_dir/curl.log" || fail_test "$condition downgraded to public URL"
+done
+unset TEST_GITHUB_TOKEN EXPECT_TOKEN FAKE_ASSETS
+printf 'ok: metadata asset uniqueness and no downgrade\n'
+
+fixture auth_checksum
+TEST_GITHUB_TOKEN=fake-token EXPECT_TOKEN=fake-token
+printf '%064d  %s\n' 0 "$asset" > "$case_dir/releases/SHA256SUMS"
+run_resolver ci
+[ "$result" -ne 0 ] || fail_test 'authenticated checksum mismatch passed'
+pack_payload
+printf '{"version":"%s","sha256":{"%s":"%064d"}}\n' "$version" "$target" 0 > "$case_dir/repo/.config/develop-tools.json"
+run_resolver ci
+[ "$result" -ne 0 ] || fail_test 'authenticated manifest mismatch passed'
+unset TEST_GITHUB_TOKEN EXPECT_TOKEN
+printf 'ok: authenticated SHA256SUMS and manifest verification\n'
+
+fixture auth_http
+cat > "$case_dir/server.py" <<'PY'
+import http.server
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+asset = sys.argv[2]
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_GET(self):
+        if self.path.endswith('/releases/tags/v0.1.0'):
+            body = json.dumps({'assets': [{'name': asset, 'id': 11}, {'name': 'SHA256SUMS', 'id': 12}]}).encode()
+        elif self.path.endswith('/releases/assets/11'):
+            attempts = root / 'attempts'
+            count = int(attempts.read_text()) + 1 if attempts.exists() else 1
+            attempts.write_text(str(count))
+            if count == 1:
+                self.send_error(503)
+                return
+            self.send_response(302)
+            self.send_header('Location', f'http://localhost:{self.server.server_port}/blob')
+            self.end_headers()
+            return
+        elif self.path.endswith('/releases/assets/12'):
+            body = (root / 'releases' / 'SHA256SUMS').read_bytes()
+        elif self.path == '/blob':
+            if self.headers.get('Authorization'):
+                (root / 'leak').write_text('authorization forwarded')
+                self.send_error(400)
+                return
+            body = (root / 'releases' / asset).read_bytes()
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+(root / 'port').write_text(str(server.server_port))
+server.serve_forever()
+PY
+cat > "$case_dir/fakebin/curl" <<'BASH'
+#!/usr/bin/env bash
+if [[ $1 == --help ]]; then printf '%s\n' '--retry-all-errors'; exit 0; fi
+args=()
+while (($#)); do
+  case "$1" in
+    --proto|--proto-redir) shift 2 ;;
+    https://api.github.com/*) args+=("http://127.0.0.1:${TEST_SERVER_PORT}/${1#https://api.github.com/}"); shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+exec "$REAL_CURL" "${args[@]}"
+BASH
+chmod +x "$case_dir/fakebin/curl"
+python3 -u "$case_dir/server.py" "$case_dir" "$asset" > "$case_dir/server.log" 2>&1 &
+server_pid=$!
+counter=0
+until [ -s "$case_dir/port" ]; do
+  counter=$((counter + 1))
+  [ "$counter" -lt 100 ] || fail_test 'fake server did not start'
+  /bin/sleep 0.02
+done
+TEST_SERVER_PORT=$(cat "$case_dir/port")
+REAL_CURL=$(real_command curl)
+TEST_GITHUB_TOKEN=fake-token
+run_resolver ci
+[ "$result" -eq 0 ] || fail_test "redirect or retry failed: $(cat "$case_dir/stderr")"
+[ "$(cat "$case_dir/attempts")" -eq 2 ] || fail_test 'HTTP 503 was not retried once'
+[ ! -e "$case_dir/leak" ] || fail_test 'Authorization crossed redirect hosts'
+kill "$server_pid"
+wait "$server_pid" 2>/dev/null || :
+server_pid=
+unset TEST_SERVER_PORT REAL_CURL TEST_GITHUB_TOKEN
+printf 'ok: real curl retry and cross-host Authorization stripping\n'
 
 cleanup
 trap - 0

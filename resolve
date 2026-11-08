@@ -4,7 +4,7 @@
 set -u
 CONNECT_TIMEOUT=5
 MAX_TIME=30
-RETRY_COUNT=2
+RETRY_COUNT=3
 
 fail() {
   printf 'develop-tools resolve: %s\n' "$1" >&2
@@ -224,12 +224,49 @@ fi
 asset=develop-tools-v$version-$target.tar.gz
 url=https://github.com/fujimogn/develop-tools/releases/download/v$version
 command -v curl >/dev/null 2>&1 || fail 'curl が必要です'
+case "$(curl --help all 2>/dev/null)" in
+  *--retry-all-errors*) ;;
+  *) fail 'curl 7.71.0 以降 (--retry-all-errors) が必要です' ;;
+esac
 command -v tar >/dev/null 2>&1 || fail 'tar が必要です'
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
   fail 'sha256sum または shasum が必要です'
 fi
-curl -fsSL --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" --retry "$RETRY_COUNT" -o "$tmp/$asset" "$url/$asset" || unavailable "$asset"
-curl -fsSL --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" --retry "$RETRY_COUNT" -o "$tmp/SHA256SUMS" "$url/SHA256SUMS" || unavailable 'SHA256SUMS'
+download() {
+  name=$1
+  output=$2
+  if [ -z "$token" ]; then
+    curl --fail --silent --show-error --location --retry "$RETRY_COUNT" --retry-all-errors \
+      --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+      --proto '=https' --proto-redir '=https' -o "$output" "$url/$name" || unavailable "$name"
+    return
+  fi
+  command -v jq >/dev/null 2>&1 || fail 'jq が必要です (認証付き Release 取得)'
+  asset_id=$(jq -er --arg name "$name" \
+    '.assets | select(type == "array") | map(select(.name == $name)) | select(length == 1) | .[0].id | select(type == "number" and . > 0 and floor == .)' \
+    "$tmp/release.json" 2>/dev/null) || fail "Release asset が一意でありません: $name"
+  status=$(curl --fail --silent --show-error --location --retry "$RETRY_COUNT" --retry-all-errors \
+    --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+    --proto '=https' --proto-redir '=https' --header "Authorization: Bearer $token" \
+    --header 'Accept: application/octet-stream' --write-out '%{http_code}' \
+    -o "$output" "https://api.github.com/repos/fujimogn/develop-tools/releases/assets/$asset_id") || {
+      case "$status" in 401|403) fail "Release API の認証が拒否されました: $name" ;; esac
+      unavailable "$name"
+    }
+}
+token=${GITHUB_TOKEN:-${GH_TOKEN:-}}
+if [ -n "$token" ]; then
+  status=$(curl --fail --silent --show-error --location --retry "$RETRY_COUNT" --retry-all-errors \
+    --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+    --proto '=https' --proto-redir '=https' --header "Authorization: Bearer $token" \
+    --header 'Accept: application/vnd.github+json' --write-out '%{http_code}' \
+    -o "$tmp/release.json" "https://api.github.com/repos/fujimogn/develop-tools/releases/tags/v$version") || {
+      case "$status" in 401|403) fail 'Release API の認証が拒否されました' ;; esac
+      unavailable 'Release metadata'
+    }
+fi
+download "$asset" "$tmp/$asset"
+download SHA256SUMS "$tmp/SHA256SUMS"
 
 # Accept sha256sum text (`hash  name`) and binary (`hash *name`) records.
 published=$(awk -v name="$asset" '($2 == name || $2 == "*" name) && NF == 2 { print $1; count++ } END { if (count != 1) exit 1 }' "$tmp/SHA256SUMS") || fail "SHA256SUMS の行が不正です: $asset"

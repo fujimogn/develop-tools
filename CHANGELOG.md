@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.13] - 2026-11-09
+
+### Added
+
+- Add `ci-change-scope` with its dependency proof mode to the public CLI binary set.
+
+### Changed
+
+- The `resolve` script downloads release assets through the authenticated GitHub API when `GITHUB_TOKEN` or `GH_TOKEN` is set, and retries transient failures with a bounded limit. Without a token it keeps using the public download URL. A token failure no longer falls back silently to anonymous access. Checksum verification is unchanged.
+
 ## [0.6.12] - 2026-11-06
 
 ### Changed

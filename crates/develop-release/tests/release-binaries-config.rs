@@ -304,5 +304,15 @@ fn public_inventory_ships_runner_without_the_example_harness() {
     let listing = String::from_utf8(output.stdout).unwrap();
     assert!(listing.lines().any(|name| name == "run-heavy-check"));
     assert!(!listing.lines().any(|name| name == "heavy-check-harness"));
-    assert_eq!(listing.lines().count(), 10);
+    assert_eq!(
+        listing
+            .lines()
+            .filter(|name| *name == "ci-change-scope")
+            .count(),
+        1
+    );
+    assert_eq!(
+        listing.lines().count(),
+        declared["binaries"].as_array().unwrap().len()
+    );
 }

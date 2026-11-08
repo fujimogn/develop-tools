@@ -233,7 +233,7 @@ fn release_notes_disables_thinking_and_reserves_the_output_budget() {
         transport.last_body.borrow().as_ref().unwrap(),
         &serde_json::json!({
             "model": purpose.model,
-            "max_tokens": 16000,
+            "max_tokens": 48000,
             "thinking": {"type": "disabled"},
             "messages": [{"role": "user", "content": format!("{}1. text", purpose.instruction)}],
         })
@@ -508,7 +508,7 @@ fn english_release_notes_sends_the_english_instruction_once() {
         transport.last_body.borrow().as_ref().unwrap(),
         &serde_json::json!({
             "model": purpose.model,
-            "max_tokens": 16000,
+            "max_tokens": 48000,
             "thinking": {"type": "disabled"},
             "messages": [{"role":"user", "content":format!("{}[1] Fixed selection.\n", purpose.instruction)}]
         })
@@ -516,4 +516,77 @@ fn english_release_notes_sends_the_english_instruction_once() {
     let rows = ledger_rows(&setup.ledger());
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["purpose"], "release-notes-en");
+}
+
+#[test]
+fn release_notes_estimate_uses_both_rates_at_the_prompt_tier_boundary() {
+    for name in ["release-notes", "release-notes-en"] {
+        let purpose = island_llm::purpose::find(name).unwrap();
+        let at_boundary = 100_000 - purpose.instruction.len();
+        assert_eq!(purpose.estimate_micro_usd(at_boundary), 34_000, "{name}");
+        assert_eq!(
+            purpose.estimate_micro_usd(at_boundary + 1),
+            170_001,
+            "{name}"
+        );
+        assert_eq!(purpose.max_cost_micro_usd, 1_000_000);
+    }
+}
+
+#[test]
+fn release_notes_accepts_recent_release_sizes_and_the_full_input_cap() {
+    for name in ["release-notes", "release-notes-en"] {
+        for bytes in [86 * 1024, 262_144] {
+            let setup = Setup::new();
+            let transport = FixtureTransport::text(r#"{"summary":"s","items":[]}"#);
+            run(
+                name,
+                &vec![b'a'; bytes],
+                &key_ref(),
+                &setup.runtime(&transport),
+            )
+            .expect("input within the release notes cap");
+            assert_eq!(transport.calls.get(), 1);
+        }
+    }
+}
+
+#[test]
+fn release_notes_rejects_one_byte_over_256_kib_before_op_or_transport() {
+    for name in ["release-notes", "release-notes-en"] {
+        let setup = Setup::new();
+        let transport = FixtureTransport::text(r#"{"summary":"s","items":[]}"#);
+        let failure = run(
+            name,
+            &vec![b'a'; 262_145],
+            &key_ref(),
+            &setup.runtime(&transport),
+        )
+        .expect_err("over the byte cap");
+        assert_eq!(failure.code(), "input_rejected");
+        assert_eq!(transport.calls.get(), 0);
+        assert!(!setup.op_was_called());
+    }
+}
+
+#[test]
+fn release_notes_reserves_a_conservative_budget_for_300_json_items() {
+    let items: Vec<_> = (1..=300)
+        .map(|n| {
+            serde_json::json!({
+                "text": "改".repeat(40), "sources": [n],
+            })
+        })
+        .collect();
+    let response = serde_json::json!({"summary": "改".repeat(40), "items": items}).to_string();
+    // UTF-8 byte数はtoken数の保守的上限。300項目×40文字とJSON構造を含める。
+    assert!(response.len() > 16_000);
+    for name in ["release-notes", "release-notes-en"] {
+        let purpose = island_llm::purpose::find(name).unwrap();
+        assert!(
+            response.len() <= purpose.max_tokens as usize,
+            "{}",
+            response.len()
+        );
+    }
 }

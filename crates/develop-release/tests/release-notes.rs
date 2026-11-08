@@ -2063,3 +2063,179 @@ fn commit_links_reject_sha256_repositories_without_rejecting_old_entries() {
     let error = extract_release(root, "HEAD", "v0.2.0", None).unwrap_err();
     assert!(error.contains("commit_link"), "{error}");
 }
+
+// Use the same original first line for preparation, extraction and rendering.
+fn check_section_link_position(body: &str, accepted: bool, has_suffix: bool) {
+    use develop_release::release_notes::{AiRuntime, DeclaredNotes, NotesPlan};
+    use develop_tools_core::develop_tools_manifest::NotesSource;
+    for first_release in [true, false] {
+        let dir = fixture();
+        let root = dir.path();
+        git(
+            root,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/owner/repo",
+            ],
+        );
+        if !first_release {
+            git(root, &["tag", "v0.1.0"]);
+        }
+        let oid = git(root, &["rev-parse", "HEAD"]);
+        let body = body.replace("OID", &oid);
+        commit(
+            root,
+            &format!("# Changelog\n\n## 0.2.0 (2026-11-06)\n\n{body}\n"),
+            "section",
+        );
+        let result = prepare_notes(
+            root,
+            DeclaredNotes {
+                plan: NotesPlan::Changelog,
+                source: NotesSource::ChangelogSection,
+                language: NotesLanguage::Ja,
+            },
+            "v0.2.0",
+        );
+        if !accepted {
+            let error = result.unwrap_err();
+            assert!(error.contains("commit_link"), "{error}");
+            continue;
+        }
+        let prepared = result.unwrap();
+        if !first_release {
+            let extract = prepared.extract(root, "HEAD").unwrap();
+            assert_eq!(extract.commit_links[0].is_some(), has_suffix);
+        }
+        let transport = LinkTransport {
+            value: serde_json::json!({}),
+            input: Default::default(),
+        };
+        let runtime = AiRuntime {
+            home: root.join("unused-home"),
+            op_program: root.join("unused-op"),
+            op_service_account_token: None,
+            transport: &transport,
+        };
+        let rendered = prepared
+            .body(root, "HEAD", true, &root.join("unused-settings"), &runtime)
+            .unwrap();
+        assert!(rendered.text.contains(&body), "{}", rendered.text);
+        assert!(transport.input.borrow().is_none());
+    }
+}
+
+#[test]
+fn commit_link_section_continuation_is_an_ordinary_reference() {
+    check_section_link_position(
+        "- 成果。\n  [abcdef0](https://github.com/other/repo/commit/abcdef0)",
+        true,
+        false,
+    );
+}
+
+#[test]
+fn commit_link_section_first_line_suffix_is_checked_with_continuation() {
+    check_section_link_position(
+        "- 成果。 [OID](https://github.com/owner/repo/commit/OID)\n  詳細。",
+        true,
+        true,
+    );
+    check_section_link_position(
+        "- 成果。 [OID](https://github.com/other/repo/commit/OID)\n  詳細。",
+        false,
+        false,
+    );
+}
+
+#[test]
+fn commit_link_section_trailing_whitespace_is_rejected() {
+    for whitespace in [" ", "\t"] {
+        check_section_link_position(
+            &format!(
+                "- 成果。 [OID](https://github.com/owner/repo/commit/OID){whitespace}\n  詳細。"
+            ),
+            false,
+            false,
+        );
+    }
+}
+
+#[test]
+fn release_body_accepts_86_kib_and_stops_over_256_kib_without_transport() {
+    use develop_release::release_notes::{AiRuntime, BodySource, NotesPlan, release_body};
+    use std::os::unix::fs::PermissionsExt;
+    let env = tempfile::tempdir().unwrap();
+    let settings = env.path().join("settings.json");
+    std::fs::write(
+        &settings,
+        serde_json::json!({
+            "anthropic_api_key_ref": "op://test/key/value",
+            "forbidden_terms": [], "internal_names": [],
+            "usage_ledger": env.path().join("usage.jsonl"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let op = env.path().join("fake-op");
+    std::fs::write(&op, "#!/bin/sh\nprintf 'test-api-key'\n").unwrap();
+    std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for language in [NotesLanguage::Ja, NotesLanguage::En] {
+        for bytes in [86 * 1024, 262_145] {
+            // [1]、空白、改行の5 bytesを含めて境界を固定する。
+            let extract = ReleaseExtract {
+                previous: "v0.1.0".to_owned(),
+                tag: "v0.2.0".to_owned(),
+                repo: "example/project".to_owned(),
+                items: vec!["a".repeat(bytes - 5)],
+                commit_links: vec![None],
+                section: None,
+                language,
+            };
+            let input = numbered_ai_input(
+                &extract
+                    .items
+                    .iter()
+                    .map(|item| scrub_for_ai(item))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(input.len(), bytes);
+            let transport = LinkTransport {
+                value: output("Improved.", &[("Improved.", &[1])]),
+                input: Default::default(),
+            };
+            let runtime = AiRuntime {
+                home: env.path().join("home"),
+                op_program: op.clone(),
+                op_service_account_token: Some("fixture".to_owned()),
+                transport: &transport,
+            };
+            let body = release_body(
+                &extract,
+                NotesPlan::Ai {
+                    audience: Audience::Private,
+                },
+                false,
+                &settings,
+                &runtime,
+            );
+            if bytes <= 262_144 {
+                assert!(
+                    matches!(body.source, BodySource::Ai { .. }),
+                    "{:?}",
+                    body.source
+                );
+                assert!(transport.input.borrow().is_some());
+            } else {
+                assert_eq!(
+                    body.source,
+                    BodySource::Fallback("input_rejected".to_owned())
+                );
+                assert!(transport.input.borrow().is_none());
+                assert_eq!(body.text, extract.render());
+            }
+        }
+    }
+}

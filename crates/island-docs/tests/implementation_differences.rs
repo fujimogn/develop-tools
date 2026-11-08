@@ -233,7 +233,7 @@ fn commit_link_syntax_is_checked_without_git_and_fenced_examples_are_ignored() {
     use island_docs::records::{ChangelogStyle, FindingKind, changelog_format_with_style};
     let document =
         |body: &str| format!("# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-09\n{body}\n");
-    let link = "[abcdef0](https://github.com/example/small/commit/abcdef0)";
+    let link = "[abcdef0](https://github.com/owner/repo/commit/abcdef0)";
     for style in [ChangelogStyle::Parenthesized, ChangelogStyle::Compact] {
         let item = match style {
             ChangelogStyle::Parenthesized => "- **成果（2026-09-30）**: 要約。",
@@ -245,6 +245,15 @@ fn commit_link_syntax_is_checked_without_git_and_fenced_examples_are_ignored() {
             format!("{item} {link} {link}"),
         ] {
             let findings = changelog_format_with_style(&document(&body), style);
+            assert!(findings.is_empty(), "{findings:?}");
+        }
+        for suffix in [
+            "[abc](https://github.com/owner/repo/commit/abc)",
+            "[abcdef0](../commit/abcdef0)",
+            "[abcdef0](https://github.com/owner/repo/commit/abcdef1)",
+        ] {
+            let findings =
+                changelog_format_with_style(&document(&format!("{item} {suffix}")), style);
             assert!(
                 findings
                     .iter()

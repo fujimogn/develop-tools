@@ -1932,6 +1932,39 @@ fn commit_links_reject_other_branch_rewritten_history_and_cherry_pick_source() {
 }
 
 #[test]
+fn commit_links_only_validate_the_first_line_suffix() {
+    let dir = linked_repo();
+    let d = dir.path();
+    write(
+        d,
+        "docs/adr/0033-example.md",
+        "---\nstatus: accepted\ndate: 2026-09-30\n---\n\n# ADR-0033: Example\n\nChosen option: A\n\n- Good: A\n- Bad: B\n- Neutral: C\n",
+    );
+    write(
+        d,
+        "docs/adr/README.md",
+        "# ADR\n\n- [0033](0033-example.md)\n",
+    );
+    write(d, "docs/evaluation.md", "# 観測評価\n");
+    write(
+        d,
+        "docs/README.md",
+        "# docs\n\n[ADR](adr/README.md) [観測評価](evaluation.md)\n",
+    );
+    git(d, &["add", "."]);
+    for reference in [
+        "[0033](docs/adr/0033-example.md)",
+        "[40705334273](https://github.com/owner/repo/actions/runs/40705334273)",
+        "[b0fa456d](https://github.com/owner/repo/commit/b0fa456d)、[観測評価](docs/evaluation.md)）。",
+        "通常の記録。\n  [b0fa456d](https://github.com/owner/repo/commit/b0fa456d)",
+    ] {
+        stage_commit_link(d, reference);
+        let out = run(d, &["--staged"]);
+        assert!(out.status.success(), "{reference}: {}", stderr(&out));
+    }
+}
+
+#[test]
 fn commit_links_require_origin_identity_and_canonical_syntax() {
     let dir = linked_repo();
     let d = dir.path();
@@ -1941,11 +1974,7 @@ fn commit_links_require_origin_identity_and_canonical_syntax() {
             commit_link(&oid).replace("example/small", "other/repo"),
             "origin",
         ),
-        (format!("{} 後置", commit_link(&oid)), "形式"),
-        (
-            format!("{} {}", commit_link(&oid), commit_link(&oid)),
-            "形式",
-        ),
+        (commit_link("123"), "形式"),
         (format!("[{oid}](../commit/{oid})"), "形式"),
         (
             commit_link(&oid).replace(&format!("[{oid}]"), "[abcdef0]"),

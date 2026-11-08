@@ -116,7 +116,7 @@ stdout は全検証と必須 usage 記録後の本文だけ、stderr の最後�
 ["release-notes", "render", "--from", "<確認済み前tag>", "--to", "<版commitの完全SHA>", "--tag", "<予定tag>", "--repo", "owner/repo"]
 ```
 
-版 commit 作成後・tag 作成前に shell 補間せず起動し、stdout/stderr/code を別々に捕捉します。非0・起動不可・timeout・本文や終端JSONの不備なら既存抽出へ戻し、`--no-ai` の再実行や再推論はしません。CLI の0だけでAI成功とは判定せず、既知 source/code の組と本文を検証します。採用本文は版SHAに結び付けて保存・再利用し、tag公開とprod操作のgateは呼び出し元が保持します。
+版 commit 作成後・tag 作成前に shell 補間せず起動し、stdout/stderr/code を別々に捕捉します。exit 1・起動不可・timeout・本文や終端 JSON の不備では、呼び出し元は tag 作成前に停止し、独自の抽出へ戻しません。AI の失敗（設定・費用・通信・出力）では render 自身が fallback 本文を exit 0 で返すため、呼び出し元はその本文をそのまま使います。CLI の0だけでAI成功とは判定せず、既知 source/code の組と本文を検証します。採用本文は版SHAに結び付けて保存・再利用し、再開時に `--no-ai` の再実行や再推論はしません。tag公開とprod操作のgateは呼び出し元が保持します。
 
 ### 宣言と既存 release
 
@@ -133,7 +133,7 @@ stdout は全検証と必須 usage 記録後の本文だけ、stderr の最後�
 | `audience` | `private` / `public`（強い出力検査） | ai のとき必須、既定なし |
 | `language` | `ja` / `en` | `ja` |
 
-AI は日付・SHA・URL・刻印メタデータを scrub し、番号付き入力で1回だけ送信します。`release <bump> --no-ai` も推論を抑止します。fallback 理由は `key_missing`、`config_invalid`、`dictionary_missing`、`input_rejected`、`budget_exceeded`、`api_timeout`、`api_failed`、`response_rejected`、`output_rejected:<position>.<kind>`、`usage_unrecorded`、`unknown_purpose` です。既存 `release` は tag 作成後に本文と出所を表示します。`release push` 前に確認してください。本文を変えるときは `git tag -f -a <tag> <commit>` で注釈 tag を作り直します。既存 tag の変更は人の承認と運用規約に従ってください。`language:ja/en` で推論の指示言語を切り替え、JSON 出力と検証の契約は共通です。fallback JSONL は clone 内の linked worktree で共有され、push されません。記録行は tag 作成の証明にはなりません。初回 release・changelog・`--no-ai`・AI 成功では fallback 行を追記しません。ログは `cat "$(git rev-parse --path-format=absolute --git-common-dir)/release-notes-fallback.jsonl"` で読めます。
+AI は日付・SHA・URL・刻印メタデータを scrub し、番号付き入力で1回だけ送信します。Release 本文の commit link は AI 出力の URL ではなく、Git で確認した入力項目の番号から付けます。commit link として扱うのは先頭の成果行の末尾の link だけで、項目の途中や継続行の commit への link は通常の参照です。`release <bump> --no-ai` も推論を抑止します。fallback 理由は `key_missing`、`config_invalid`、`dictionary_missing`、`input_rejected`、`budget_exceeded`、`api_timeout`、`api_failed`、`response_rejected`、`output_rejected:<position>.<kind>`、`usage_unrecorded`、`unknown_purpose` です。既存 `release` は tag 作成後に本文と出所を表示します。`release push` 前に確認してください。本文を変えるときは `git tag -f -a <tag> <commit>` で注釈 tag を作り直します。既存 tag の変更は人の承認と運用規約に従ってください。`language:ja/en` で推論の指示言語を切り替え、JSON 出力と検証の契約は共通です。fallback JSONL は clone 内の linked worktree で共有され、push されません。記録行は tag 作成の証明にはなりません。初回 release・changelog・`--no-ai`・AI 成功では fallback 行を追記しません。ログは `cat "$(git rev-parse --path-format=absolute --git-common-dir)/release-notes-fallback.jsonl"` で読めます。
 
 ### Environment settings
 

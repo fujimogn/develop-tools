@@ -708,20 +708,39 @@ pub fn extract_changelog_section(
     })
 }
 
-/// 節のトップレベルの箇条（行頭 `- `）。字下げした後続の行は空白 1 つで同じ項目へ連結する。
+/// 表示・AI入力用には字下げした継続行を空白1つで連結する。
 fn section_items(body: &str) -> Vec<String> {
+    raw_section_items(body)
+        .into_iter()
+        .map(|item| item.lines().map(str::trim).collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+impl ChangelogSection {
+    /// 表示用に連結する前の原文でdocsと同じparserを使う。
+    fn verified_links(
+        &self,
+        root: &Path,
+        end: &str,
+    ) -> Result<Vec<Option<VerifiedCommitLink>>, String> {
+        verified_links(root, end, &raw_section_items(&self.body))
+    }
+}
+
+/// 先頭行の空白と改行を保ち、commit linkの位置を変えない。
+fn raw_section_items(body: &str) -> Vec<String> {
     let mut items: Vec<String> = Vec::new();
     let mut open = false;
     for (_, line, fenced) in outside_fences(body) {
         if fenced {
             open = false;
         } else if line.starts_with("- ") {
-            items.push(line.trim_end().to_owned());
+            items.push(line.to_owned());
             open = true;
         } else if open && line.starts_with([' ', '\t']) && !line.trim().is_empty() {
             let item = items.last_mut().expect("open は箇条の後だけ");
-            item.push(' ');
-            item.push_str(line.trim());
+            item.push('\n');
+            item.push_str(line);
         } else {
             open = false;
         }
@@ -1019,7 +1038,7 @@ pub fn prepare_notes(
             &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
         )?;
         let section = prepared.section_at(root, &head)?;
-        verified_links(root, &head, &section.items)?;
+        section.verified_links(root, &head)?;
     } else {
         // 版 commit を作る前に、追記に含まれる刻印の構造エラーも検出する。
         prepared.extract(root, "HEAD")?;
@@ -1063,7 +1082,7 @@ impl PreparedNotes {
                 ],
             )?;
             let section = self.section_at(root, &end)?;
-            verified_links(root, &end, &section.items)?;
+            section.verified_links(root, &end)?;
             return Ok(ReleaseBody {
                 text: format!("{}\n", section.body),
                 source: BodySource::FirstRelease,
@@ -1133,8 +1152,9 @@ fn extract_declared(
             &format!("{end}^{{commit}}"),
         ],
     )?;
-    let ChangelogSection { body, items } = section_at(root, &end, tag)?;
-    let commit_links = verified_links(root, &end, &items)?;
+    let section = section_at(root, &end, tag)?;
+    let commit_links = section.verified_links(root, &end)?;
+    let ChangelogSection { body, items } = section;
     Ok(ReleaseExtract {
         previous: base.previous.clone(),
         tag: tag.to_owned(),

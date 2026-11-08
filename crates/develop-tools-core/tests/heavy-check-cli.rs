@@ -24,8 +24,16 @@ fn cli(ci: bool) -> Command {
 
 #[test]
 fn local_75_maps_to_one_but_ci_preserves_75() {
+    let home = support::fixture();
     for (ci, expected) in [(false, 1), (true, 75)] {
-        let output = supervisor::spawn(cli(ci).args(["--", "/bin/sh", "-c", "exit 75"]))
+        // Local admission must never acquire the real account's outer verify slot.
+        // The fixture runs the same core; CI still exercises the released CLI entry point.
+        let mut command = if ci {
+            cli(true)
+        } else {
+            fixture_cli(home.path(), false)
+        };
+        let output = supervisor::spawn(command.args(["--", "/bin/sh", "-c", "exit 75"]))
             .unwrap()
             .wait_with_output()
             .unwrap();

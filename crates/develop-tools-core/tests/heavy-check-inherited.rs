@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 
 const SLOT_ENV: &str = "DEVELOP_HEAVY_CHECK_SLOT_FD";
 
+// A concurrent fork can retain validate's temporary locked probe until exec,
+// even with CLOEXEC and distinct fixture roots. Keep probes and spawns apart.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn state(home: &Path) -> state::State {
     state::prepare(
         &support::Source {
@@ -172,6 +176,7 @@ fn assert_rejected(command: Command, home: &Path) {
 
 #[test]
 fn valid_inherited_slot_does_not_enqueue() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     let home = support::directory(&fixture.path().join("account"));
     let slot = Ticket::register(state(&home))
@@ -194,6 +199,7 @@ fn valid_inherited_slot_does_not_enqueue() {
 
 #[test]
 fn env_only_or_other_open_description_is_rejected() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for case in [
         "env-only",
         "closed",
@@ -247,6 +253,7 @@ fn env_only_or_other_open_description_is_rejected() {
 
 #[test]
 fn supervised_worker_does_not_create_second_group() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     let home = support::directory(&fixture.path().join("account"));
     let mut child = support::harness_command();
@@ -275,6 +282,7 @@ fn supervised_worker_does_not_create_second_group() {
 
 #[test]
 fn fake_control_channel_is_rejected_before_payload() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for mode in ["byte", "forged-peer", "eof", "regular"] {
         let fixture = Fixture::new();
         let home = support::directory(&fixture.path().join("account"));
@@ -286,6 +294,7 @@ fn fake_control_channel_is_rejected_before_payload() {
 
 #[test]
 fn fixture_child_closes_identity_without_unlocking_parent() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let fixture = Fixture::new();
     let home = support::directory(&fixture.path().join("account"));
     let slot = Ticket::register(state(&home))
@@ -318,6 +327,7 @@ fn fixture_child_closes_identity_without_unlocking_parent() {
 
 #[test]
 fn rejected_unlocked_description_does_not_take_the_slot() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     use develop_tools_core::heavy_check::inherited::InheritedSlot;
     let fixture = Fixture::new();
     let home = support::directory(&fixture.path().join("account"));
@@ -337,6 +347,7 @@ fn rejected_unlocked_description_does_not_take_the_slot() {
 
 #[test]
 fn control_handshake_validates_version_group_and_short_frames() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     use std::os::unix::net::UnixStream;
     for mode in ["valid", "version", "group", "short"] {
         let fixture = Fixture::new();

@@ -2511,7 +2511,10 @@ fn fixed_render_private_dictionary_missing_keeps_ai_success() {
 /// purpose の入力上限を越える本文は推論せず input_rejected fallback にする。
 #[test]
 fn fixed_render_rejects_input_over_limit_without_sending() {
-    let item = format!("- **巨大な項目**: {}", "x".repeat(70_000));
+    let limit = island_llm::purpose::find("release-notes")
+        .unwrap()
+        .max_input_bytes;
+    let item = format!("- **巨大な項目**: {}", "x".repeat(limit + 1));
     let fixture = notes_fixture(Some(AI_PRIVATE), Some(&item));
     let fixed = fixed_notes(&fixture);
     let env = NotesEnv::new(Some(&full_settings()));

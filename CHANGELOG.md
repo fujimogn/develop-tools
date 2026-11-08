@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.12] - 2026-11-06
+
+### Changed
+
+- Check only the link at the end of an entry's first line as the CHANGELOG commit link. Commit links in the middle of an entry or on continuation lines are ordinary references, and labels made only of digits (such as ADR or run numbers) are no longer taken for commits. Release bodies apply the same rule to the original first line.
+- Raise the AI release-note input capacity to 256 KiB. Cost estimates now use the higher price tier when the input may exceed 100K tokens, the per-request cost limit stays at USD 1, and the JSON output budget is larger.
+- Clarify when release-note callers must stop before tagging, how to reuse render fallback bodies, and how verified input items supply trailing commit links.
+
+### Fixed
+
+- Fix `run-heavy-check` on Linux leaving zombies of descendants that moved to another process group; the supervisor now reaps every adopted child while it runs. The slot is still held until the worker group is confirmed gone.
+- Fix the heavy-check handshake on macOS failing with `EINVAL` when the supervisor closes the socket right after the acknowledgement.
+
 ## [0.6.11] - 2026-11-06
 
 ### Fixed

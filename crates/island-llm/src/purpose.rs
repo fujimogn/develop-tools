@@ -19,6 +19,26 @@ pub enum Thinking {
     Disabled,
 }
 
+/// 入力tokenの見積もりが境界を超えたとき、入力・出力の両方に適用する単価。
+#[derive(Debug, Clone, Copy)]
+pub struct PriceTier {
+    pub above_input_tokens: u64,
+    pub input_micro_usd_per_mtok: u64,
+    pub output_micro_usd_per_mtok: u64,
+}
+
+const RELEASE_NOTES_MAX_INPUT_BYTES: usize = 262_144;
+// 300項目×日本語40文字のJSON（44,436 bytes）のtoken上限見積もりを確保する。
+const RELEASE_NOTES_MAX_TOKENS: u32 = 48_000;
+
+// Anthropic claude-api/shared/models.md:87（2026-11-06確認）:
+// 100K token以下はUSD 0.10/0.50、超過はUSD 0.50/2.50 per MTok。
+const RELEASE_NOTES_PRICE_TIER: PriceTier = PriceTier {
+    above_input_tokens: 100_000,
+    input_micro_usd_per_mtok: 500_000,
+    output_micro_usd_per_mtok: 2_500_000,
+};
+
 #[derive(Debug, Clone, Copy)]
 pub struct Purpose {
     pub name: &'static str,
@@ -30,6 +50,7 @@ pub struct Purpose {
     /// 1M token あたりの単価（micro-USD）。
     pub input_micro_usd_per_mtok: u64,
     pub output_micro_usd_per_mtok: u64,
+    pub price_tier: Option<PriceTier>,
     /// 1 回の費用の上限（micro-USD）。見積もりが超えたら送らない。
     pub max_cost_micro_usd: u64,
     pub output: Shape,
@@ -42,8 +63,17 @@ impl Purpose {
     /// 入力 token は「指示文 + 入力」の byte 数を超えない。出力は `max_tokens` を上限に取る。
     pub fn estimate_micro_usd(&self, input_bytes: usize) -> u64 {
         let input_tokens = (self.instruction.len() + input_bytes) as u64;
-        let total = input_tokens * self.input_micro_usd_per_mtok
-            + u64::from(self.max_tokens) * self.output_micro_usd_per_mtok;
+        let (input_rate, output_rate) = match self.price_tier {
+            Some(tier) if input_tokens > tier.above_input_tokens => (
+                tier.input_micro_usd_per_mtok,
+                tier.output_micro_usd_per_mtok,
+            ),
+            _ => (
+                self.input_micro_usd_per_mtok,
+                self.output_micro_usd_per_mtok,
+            ),
+        };
+        let total = input_tokens * input_rate + u64::from(self.max_tokens) * output_rate;
         total.div_ceil(1_000_000)
     }
 }
@@ -57,6 +87,7 @@ pub const PURPOSES: &[Purpose] = &[
         thinking: None,
         input_micro_usd_per_mtok: 1_000_000,
         output_micro_usd_per_mtok: 5_000_000,
+        price_tier: None,
         max_cost_micro_usd: 1_000_000,
         output: Shape::Line,
         instruction: "以下の保守材料から人が確認する論点を日本語で一行に要約してください。材料にない事実は加えず、対応の実行を提案しないでください。\n\n",
@@ -64,12 +95,13 @@ pub const PURPOSES: &[Purpose] = &[
     Purpose {
         name: "release-notes",
         model: "claude-haiku-5-5",
-        // 100K token を超えると単価が上がるため、その手前に収める。
-        max_input_bytes: 65_536,
-        max_tokens: 16_000,
+        // 入力上限と料金段は独立。長い入力は上位単価で費用上限を検査する。
+        max_input_bytes: RELEASE_NOTES_MAX_INPUT_BYTES,
+        max_tokens: RELEASE_NOTES_MAX_TOKENS,
         thinking: Some(Thinking::Disabled),
         input_micro_usd_per_mtok: 100_000,
         output_micro_usd_per_mtok: 500_000,
+        price_tier: Some(RELEASE_NOTES_PRICE_TIER),
         max_cost_micro_usd: 1_000_000,
         output: Shape::Json,
         instruction: "以下は番号付きの変更項目です。利用者向けの Release の本文を作ってください。\n\
@@ -83,12 +115,13 @@ pub const PURPOSES: &[Purpose] = &[
     Purpose {
         name: "release-notes-en",
         model: "claude-haiku-5-5",
-        // 100K token を超えると単価が上がるため、その手前に収める。
-        max_input_bytes: 65_536,
-        max_tokens: 16_000,
+        // 入力上限と料金段は独立。長い入力は上位単価で費用上限を検査する。
+        max_input_bytes: RELEASE_NOTES_MAX_INPUT_BYTES,
+        max_tokens: RELEASE_NOTES_MAX_TOKENS,
         thinking: Some(Thinking::Disabled),
         input_micro_usd_per_mtok: 100_000,
         output_micro_usd_per_mtok: 500_000,
+        price_tier: Some(RELEASE_NOTES_PRICE_TIER),
         max_cost_micro_usd: 1_000_000,
         output: Shape::Json,
         instruction: "The following are numbered change items. Write the Release body in English for users.\n\

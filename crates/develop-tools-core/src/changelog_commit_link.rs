@@ -20,9 +20,16 @@ pub struct CommitLink<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MalformedCommitLink;
 
-/// Parse one complete achievement item (first line and any continuation lines).
+/// Inspect only the first-line suffix; other links are ordinary references.
 pub fn parse(item: &str) -> Result<Option<CommitLink<'_>>, MalformedCommitLink> {
-    let visible = visible_bytes(item);
+    let first_line = item
+        .split('\n')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('\r');
+    let suffix_end = first_line.trim_end_matches([' ', '\t']).len();
+    let masked = visible_bytes(item);
+    let visible = &masked[..first_line.len()];
     let mut candidate = None;
     let mut opening = None;
     let mut index = 0;
@@ -41,16 +48,13 @@ pub fn parse(item: &str) -> Result<Option<CommitLink<'_>>, MalformedCommitLink> 
                     .windows(COMMIT_PATH.len())
                     .any(|w| w == COMMIT_PATH.as_bytes())
                     || label.is_some_and(|label| {
-                        !label.is_empty() && label.iter().all(u8::is_ascii_hexdigit)
+                        label.iter().all(u8::is_ascii_hexdigit)
+                            && label.iter().any(u8::is_ascii_alphabetic)
                     });
-                if is_candidate {
+                let link_end = end + usize::from(visible.get(end) == Some(&b')'));
+                if is_candidate && link_end == suffix_end {
                     let start = opening.ok_or(MalformedCommitLink)?;
-                    if candidate
-                        .replace(start..end + usize::from(visible.get(end) == Some(&b')')))
-                        .is_some()
-                    {
-                        return Err(MalformedCommitLink);
-                    }
+                    candidate = Some(start..link_end);
                 }
                 opening = None;
                 index = end;
@@ -63,11 +67,6 @@ pub fn parse(item: &str) -> Result<Option<CommitLink<'_>>, MalformedCommitLink> 
     let Some(range) = candidate else {
         return Ok(None);
     };
-    let first_line = item
-        .split('\n')
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('\r');
     let start = range.start;
     if range.end != first_line.len()
         || start == 0
@@ -206,6 +205,27 @@ mod tests {
     }
 
     #[test]
+    fn references_outside_the_suffix_and_numeric_labels_are_ordinary() {
+        let valid = link("b0fa456d");
+        for item in [
+            "- ADR [0033](docs/adr/0033-example.md) を記録。".to_owned(),
+            "- ADR [0033](docs/adr/0033-example.md)".to_owned(),
+            "- run [40705334273](https://github.com/owner/repo/actions/runs/40705334273) を観測。"
+                .to_owned(),
+            "- run [40705334273](https://github.com/owner/repo/actions/runs/40705334273)"
+                .to_owned(),
+            format!("- 成果。{valid}、[観測評価](docs/evaluation.md)）。"),
+            format!("- 成果。 {valid} 注記"),
+            format!("- 成果。 {valid}。"),
+            format!("- 成果。\n  {valid}"),
+        ] {
+            assert_eq!(parse(&item), Ok(None), "{item}");
+        }
+        let item = format!("- 参照 {valid} 成果。 {}", link("c16d9a5"));
+        assert_eq!(parse(&item).unwrap().unwrap().sha, "c16d9a5");
+    }
+
+    #[test]
     fn canonical_suffix_keeps_borrowed_identity_and_original_byte_range() {
         for sha in [
             "c16d9a5",
@@ -243,13 +263,11 @@ mod tests {
             "- 成果。 [c16d9a5](docs/adr.md)".into(),
             "- 成果。 [commit](https://github.com/a/b/commit/c16d9a5".into(),
             "- 成果。 ](https://github.com/a/b/commit/c16d9a5".into(),
-            format!("- 成果。 {valid} {valid}"),
-            format!("- 成果。 {valid} 注記"),
-            format!("- 成果。 {valid}。"),
-            format!("- 成果。\n  {valid}"),
             format!("- 成果。{valid}"),
             format!("- 成果。  {valid}"),
             format!("- 成果。\t{valid}"),
+            format!("- 成果。 {valid} "),
+            format!("- 成果。 {valid}\t"),
         ] {
             assert_eq!(parse(&item), Err(MalformedCommitLink), "{item}");
         }

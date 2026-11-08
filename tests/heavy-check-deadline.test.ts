@@ -35,7 +35,17 @@ async function eventually(check: () => boolean, description: string): Promise<vo
 }
 
 function start(args: string[]) {
+  // Bun inherits only the configured stdio descriptors. Remove the matching
+  // capability labels too; fixture admission must never consume an outer slot.
+  const env = { ...process.env }
+  for (const key of [
+    'DEVELOP_HEAVY_CHECK_SLOT_FD',
+    'DEVELOP_HEAVY_CHECK_CONTROL_FD',
+    'DEVELOP_HEAVY_CHECK_EVENT_FD',
+    'DEVELOP_HEAVY_CHECK_RESULT_FD',
+  ]) Reflect.deleteProperty(env, key)
   const child = Bun.spawn([harness, ...args], {
+    env,
     stdin: 'pipe',
     stdout: 'pipe',
     stderr: 'inherit',

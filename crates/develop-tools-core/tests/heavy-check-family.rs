@@ -218,6 +218,66 @@ impl Drop for Runner {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn adopted_other_group_is_reaped_while_family_remains_live() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let root = Fixture::new();
+    let home = support::directory(&root.path().join("account"));
+    let mut runner = Runner::start(&home, "adopted-orphan");
+    runner.until("primary-exited");
+    // Both the group member keeping the slot and the escaped orphan report PID.
+    while runner
+        .seen
+        .borrow()
+        .iter()
+        .filter(|line| line.starts_with("descendant:"))
+        .count()
+        < 2
+    {
+        runner.line();
+    }
+    let mut escaped = None;
+    for line in runner.seen.borrow().iter() {
+        if let Some(pid) = line.strip_prefix("descendant:") {
+            let pid = pid.parse::<i32>().unwrap();
+            if unsafe { libc::getpgid(pid) } == pid {
+                escaped = Some(pid);
+            }
+        }
+    }
+    let escaped = escaped.expect("separate process group descendant");
+    let proc = std::path::PathBuf::from(format!("/proc/{escaped}/status"));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status = std::fs::read_to_string(&proc).unwrap();
+        if status.lines().any(|line| {
+            line.strip_prefix("PPid:")
+                .is_some_and(|parent| parent.trim() == runner.child.id().to_string())
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "orphan was not adopted");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(home.join("exit-orphan"), b"exit").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while proc.exists() && Instant::now() < deadline {
+        runner.alive();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !proc.exists(),
+        "adopted other-group child remained a zombie"
+    );
+    runner.alive();
+    assert_eq!(
+        unsafe { libc::kill(-runner.group.unwrap(), libc::SIGKILL) },
+        0
+    );
+    assert_eq!(runner.exit(), 0, "orphan exit replaced worker exit");
+}
+
+#[test]
 fn primary_exit_keeps_descendant_slot() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = Fixture::new();

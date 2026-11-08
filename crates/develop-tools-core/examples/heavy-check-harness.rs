@@ -362,6 +362,17 @@ fn family_main() -> i32 {
         if mode == "short" {
             return 0;
         }
+        if mode == "adopted-orphan" {
+            use std::os::unix::process::CommandExt;
+            let mut escaped = Command::new(&executable);
+            escaped
+                .arg("--descendant")
+                .arg("escaped-orphan")
+                .arg(inherited.to_string())
+                .arg(&home)
+                .process_group(0);
+            drop(supervisor::spawn(&mut escaped).unwrap());
+        }
         let mut command = Command::new(executable);
         command
             .arg("--descendant")
@@ -382,6 +393,18 @@ fn family_main() -> i32 {
         } else {
             0
         };
+    }
+    if mode == "escaped-orphan" {
+        unsafe {
+            libc::close(inherited);
+        }
+        println!("descendant:{}", std::process::id());
+        io::stdout().flush().unwrap();
+        // The test releases this child only after verifying Linux adoption.
+        while !home.join("exit-orphan").exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        return 42;
     }
     if mode == "closed-slot" || mode == "exit130" || mode == "exit137" {
         unsafe {

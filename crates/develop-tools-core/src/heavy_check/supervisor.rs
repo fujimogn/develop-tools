@@ -85,9 +85,35 @@ impl SlotSender {
             return Err(handshake_error());
         }
         (&self.0).write_all(&frame)?;
-        self.0.set_read_timeout(None)?;
-        self.0.set_write_timeout(None)?;
-        Ok(())
+        self.clear_handshake_timeouts()
+    }
+    fn clear_handshake_timeouts(&self) -> io::Result<()> {
+        let result = self
+            .0
+            .set_read_timeout(None)
+            .and_then(|()| self.0.set_write_timeout(None));
+        #[cfg(target_os = "macos")]
+        if result
+            .as_ref()
+            .is_err_and(|e| e.raw_os_error() == Some(libc::EINVAL))
+        {
+            // Darwin rejects setsockopt after the supervisor consumes our ACK
+            // and closes. Only an observed EOF makes those timeouts irrelevant;
+            // all other errors (including unexpected unread data) still fail.
+            let mut byte = 0u8;
+            let received = unsafe {
+                libc::recv(
+                    self.fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if received == 0 {
+                return Ok(());
+            }
+        }
+        result
     }
     pub fn fd(&self) -> i32 {
         self.0.as_raw_fd()
@@ -384,16 +410,21 @@ impl Family {
         }
         Ok(())
     }
-    /// Reap only this family. Linux subreaper adoption includes orphaned
-    /// grandchildren; on macOS init reaps orphans and group disappearance is
-    /// still required. A zombie/EPERM is never classified as a stopped group.
+    /// Linux subreapers also adopt descendants that left the worker group;
+    /// reap those throughout supervision without extending the slot lifetime.
+    /// On macOS init reaps orphans, so only the worker group is ours to reap.
+    /// Group disappearance is still required before releasing the slot.
     fn stopped(&mut self) -> io::Result<bool> {
         if self.slot.is_none() {
             self.slot = self.receiver.receive()?;
         }
         loop {
             let mut status = 0;
-            let pid = unsafe { libc::waitpid(-self.group, &mut status, libc::WNOHANG) };
+            #[cfg(target_os = "linux")]
+            let target = -1;
+            #[cfg(not(target_os = "linux"))]
+            let target = -self.group;
+            let pid = unsafe { libc::waitpid(target, &mut status, libc::WNOHANG) };
             if pid > 0 {
                 if pid == self.worker.id() as i32 {
                     self.worker_signal = libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status));
@@ -589,6 +620,49 @@ fn peer_pid(socket: &UnixStream) -> io::Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_handshake_cleanup_accepts_closed_supervisor() {
+        let (mut peer, stream) = UnixStream::pair().unwrap();
+        let sender = SlotSender(stream);
+        sender.0.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).unwrap();
+        sender.0.set_write_timeout(Some(HANDSHAKE_TIMEOUT)).unwrap();
+        let frame = handshake_frame(unsafe { libc::getpid() }, unsafe { libc::getpgrp() });
+        (&sender.0).write_all(&frame).unwrap();
+        let mut ack = [0; 16];
+        peer.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, frame);
+        // The supervisor can consume the ACK and close before this cleanup.
+        drop(peer);
+        sender.clear_handshake_timeouts().unwrap();
+    }
+
+    #[test]
+    fn sender_handshake_cleanup_clears_live_socket_timeouts() {
+        let (_peer, stream) = UnixStream::pair().unwrap();
+        let sender = SlotSender(stream);
+        sender.0.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).unwrap();
+        sender.0.set_write_timeout(Some(HANDSHAKE_TIMEOUT)).unwrap();
+        sender.clear_handshake_timeouts().unwrap();
+        assert_eq!(sender.0.read_timeout().unwrap(), None);
+        assert_eq!(sender.0.write_timeout().unwrap(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sender_handshake_cleanup_does_not_hide_unread_data() {
+        let (mut peer, stream) = UnixStream::pair().unwrap();
+        let sender = SlotSender(stream);
+        peer.write_all(b"unexpected").unwrap();
+        drop(peer);
+        assert_eq!(
+            sender
+                .clear_handshake_timeouts()
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+    }
 
     #[test]
     fn completed_handshake_accepts_closed_peer() {

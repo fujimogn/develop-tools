@@ -174,7 +174,7 @@ pub fn changelog_format(text: &str) -> Vec<Finding> {
     changelog_format_with_style(text, ChangelogStyle::Parenthesized)
 }
 
-/// 成果項目ごとの任意link。構文だけを解析し、Gitには触れない。
+/// 成果項目の先頭行末尾だけを任意commit linkとして解析し、Gitには触れない。
 /// fence内のトップレベル風の行を項目境界にしない。
 pub fn changelog_commit_links(
     text: &str,

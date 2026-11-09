@@ -72,6 +72,27 @@ fn notes_args(root: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
+fn origin_errors_do_not_expose_credentials() {
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["tag", "v0.1.0"]);
+    commit(root, "# Changelog\n\n## 2026-11\n- **追加**\n", "end");
+    let end = git(root, &["rev-parse", "HEAD"]);
+    git(root, &["tag", "v0.2.0"]);
+    for origin in [
+        "https://x-access-token:secret-token@github.com/example/project.git",
+        "https://github.com/example/project/secret-token.git",
+    ] {
+        git(root, &["remote", "set-url", "origin", origin]);
+        let error = extract_release(root, &end, "v0.2.0", None).unwrap_err();
+        assert!(!error.contains("secret-token"), "{error}");
+        let output = notes(root, "v0.2.0");
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("secret-token"));
+    }
+}
+
+#[test]
 fn previous_tag_is_required_even_for_the_first_release() {
     let dir = fixture();
     git(dir.path(), &["tag", "v0.1.0"]);
@@ -1008,6 +1029,77 @@ fn scrub_preserves_body_metadata_and_obsolete_parenthesized_stamps() {
     }
 }
 
+#[test]
+fn body_bold_and_version_text_are_not_treated_as_a_title_stamp() {
+    let item = "- **成果（2026-11-05）**: 前版の **修正** 2026-11-04/v1.2.2: の続き";
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["tag", "v1.2.2"]);
+    commit(
+        root,
+        &format!("# Changelog\n\n## 2026-11\n{item}\n\n## 2026-09\n- **以前の項目**\n"),
+        "body bold fixture",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        extract_release(root, &end, "v1.2.3", None).unwrap().items,
+        [item]
+    );
+    assert_eq!(
+        scrub_for_ai(item),
+        "- **成果**: 前版の **修正** 2026-11-04/v1.2.2: の続き"
+    );
+}
+
+#[test]
+fn body_bold_stamp_does_not_override_legacy_title_version() {
+    let item = "- **題** 2026-11-05/v1.2.3: 本文 **強調（2026-11-05/v1.2.2）**: 続き";
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["tag", "v1.2.2"]);
+    commit(
+        root,
+        &format!("# Changelog\n\n## 2026-11\n{item}\n\n## 2026-09\n- **以前の項目**\n"),
+        "body bold version fixture",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        extract_release(root, &end, "v1.2.3", None).unwrap().items,
+        [item]
+    );
+    assert_eq!(
+        scrub_for_ai(item),
+        "- **題**: 本文 **強調（2026-11-05/v1.2.2）**: 続き"
+    );
+}
+
+#[test]
+fn legacy_title_with_space_does_not_confuse_ai_scrub() {
+    assert_eq!(
+        scrub_for_ai("- ** 題** 2026-11-05/v1.2.3: 本文"),
+        "- ** 題**: 本文"
+    );
+}
+
+#[test]
+fn stamped_items_keep_supplement_in_ai_and_exclude_another_version_without_release_url() {
+    assert_eq!(
+        scrub_for_ai(
+            "- **題（2026-11-05/[v1.2.3](https://github.com/owner/repo/releases/tag/v1.2.3)、補足）**: 本文"
+        ),
+        "- **題（補足）**: 本文"
+    );
+    assert_eq!(
+        scrub_for_ai("- **過去（2026-11-04/v1.2.2）**: 本文"),
+        "- **過去**: 本文"
+    );
+    let diff = "@@ -1,0 +1,3 @@\n+## 2026-11\n+- **今回（2026-11-05/⏳）**: 本文\n+- **過去（2026-11-04/v1.2.2）**: GitHub Release が無い版\n";
+    assert_eq!(
+        develop_release::release_notes::extract_changelog_additions(diff, "v1.2.3"),
+        ["- **今回（2026-11-05/⏳）**: 本文"]
+    );
+}
+
 fn fixed_manifest(root: &Path, path: &str, notes: &str) {
     let file = root.join(path);
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -1031,6 +1123,52 @@ fn fixed_fixture() -> (tempfile::TempDir, String) {
     );
     let end = git(root, &["rev-parse", "HEAD"]);
     (dir, end)
+}
+
+#[test]
+fn fixed_stamped_render_uses_explicit_repo_with_token_origin() {
+    use develop_release::release_notes::FixedNotes;
+    let dir = fixture();
+    let root = dir.path();
+    git(
+        root,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://x-access-token:token@github.com/example/project.git",
+        ],
+    );
+    annotate(root, "v0.1.0");
+    let manifest = root.join(".config/develop-tools.json");
+    std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    std::fs::write(&manifest, r#"{"release":{"changelogStamp":true,"notes":{"mode":"changelog-additions","language":"en"}}}"#).unwrap();
+    git(root, &["add", ".config/develop-tools.json"]);
+    commit(
+        root,
+        "# Changelog\n\n## 2026-11\n- **追加（2026-11-05/[v0.3.0](https://github.com/example/project/releases/tag/v0.3.0)）**: 本文\n",
+        "end",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    let fixed =
+        FixedNotes::resolve(root, "v0.1.0", &end, "v0.3.0", Some("example/project")).unwrap();
+    assert_eq!(fixed.extract().unwrap().repo, "example/project");
+    assert_eq!(
+        extract_release(root, &end, "v0.3.0", Some("example/project"))
+            .unwrap()
+            .repo,
+        "example/project"
+    );
+    let mut args = render_args(&end);
+    args.extend(["--repo", "example/project"]);
+    let output = notes_args(root, &args);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("example/project/compare/"));
 }
 
 #[test]
@@ -1298,6 +1436,105 @@ fn legacy_stamp_fixture_selects_items_without_writing_changelog() {
     let nested = "  - **入れ子（未リリース）**: 本文";
     // scrub の既存の空白正規化だけを許す。
     assert_eq!(scrub_for_ai(nested), nested.trim_start());
+}
+
+#[test]
+fn legacy_manifest_does_not_block_release_notes_extraction() {
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["tag", "v0.1.0"]);
+    std::fs::write(
+        root.join(".develop-tools.json"),
+        r#"{"release":{"oldField":"legacy"},"platforms":"old"}"#,
+    )
+    .unwrap();
+    git(root, &["add", ".develop-tools.json"]);
+    commit(
+        root,
+        "# Changelog\n\n## 2026-11\n- **旧形** 2026-11-05 ⏳: 本文\n\n## 2026-09\n- **以前の項目**\n",
+        "legacy manifest fixture",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        extract_release(root, &end, "v0.2.0", None).unwrap().items,
+        ["- **旧形** 2026-11-05 ⏳: 本文"]
+    );
+}
+
+#[test]
+fn declared_stamp_rejects_legacy_compact_titles_in_release_notes() {
+    for path in [".config/develop-tools.json", ".develop-tools.json"] {
+        let dir = fixture();
+        let root = dir.path();
+        git(root, &["tag", "v0.1.0"]);
+        std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+        std::fs::write(root.join(path), r#"{"release":{"changelogStamp":true}}"#).unwrap();
+        git(root, &["add", path]);
+        commit(
+            root,
+            "# Changelog\n\n## 2026-11\n- **旧形** 2026-11-05 ⏳: 本文\n\n## 2026-09\n- **以前の項目**\n",
+            "declared legacy fixture",
+        );
+        let end = git(root, &["rev-parse", "HEAD"]);
+        assert!(
+            extract_release(root, &end, "v0.2.0", None)
+                .unwrap_err()
+                .contains("changelog_stamp_invalid"),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn release_notes_stamp_declaration_comes_from_endpoint_not_worktree() {
+    let dir = fixture();
+    let root = dir.path();
+    git(root, &["tag", "v0.1.0"]);
+    std::fs::create_dir_all(root.join(".config")).unwrap();
+    let manifest = root.join(".config/develop-tools.json");
+    std::fs::write(&manifest, r#"{"release":{"changelogStamp":true}}"#).unwrap();
+    git(root, &["add", ".config/develop-tools.json"]);
+    commit(
+        root,
+        "# Changelog\n\n## 2026-11\n- **旧形** 2026-11-05 ⏳: 本文\n\n## 2026-09\n- **以前の項目**\n",
+        "declared endpoint fixture",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(&manifest, r#"{"release":{"changelogStamp":false}}"#).unwrap();
+    assert!(
+        extract_release(root, &end, "v0.2.0", None)
+            .unwrap_err()
+            .contains("changelog_stamp_invalid")
+    );
+}
+
+#[test]
+fn malformed_endpoint_stamp_declaration_fails_release_notes() {
+    for (raw, expected) in [
+        (
+            r#"{"release":{"changelogStamp":"true"}}"#,
+            "release.changelogStamp は boolean",
+        ),
+        (r#"{"release":{"changelogStamp":true}"#, "JSON が不正"),
+    ] {
+        let dir = fixture();
+        let root = dir.path();
+        git(root, &["tag", "v0.1.0"]);
+        std::fs::create_dir_all(root.join(".config")).unwrap();
+        std::fs::write(root.join(".config/develop-tools.json"), raw).unwrap();
+        git(root, &["add", ".config/develop-tools.json"]);
+        commit(
+            root,
+            "# Changelog\n\n## 2026-11\n- **新形（2026-11-05/⏳）**: 本文\n\n## 2026-09\n- **以前の項目**\n",
+            "malformed endpoint fixture",
+        );
+        let end = git(root, &["rev-parse", "HEAD"]);
+        assert!(
+            extract_release(root, &end, "v0.2.0", None)
+                .unwrap_err()
+                .contains(expected)
+        );
+    }
 }
 
 #[test]

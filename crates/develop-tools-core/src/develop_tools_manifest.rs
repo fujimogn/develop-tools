@@ -121,6 +121,8 @@ pub struct CiDeclaration {
 #[derive(Debug, PartialEq, Eq)]
 pub struct RustCi {
     pub workspaces: Vec<String>,
+    pub test_runner: String,
+    pub cache_toolchain: bool,
     /// 区画の Rust job の最後に `run:` へそのまま置く 1 行の command。
     pub extra_steps: Vec<String>,
 }
@@ -271,9 +273,27 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
     let rust = match ci.get("rust") {
         None => None,
         Some(rust) => {
-            let rust = stack(rust, "ci.rust", &["workspaces", "extraSteps"])?;
+            let rust = stack(
+                rust,
+                "ci.rust",
+                &["workspaces", "extraSteps", "testRunner", "cacheToolchain"],
+            )?;
+            let test_runner = match rust.get("testRunner") {
+                None => "cargo",
+                Some(Value::String(value)) if matches!(value.as_str(), "cargo" | "nextest") => {
+                    value.as_str()
+                }
+                Some(_) => return Err("ci.rust.testRunner は cargo または nextest にする".into()),
+            };
+            let cache_toolchain = match rust.get("cacheToolchain") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return Err("ci.rust.cacheToolchain は真偽値でなければなりません".into()),
+            };
             Some(RustCi {
                 workspaces: directories(rust, "ci.rust", "workspaces")?,
+                test_runner: test_runner.to_owned(),
+                cache_toolchain,
                 extra_steps: extra_steps(rust)?,
             })
         }
@@ -1086,6 +1106,8 @@ mod tests {
                 record_only_skip: false,
                 rust: Some(RustCi {
                     workspaces: vec!["tools".into(), "packages/cli".into()],
+                    test_runner: "cargo".into(),
+                    cache_toolchain: false,
                     extra_steps: vec!["cargo xtask record-root".into()],
                 }),
                 bun: Some(BunCi {
@@ -1119,6 +1141,43 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(ci_install.bun.map(|bun| bun.ci_install), Some(true));
+    }
+
+    #[test]
+    fn rust_ci_runner_and_toolchain_cache_are_strict_opt_ins() {
+        for (runner, cache) in [
+            (None, None),
+            (Some("cargo"), Some(false)),
+            (Some("nextest"), Some(true)),
+        ] {
+            let mut rust = json!({"workspaces": ["tools"]});
+            if let Some(runner) = runner {
+                rust["testRunner"] = json!(runner);
+            }
+            if let Some(cache) = cache {
+                rust["cacheToolchain"] = json!(cache);
+            }
+            let declared = ci_declaration(&json!({"ci": {"rust": rust}}))
+                .unwrap()
+                .unwrap();
+            let rust = declared.rust.unwrap();
+            assert_eq!(rust.test_runner, runner.unwrap_or("cargo"));
+            assert_eq!(rust.cache_toolchain, cache.unwrap_or(false));
+        }
+        for invalid in [json!(null), json!(true), json!(0), json!("other")] {
+            let error = ci_declaration(
+                &json!({"ci": {"rust": {"workspaces": ["tools"], "testRunner": invalid}}}),
+            )
+            .unwrap_err();
+            assert!(error.contains("ci.rust.testRunner"), "{error}");
+        }
+        for invalid in [json!(null), json!("true"), json!(0)] {
+            let error = ci_declaration(
+                &json!({"ci": {"rust": {"workspaces": ["tools"], "cacheToolchain": invalid}}}),
+            )
+            .unwrap_err();
+            assert!(error.contains("ci.rust.cacheToolchain"), "{error}");
+        }
     }
 
     #[test]

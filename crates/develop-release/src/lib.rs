@@ -272,9 +272,9 @@ pub(crate) fn is_date(text: &str) -> bool {
         })
 }
 
-/// 短い形のトップレベル項目の未リリースの印を `/v<版>` に書き換える。
+/// トップレベル項目の未リリース印を Release link へ書き換える。
 /// 日付・本文・改行は保ち、入れ子・見出し・code fence の中は触らない。
-pub fn stamp_changelog(text: &str, version: Version) -> (String, usize) {
+pub fn stamp_changelog(text: &str, version: Version, repo: &str) -> (String, usize) {
     use develop_tools_core::changelog_title::{self, Stamp};
 
     let mut count = 0;
@@ -288,8 +288,9 @@ pub fn stamp_changelog(text: &str, version: Version) -> (String, usize) {
         };
         if let Some(parsed) = parsed {
             out.push_str(&line[..parsed.stamp_range.start]);
-            out.push_str(changelog_title::RELEASED_PREFIX);
-            out.push_str(&version.to_string());
+            out.push_str(&format!(
+                "/[v{version}](https://github.com/{repo}/releases/tag/v{version})"
+            ));
             out.push_str(&line[parsed.stamp_range.end..]);
             count += 1;
             continue;

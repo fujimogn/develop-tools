@@ -127,13 +127,15 @@ pub fn todo_format(text: &str) -> Vec<Finding> {
 pub enum ChangelogStyle {
     #[default]
     Parenthesized,
+    Stamped,
+    /// 旧形式の比較試験用。宣言からは選ばない。
     Compact,
 }
 
 impl ChangelogStyle {
     pub fn from_stamp(enabled: bool) -> Self {
         if enabled {
-            Self::Compact
+            Self::Stamped
         } else {
             Self::Parenthesized
         }
@@ -305,9 +307,12 @@ pub fn changelog_format_with_style(text: &str, style: ChangelogStyle) -> Vec<Fin
         };
         let parsed = match style {
             ChangelogStyle::Parenthesized => parse_changelog_item(line),
-            ChangelogStyle::Compact => develop_core::changelog_title::parse(line)
+            ChangelogStyle::Stamped => develop_core::changelog_title::parse(line)
                 .map(|item| item.date.to_owned())
-                .ok_or_else(|| "この repo は release.changelogStamp を宣言しているので - **題** YYYY-MM-DD ⏳: 要約 か - **題** YYYY-MM-DD/vX.Y.Z: 要約 にしてください".to_owned()),
+                .ok_or_else(|| "この repo は release.changelogStamp を宣言しているので - **題（YYYY-MM-DD/⏳）**: 要約 か - **題（YYYY-MM-DD/[vX.Y.Z](Release URL)）**: 要約 にしてください".to_owned()),
+            ChangelogStyle::Compact => develop_core::changelog_title::parse_legacy_compact(line)
+                .map(|(date, _)| date.to_owned())
+                .ok_or_else(|| "release.changelogStamp の旧い短形項目が不正です".to_owned()),
         };
         match parsed {
             Ok(date) => {
@@ -401,6 +406,10 @@ pub fn changelog_item_date(line: &str) -> Option<String> {
     parse_changelog_item(line)
         .ok()
         .or_else(|| develop_core::changelog_title::parse(line).map(|item| item.date.to_owned()))
+        .or_else(|| {
+            develop_core::changelog_title::parse_legacy_compact(line)
+                .map(|(date, _)| date.to_owned())
+        })
 }
 
 fn parse_changelog_item(line: &str) -> Result<String, String> {
@@ -410,14 +419,20 @@ fn parse_changelog_item(line: &str) -> Result<String, String> {
                 .to_owned(),
         );
     };
-    let Some(marker) = rest.find("**:") else {
+    let Some(close) = rest.find("**") else {
         return Err(
             "CHANGELOG.md のトップレベル項目は - **成果（YYYY-MM-DD）**: 要約 の形にしてください"
                 .to_owned(),
         );
     };
-    let title = &rest[..marker];
-    let summary = rest[marker + 3..].trim();
+    let Some(summary) = rest[close + 2..].strip_prefix(':') else {
+        return Err(
+            "CHANGELOG.md のトップレベル項目は - **成果（YYYY-MM-DD）**: 要約 の形にしてください"
+                .to_owned(),
+        );
+    };
+    let title = &rest[..close];
+    let summary = summary.trim();
     if summary.is_empty() {
         return Err("CHANGELOG.md の成果項目には要約が必要です".to_owned());
     }
@@ -540,6 +555,35 @@ pub fn check(input: &Input) -> Vec<RuleFinding> {
             });
         }
         if rule == Rule::Changelog {
+            if input.changelog_stamp {
+                let lines: Vec<&str> = text.lines().collect();
+                let fenced = fence_mask(&lines);
+                for (index, line) in lines.into_iter().enumerate() {
+                    if fenced[index] {
+                        continue;
+                    }
+                    let Some(parsed) = develop_core::changelog_title::parse(line) else {
+                        continue;
+                    };
+                    let Some(url) = parsed.release_url else {
+                        continue;
+                    };
+                    let linked_repo = url
+                        .strip_prefix("https://github.com/")
+                        .and_then(|path| path.split_once("/releases/tag/").map(|(repo, _)| repo));
+                    if !matches!((input.repo.as_deref(), linked_repo), (Some(origin), Some(linked)) if origin.eq_ignore_ascii_case(linked))
+                    {
+                        findings.push(
+                            RuleFinding::new(
+                                Rule::Changelog,
+                                path,
+                                "Release URL の宛先が origin の GitHub repo と一致しません",
+                            )
+                            .at(index + 1),
+                        );
+                    }
+                }
+            }
             for (line, link) in changelog_commit_links(text) {
                 let Ok(link) = link else { continue };
                 let linked_repo = format!("{}/{}", link.owner, link.repo);
@@ -588,6 +632,78 @@ mod tests {
 
     const TODO: &str = "# TODO\n\n## 進行中\n\n- [ ] **項目**。現在地。\n  - 補足\n";
     const CHANGELOG: &str = "# Changelog\n\n> 古い分は git 履歴に任せる。\n\n## 2026-09\n\n- **成果（2026-09-30）**: 要約。\n";
+
+    #[test]
+    fn body_bold_date_does_not_replace_title_date() {
+        let item = "- **題** 2026-11-05/v1.2.3: 本文 **強調（2026-11-04）**: 続き";
+        assert_eq!(changelog_item_date(item), Some("2026-11-05".to_owned()));
+    }
+
+    #[test]
+    fn stamped_declaration_accepts_only_parenthesized_stamps() {
+        let document = |item: &str| {
+            format!("# Changelog\n\n> 古い分は git 履歴に任せる。\n\n## 2026-11\n{item}\n")
+        };
+        for item in [
+            "- **成果（2026-11-05/⏳、補足）**: 要約",
+            "- **成果（2026-11-05/[v1.2.3](https://github.com/owner/repo/releases/tag/v1.2.3)）**: 要約",
+            "- **成果（2026-11-05/v1.2.3）**: 要約",
+        ] {
+            assert!(
+                inspect_changelog_with_style(document(item).as_bytes(), ChangelogStyle::Stamped)
+                    .is_empty(),
+                "{item}"
+            );
+            assert!(
+                !inspect_changelog(document(item).as_bytes()).is_empty(),
+                "{item}"
+            );
+        }
+        for item in [
+            "- **成果（2026-11-05）**: 要約",
+            "- **成果** 2026-11-05 ⏳: 要約",
+        ] {
+            assert!(
+                !inspect_changelog_with_style(document(item).as_bytes(), ChangelogStyle::Stamped)
+                    .is_empty(),
+                "{item}"
+            );
+        }
+    }
+
+    #[test]
+    fn stamped_release_url_must_match_origin() {
+        let mut input = Input {
+            repo: Some("owner/repo".to_owned()),
+            changelog_stamp: true,
+            ..Input::default()
+        };
+        let changelog = "# Changelog\n\n> 古い分は git 履歴に任せる。\n\n## 2026-11\n\n- **成果（2026-11-05/[v1.2.3](https://github.com/other/repo/releases/tag/v1.2.3)）**: 要約\n";
+        input
+            .snapshot
+            .add_markdown(CHANGELOG_PATH, changelog.as_bytes().to_vec());
+        assert!(
+            check(&input)
+                .iter()
+                .any(|finding| finding.message.contains("Release URL の宛先"))
+        );
+        input.repo = Some("other/repo".to_owned());
+        assert!(check(&input).is_empty());
+    }
+
+    #[test]
+    fn stamped_release_url_example_inside_fence_is_ignored() {
+        let mut input = Input {
+            repo: Some("owner/repo".to_owned()),
+            changelog_stamp: true,
+            ..Input::default()
+        };
+        let changelog = "# Changelog\n\n> 古い分は git 履歴に任せる。\n\n## 2026-11\n\n- **成果（2026-11-05/⏳）**: 要約\n\n```markdown\n- **例（2026-11-05/[v1.2.3](https://github.com/other/repo/releases/tag/v1.2.3)）**: 要約\n```\n";
+        input
+            .snapshot
+            .add_markdown(CHANGELOG_PATH, changelog.as_bytes().to_vec());
+        assert!(check(&input).is_empty());
+    }
 
     #[test]
     fn compact_changelog_enforces_declared_shape_and_existing_order_rules() {

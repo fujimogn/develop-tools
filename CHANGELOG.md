@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.14] - 2026-11-10
+
+### Added
+
+- Add the `changelog-migrate` binary to `develop-release`. It plans version stamps for existing `CHANGELOG.md` items from the git history and writes them only for a fixed input with no held items. It is not part of the Release assets; build it from source.
+- Accept the stamped title forms `- **Title（YYYY-MM-DD/⏳）**`, `- **Title（YYYY-MM-DD/vX.Y.Z）**` and `- **Title（YYYY-MM-DD/[vX.Y.Z](Release URL)）**` (full-width parentheses) when `release.changelogStamp` is declared. `release` writes the Release link when it stamps an item.
+
+### Changed
+
+- Raise the `CHANGELOG.md` size limit to 360,000 bytes. The archive target stays at 80% of the limit.
+- `release-notes <tag>` reads only `release.changelogStamp` from the end commit, and rejects the older forms when it is `true`.
+
+### Fixed
+
+- Stop reading bold text in an item body as the item title, date or version stamp.
+- Stop printing the `origin` URL, which can carry a token, in repository resolution errors.
+- `release-notes render --repo` uses the given repository instead of resolving `origin` again.
+
 ## [0.6.13] - 2026-11-09
 
 ### Added

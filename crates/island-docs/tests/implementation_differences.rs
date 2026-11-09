@@ -234,9 +234,14 @@ fn commit_link_syntax_is_checked_without_git_and_fenced_examples_are_ignored() {
     let document =
         |body: &str| format!("# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-09\n{body}\n");
     let link = "[abcdef0](https://github.com/owner/repo/commit/abcdef0)";
-    for style in [ChangelogStyle::Parenthesized, ChangelogStyle::Compact] {
+    for style in [
+        ChangelogStyle::Parenthesized,
+        ChangelogStyle::Stamped,
+        ChangelogStyle::Compact,
+    ] {
         let item = match style {
             ChangelogStyle::Parenthesized => "- **成果（2026-09-30）**: 要約。",
+            ChangelogStyle::Stamped => "- **成果（2026-09-30/⏳）**: 要約。",
             ChangelogStyle::Compact => "- **成果** 2026-09-30 ⏳: 要約。",
         };
         for body in [

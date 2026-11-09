@@ -34,7 +34,7 @@ fn yes_archives_oldest_months_and_records_pre_archive_commit() {
     assert!(!result.contains(&format!("## {}", previous_month(&current_month(), 2))));
     assert!(result.contains(&format!("## {}", current_month())));
     assert!(output_text(&output).contains("退避する月:"));
-    assert!(result.len() <= 96_000);
+    assert!(result.len() <= 288_000);
     assert_eq!(
         fs::read_dir(repo.path())
             .unwrap()
@@ -54,7 +54,7 @@ fn archive_without_current_month_keeps_the_newest_existing_month() {
     let block = |month: &str| {
         format!(
             "## {month}\n- **成果（{month}-01）**: {}\n\n",
-            "x".repeat(55_000)
+            "x".repeat(165_000)
         )
     };
     let content = format!(
@@ -76,7 +76,7 @@ fn archive_without_current_month_keeps_the_newest_existing_month() {
     assert!(result.contains(&format!(
         "> {middle} 以前は git 履歴（退避直前の commit: {before_sha}）"
     )));
-    assert!(result.len() <= 96_000);
+    assert!(result.len() <= 288_000);
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn newest_existing_month_overage_fails_without_changing_the_file() {
     let older = previous_month(&current_month(), 2);
     let content = format!(
         "# Changelog\n> 古い分は git 履歴に任せる。\n\n## {newest}\n- **成果（{newest}-01）**: {}\n\n## {older}\n- **成果（{older}-01）**: old\n",
-        "x".repeat(120_001)
+        "x".repeat(360_001)
     );
     let repo = repo_with_changelog(&content);
 
@@ -101,8 +101,8 @@ fn newest_existing_month_overage_fails_without_changing_the_file() {
 
 #[test]
 fn input_at_the_success_cap_stays_unchanged() {
-    let content = changelog_of_len(120_000);
-    assert_eq!(content.len(), 120_000);
+    let content = changelog_of_len(360_000);
+    assert_eq!(content.len(), 360_000);
     let repo = repo_with_changelog(&content);
 
     let output = run_archiver(repo.path(), &["--yes"]);
@@ -116,9 +116,9 @@ fn input_at_the_success_cap_stays_unchanged() {
 
 #[test]
 fn exhausted_archive_succeeds_between_target_and_cap() {
-    for result_bytes in [96_001, 120_000] {
+    for result_bytes in [288_001, 360_000] {
         let (content, protected, older) = changelog_whose_archive_result_is(result_bytes);
-        assert!(content.len() > 120_000, "{}", content.len());
+        assert!(content.len() > 360_000, "{}", content.len());
         let repo = repo_with_changelog(&content);
         let before_sha = git_output(repo.path(), &["rev-parse", "HEAD"]);
 
@@ -139,8 +139,8 @@ fn exhausted_archive_succeeds_between_target_and_cap() {
 
 #[test]
 fn exhausted_archive_over_the_cap_fails_without_changing_the_file() {
-    let (content, _, _) = changelog_whose_archive_result_is(120_001);
-    assert!(content.len() > 120_000);
+    let (content, _, _) = changelog_whose_archive_result_is(360_001);
+    assert!(content.len() > 360_000);
     let repo = repo_with_changelog(&content);
 
     let output = run_archiver(repo.path(), &["--yes"]);
@@ -158,7 +158,7 @@ fn current_month_overage_fails_without_changing_the_file() {
     let month = current_month();
     let content = format!(
         "# Changelog\n> 古い分は git 履歴に任せる。\n\n## {month}\n- **成果（{month}-01）**: {}\n",
-        "x".repeat(120_001)
+        "x".repeat(360_001)
     );
     let repo = repo_with_changelog(&content);
 
@@ -236,7 +236,7 @@ fn changelog_whose_archive_result_is(result_bytes: usize) -> (String, String, St
     let protected_section = format!("{prefix}{summary}\n");
     let older_section = format!(
         "## {older}\n- **成果（{older}-01）**: {}\n",
-        "y".repeat(40_000)
+        "y".repeat(120_000)
     );
     let content =
         format!("# Changelog\n> 古い分は git 履歴に任せる。\n\n{protected_section}{older_section}");
@@ -248,7 +248,7 @@ fn oversized_changelog() -> String {
     let block = |month: &str| {
         format!(
             "## {month}\n- **成果（{month}-01）**: {}\n\n",
-            "x".repeat(55_000)
+            "x".repeat(165_000)
         )
     };
     format!(
@@ -289,7 +289,7 @@ fn output_text(output: &Output) -> String {
 #[test]
 fn yes_archives_old_dates_of_the_current_month_when_it_alone_is_over_the_cap() {
     let month = current_month();
-    let item = |day: &str| format!("- **成果（{month}-{day}）**: {}\n", "x".repeat(50_000));
+    let item = |day: &str| format!("- **成果（{month}-{day}）**: {}\n", "x".repeat(150_000));
     let content = format!(
         "# Changelog\n> 古い分は git 履歴に任せる。\n\n## {month}\n{}{}{}",
         item("20"),
@@ -312,5 +312,5 @@ fn yes_archives_old_dates_of_the_current_month_when_it_alone_is_over_the_cap() {
     assert!(result.contains(&format!(
         "> {month}-10 以前は git 履歴（退避直前の commit: {before_sha}）"
     )));
-    assert!(result.len() <= 96_000);
+    assert!(result.len() <= 288_000);
 }

@@ -10,7 +10,7 @@ fn errors(findings: &[Finding]) -> Vec<&Finding> {
 #[test]
 fn common_limits_are_single_public_contract() {
     assert_eq!(TODO_MAX_BYTES, 36_000);
-    assert_eq!(CHANGELOG_MAX_BYTES, 120_000);
+    assert_eq!(CHANGELOG_MAX_BYTES, 360_000);
     assert_eq!(TODO_ITEM_WARNING_BYTES, 500);
     assert_eq!(CHANGELOG_ARCHIVE_TARGET_PERCENT, 80);
 }
@@ -233,10 +233,10 @@ fn changelog_item_warning_counts_utf8_body_without_its_final_newline() {
 
 #[test]
 fn archive_keeps_protected_items_after_a_fenced_month_heading() {
-    let protected_item = format!("- **残す成果（2026-10-04）**: {}\n", "x".repeat(100_000));
+    let protected_item = format!("- **残す成果（2026-10-04）**: {}\n", "x".repeat(260_000));
     let content = format!(
         "# Changelog\n> 古い分は git 履歴に任せる\n\n## 2026-10\n- **先頭（2026-10-04）**: 要約\n```markdown\n## 2026-05\n```\n{protected_item}## 2026-09\n- **古い成果（2026-09-01）**: {}\n",
-        "y".repeat(25_000)
+        "y".repeat(110_000)
     );
     let plan = plan_changelog_archive(&content, "2026-10", "abc123").unwrap();
     assert_eq!(plan.archived_months, ["2026-09"]);
@@ -261,7 +261,7 @@ fn archive_removes_oldest_months_and_records_range_and_sha() {
     let block = |month: &str| {
         format!(
             "## {month}\n- **成果（{month}-01）**: {}\n\n",
-            "x".repeat(55_000)
+            "x".repeat(165_000)
         )
     };
     let content = format!(
@@ -287,7 +287,7 @@ fn archive_removes_oldest_months_and_records_range_and_sha() {
 fn changelog_with_large_history(preamble: &str) -> String {
     let section =
         |month: &str, summary: &str| format!("## {month}\n- **成果（{month}-01）**: {summary}\n\n");
-    let large_summary = "x".repeat(55_000);
+    let large_summary = "x".repeat(165_000);
     format!(
         "{preamble}{}{}{}{}",
         section("2026-10", "current"),
@@ -336,7 +336,7 @@ fn archive_refuses_to_apply_when_current_month_alone_is_too_large() {
 
 #[test]
 fn archive_moves_into_old_dates_of_the_current_month_when_months_run_out() {
-    let item = |date: &str| format!("- **成果（{date}）**: {}\n", "x".repeat(30_000));
+    let item = |date: &str| format!("- **成果（{date}）**: {}\n", "x".repeat(90_000));
     let content = format!(
         "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-10\n{}{}{}{}\n## 2026-09\n- **成果（2026-09-01）**: old\n",
         item("2026-10-29"),
@@ -367,7 +367,7 @@ fn archive_moves_into_old_dates_of_the_current_month_when_months_run_out() {
 
 #[test]
 fn archive_picks_dates_by_value_not_by_position_and_keeps_the_newest_date() {
-    let item = |date: &str| format!("- **成果（{date}、補足）**: {}\n", "x".repeat(41_000));
+    let item = |date: &str| format!("- **成果（{date}、補足）**: {}\n", "x".repeat(100_000));
     let content = format!(
         "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-10\n{}{}{}{}",
         item("2026-10-05"),
@@ -400,8 +400,8 @@ fn archive_refuses_when_the_newest_date_alone_is_too_large() {
 fn archive_keeps_unindented_lines_after_an_archived_item() {
     let content = format!(
         "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-10\n- **新（2026-10-29）**: {}\n- **旧（2026-10-01）**: {}\n```markdown\n## 2026-05\n```\n",
-        "x".repeat(60_000),
-        "y".repeat(61_000)
+        "x".repeat(180_000),
+        "y".repeat(181_000)
     );
 
     let plan = plan_changelog_archive(&content, "2026-10", "deadbeef").unwrap();
@@ -415,8 +415,8 @@ fn archive_keeps_unindented_lines_after_an_archived_item() {
 fn archive_takes_the_indented_continuation_after_a_blank_line_with_its_item() {
     let content = format!(
         "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-10\n- **新（2026-10-29）**: {}\n- **旧（2026-10-01）**: {}\n\n  旧の補足\n",
-        "x".repeat(60_000),
-        "y".repeat(61_000)
+        "x".repeat(180_000),
+        "y".repeat(181_000)
     );
 
     let plan = plan_changelog_archive(&content, "2026-10", "deadbeef").unwrap();
@@ -429,7 +429,7 @@ fn archive_takes_the_indented_continuation_after_a_blank_line_with_its_item() {
 #[test]
 fn archive_compact_titles_by_date_without_manifest_or_shape_validation() {
     let item =
-        |date: &str, stamp: &str| format!("- **成果** {date}{stamp}: {}\n", "x".repeat(30_000));
+        |date: &str, stamp: &str| format!("- **成果** {date}{stamp}: {}\n", "x".repeat(90_000));
     let content = format!(
         "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-10\n{}{}{}{}",
         item("2026-10-29", " ⏳"),

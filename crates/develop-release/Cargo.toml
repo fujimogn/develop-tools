@@ -29,14 +29,17 @@ name = "release-notes"
 path = "src/bin/release-notes.rs"
 test = false
 
+[[bin]]
+name = "changelog-migrate"
+path = "src/bin/changelog-migrate.rs"
+test = false
+
 [dependencies]
 develop-tools-core = { path = "../develop-tools-core" }
 island-llm = { path = "../island-llm" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
-
-[dev-dependencies]
 tempfile = { workspace = true }
 
 [lints]

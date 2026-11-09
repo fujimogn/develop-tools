@@ -62,7 +62,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "ci-change-scope"
-version = "0.6.13"
+version = "0.6.14"
 dependencies = [
  "develop-tools-core",
  "libc",
@@ -113,14 +113,14 @@ checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 
 [[package]]
 name = "develop-adr"
-version = "0.6.13"
+version = "0.6.14"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "develop-release"
-version = "0.6.13"
+version = "0.6.14"
 dependencies = [
  "develop-tools-core",
  "island-llm",
@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "develop-staged"
-version = "0.6.13"
+version = "0.6.14"
 dependencies = [
  "develop-adr",
  "develop-tools-core",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "develop-tools-core"
-version = "0.6.13"
+version = "0.6.14"
 dependencies = [
  "libc",
  "serde_json",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "island-docs"
-version = "0.6.13"
+version = "0.6.14"
 dependencies = [
  "develop-tools-core",
  "regex",
@@ -284,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "island-llm"
-version = "0.6.13"
+version = "0.6.14"
 dependencies = [
  "island-secrets",
  "serde",
@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "island-secrets"
-version = "0.6.13"
+version = "0.6.14"
 dependencies = [
  "develop-tools-core",
  "getrandom 0.4.3",

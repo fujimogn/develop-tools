@@ -80,11 +80,11 @@ The command reports template drift, missing README entries, duplicate or missing
 | `cargo-lock` | The `version` of the declared Cargo packages in `Cargo.lock` |
 | `toml-root` | The top-level `version` in a TOML file |
 
-All declared files must hold the same version. Set `release.changelogStamp` to `true` to also stamp the root `CHANGELOG.md` in the version commit. With this declaration, use `- **Title** YYYY-MM-DD ⏳: Summary` for unreleased entries; `release` replaces ` ⏳` with `/vX.Y.Z` (for example, `- **Title** 2026-11-04/v0.1.155: Summary`).
+All declared files must hold the same version. Set `release.changelogStamp` to `true` to stamp the root `CHANGELOG.md` in the version commit. With this declaration, use `- **Title（YYYY-MM-DD/⏳）**: Summary` for unreleased entries; `release` replaces `/⏳` with `/[vX.Y.Z](https://github.com/owner/repo/releases/tag/vX.Y.Z)`. Historical tags without a GitHub Release use `/vX.Y.Z` without a link. Repositories without this declaration keep `- **Title（YYYY-MM-DD）**: Summary`.
 
 ## Release notes
 
-`release-notes <vX.Y.Z> [--repo owner/name]` は前 tag から指定 tag までの月別追記を決定論で抽出します。宣言と LLM は使いません。旧刻印 `（…、vX.Y.Z で prod 反映）` の他版項目も除外するように変更されています。短い刻印の他版除外は維持し、対象版・未リリース・印なしは通常の抽出対象です。旧刻印と短い刻印が重なる曖昧な題は構造エラーになります。成功は本文を stdout に出して exit 0、tag・repo・履歴・抽出の不備は exit 1 です。
+`release-notes <vX.Y.Z> [--repo owner/name]` は前 tag から指定 tag までの月別追記を決定論で抽出します。宣言のうち終点 commit の `release.changelogStamp` だけを読み、LLM は使いません。旧刻印 `（…、vX.Y.Z で prod 反映）` の他版項目は非宣言 repo で除外します。宣言 repo は括弧内の新版だけを受けます。旧刻印と短い刻印が重なる曖昧な題は構造エラーになります。成功は本文を stdout に出して exit 0、tag・repo・履歴・宣言・抽出の不備は exit 1 です。
 
 ### 本文だけの生成
 

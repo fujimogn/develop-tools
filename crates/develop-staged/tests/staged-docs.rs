@@ -114,7 +114,7 @@ fn checker_recommends_archiving_an_oversized_staged_changelog() {
     let repo = repository();
     let changelog = format!(
         "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-09\n- **成果（2026-09-27）**: {}\n",
-        "x".repeat(120_001)
+        "x".repeat(360_001)
     );
     fs::write(repo.path().join("CHANGELOG.md"), changelog).unwrap();
     git_ok(repo.path(), &["add", "CHANGELOG.md"]);
@@ -337,8 +337,8 @@ fn write_manifest(root: &Path, source: &str) {
     fs::write(root.join(".config/develop-tools.json"), source).unwrap();
 }
 
-fn compact_changelog() -> &'static str {
-    "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-11\n- **成果** 2026-11-05 ⏳: 要約\n"
+fn stamped_changelog() -> &'static str {
+    "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-11\n- **成果（2026-11-05/⏳）**: 要約\n"
 }
 
 #[test]
@@ -346,7 +346,7 @@ fn checker_selects_changelog_shape_from_index_manifest() {
     for (manifest, changelog, expected) in [
         (
             Some(r#"{"release":{"changelogStamp":true}}"#),
-            compact_changelog(),
+            stamped_changelog(),
             0,
         ),
         (
@@ -354,12 +354,12 @@ fn checker_selects_changelog_shape_from_index_manifest() {
             valid_changelog(),
             1,
         ),
-        (None, compact_changelog(), 1),
+        (None, stamped_changelog(), 1),
         (Some("{}"), valid_changelog(), 0),
-        (Some("not JSON"), compact_changelog(), 2),
+        (Some("not JSON"), stamped_changelog(), 2),
         (
             Some(r#"{"release":{"changelogStamp":"yes"}}"#),
-            compact_changelog(),
+            stamped_changelog(),
             2,
         ),
     ] {
@@ -389,7 +389,7 @@ fn checker_uses_manifest_from_explicit_index() {
     let alternate = repo.path().join(".git/alternate-index");
     fs::copy(repo.path().join(".git/index"), &alternate).unwrap();
     write_manifest(repo.path(), r#"{"release":{"changelogStamp":true}}"#);
-    fs::write(repo.path().join("CHANGELOG.md"), compact_changelog()).unwrap();
+    fs::write(repo.path().join("CHANGELOG.md"), stamped_changelog()).unwrap();
     assert!(
         git_with_index(repo.path(), &alternate, &["add", "."])
             .status
@@ -612,7 +612,7 @@ fn unchanged_changelog_does_not_block_staged_todo_with_bad_commit_link() {
 #[test]
 fn commit_link_bytes_still_count_towards_warning_and_limit() {
     let (repo, head, _) = link_history();
-    for (length, expected) in [(500, 0), (120_000, 1)] {
+    for (length, expected) in [(500, 0), (360_000, 1)] {
         let text = linked_changelog(&head[..8]).replace("要約", &"x".repeat(length));
         stage_changelog(repo.path(), &text);
         let output = run_checker(repo.path(), &[]);
@@ -623,7 +623,7 @@ fn commit_link_bytes_still_count_towards_warning_and_limit() {
             "{stderr}"
         );
         if expected == 1 {
-            assert!(stderr.contains("120000"), "{stderr}");
+            assert!(stderr.contains("360000"), "{stderr}");
         }
     }
 }
@@ -638,7 +638,7 @@ fn archive_changelog_preserves_retained_commit_link_suffix_bytes() {
     );
     let text = format!(
         "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2099-12\n{retained}\n## 2000-01\n- **古い成果（2000-01-01）**: {}\n",
-        "x".repeat(121_000)
+        "x".repeat(361_000)
     );
     fs::write(repo.path().join("CHANGELOG.md"), text).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_archive-changelog"))
@@ -657,7 +657,7 @@ fn archive_changelog_preserves_retained_commit_link_suffix_bytes() {
     // Exercise the protected-month date pruning path as well.
     let text = format!(
         "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2099-12\n{retained}- **古い成果（2099-12-01）**: {}\n",
-        "x".repeat(121_000)
+        "x".repeat(361_000)
     );
     let plan =
         develop_staged::docs_standard::plan_changelog_archive(&text, "2099-12", &head).unwrap();

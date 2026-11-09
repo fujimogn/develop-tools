@@ -1718,7 +1718,7 @@ fn check_local_version_skips_fields_added_beside_the_version() {
     assert!(text.contains("入れ直して"), "{text}");
 }
 
-const COMPACT_CHANGELOG: &str = "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-11\n- **成果** 2026-11-05/v1.2.3: 要約\n";
+const COMPACT_CHANGELOG: &str = "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-11\n- **成果（2026-11-05/v1.2.3）**: 要約\n";
 
 #[test]
 fn changelog_shape_follows_tracked_manifest_snapshot() {

@@ -60,6 +60,7 @@ fn structure_code(error: &str) -> &'static str {
         "section_duplicate",
         "section_empty",
         "changelog_stamp_ambiguous",
+        "changelog_stamp_invalid",
     ]
     .into_iter()
     .find(|code| {
@@ -115,7 +116,7 @@ fn run() -> Result<(), String> {
                     "{}",
                     Help::new(
                         "release-notes <vX.Y.Z> [--repo owner/name]\n       release-notes render --from <vX.Y.Z> --to <full-commit-SHA> --tag <vA.B.C> [--repo owner/name] [--no-ai]",
-                        "tag: 前 tag からの月別追記を決定論で抽出し、旧刻印の他版項目を除外します。宣言と LLM は使いません。\nrender: 固定した from/to と終点 commit の宣言から本文だけを生成します。--from は既存 tag、--to は完全な commit SHA、--tag は予定 tag です。",
+                        "tag: 前 tag からの月別追記を決定論で抽出し、旧刻印の他版項目を除外します。宣言のうち終点 commit の release.changelogStamp だけを読み、LLM は使いません。\nrender: 固定した from/to と終点 commit の宣言から本文だけを生成します。--from は既存 tag、--to は完全な commit SHA、--tag は予定 tag です。",
                         "tag: 前 tag と repo を git から解決。render: repo は origin から解決し、宣言が ai なら最大 1 回推論（--no-ai で抑止）。stdout は本文だけ、stderr の最後の 1 行が JSON（source/reason_code）。AI 成功では常に dictionary_missing boolean（private 辞書欠落時 true、それ以外 false）、fallback 理由保存失敗は recording_warning=fallback_reason_unrecorded で通知。fallback は再推論しません。help は release-notes --help で表示（render --help は文法エラー）。",
                         "tag: なし。render: API の最大 1 回の送信、usage 台帳と fallback JSONL への追記だけ。版 file・CHANGELOG・index・commit・branch・tag・remote・GitHub Release・prod は変更しません。",
                     )

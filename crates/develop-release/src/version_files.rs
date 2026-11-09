@@ -419,7 +419,8 @@ impl VersionFiles {
         let mut written: Vec<String> = self.files.iter().map(|(path, _, _)| path.clone()).collect();
         // 宣言の無い repo では CHANGELOG を読まない。宣言があって file が無いのは宣言の誤りなので止める。
         if self.changelog_stamp {
-            let (stamped, count) = crate::stamp_changelog(&read(root, CHANGELOG)?, next);
+            let repo = crate::release_notes::remote_repo(root)?;
+            let (stamped, count) = crate::stamp_changelog(&read(root, CHANGELOG)?, next, &repo);
             if count > 0 {
                 changes.push((root.join(CHANGELOG), stamped));
                 written.push(CHANGELOG.to_owned());

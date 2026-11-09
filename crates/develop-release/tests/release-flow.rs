@@ -1583,6 +1583,15 @@ fn changelog_fixture(stamp: bool, changelog: Option<&str>) -> Fixture {
     }
     let fixture = git_fixture(dir, root);
     git(fixture.path(), &["switch", "develop"]);
+    git(
+        fixture.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ],
+    );
     fixture
 }
 
@@ -1613,6 +1622,15 @@ fn unreadable_changelog_fixture(stamp: bool) -> Fixture {
     std::fs::write(root.join("CHANGELOG.md/keep"), "").unwrap();
     let fixture = git_fixture(dir, root);
     git(fixture.path(), &["switch", "develop"]);
+    git(
+        fixture.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ],
+    );
     fixture
 }
 
@@ -1634,7 +1652,7 @@ fn assert_released_v124(root: &Path, output: &Output) {
     assert_eq!(git(root, &["status", "--porcelain"]), "");
 }
 
-const UNRELEASED_CHANGELOG: &str = "# CHANGELOG\n\n## 2026-10\n\n- **刻印を足した** 2026-10-20 ⏳: 本文。\n- **前の版で出した** 2026-10-19/v1.2.3: 本文。\n";
+const UNRELEASED_CHANGELOG: &str = "# CHANGELOG\n\n## 2026-10\n\n- **刻印を足した（2026-10-20/⏳）**: 本文。\n- **前の版で出した（2026-10-19/v1.2.3）**: 本文。\n";
 
 #[test]
 fn declared_repo_stamps_dated_unreleased_titles_in_the_version_commit() {
@@ -1645,7 +1663,10 @@ fn declared_repo_stamps_dated_unreleased_titles_in_the_version_commit() {
     assert_released_v124(root, &output);
     assert_eq!(
         std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
-        UNRELEASED_CHANGELOG.replace(" 2026-10-20 ⏳:", " 2026-10-20/v1.2.4:")
+        UNRELEASED_CHANGELOG.replace(
+            "/⏳",
+            "/[v1.2.4](https://github.com/owner/repo/releases/tag/v1.2.4)"
+        )
     );
     assert_eq!(released_files(root), ["CHANGELOG.md", "package.json"]);
 }
@@ -1675,20 +1696,20 @@ fn undeclared_repo_does_not_read_changelog_when_it_is_a_directory() {
 fn nested_body_heading_and_non_title_markers_are_not_stamped() {
     let untouched = [
         "## 2026-10 ⏳:",
-        "  - **入れ子** 2026-10-20 ⏳: 本文。",
+        "  - **入れ子（2026-10-20/⏳）**: 本文。",
         "- **括弧の形（2026-10-20、未リリース）**: 本文。",
         "- **題の途中 ⏳ だけ**: 本文。",
         "- **閉じない太字 2026-10-20 ⏳:",
         "```md",
-        "- **fence の中** 2026-10-20 ⏳: 本文。",
+        "- **fence の中（2026-10-20/⏳）**: 本文。",
         "```",
         "~~~md",
-        "- **tilde fence の中** 2026-10-20 ⏳: 本文。",
+        "- **tilde fence の中（2026-10-20/⏳）**: 本文。",
         "~~~",
     ];
     let stamped = [
-        "- **題** 2026-10-20 ⏳: 本文の 2026-10-19 ⏳: は残す。",
-        "- **次の題** 2026-10-21 ⏳: 本文。",
+        "- **題（2026-10-20/⏳）**: 本文の 2026-10-19 ⏳: は残す。",
+        "- **次の題（2026-10-21/⏳）**: 本文。",
     ];
     let changelog = format!(
         "# CHANGELOG\n\n{}\n{}\n",
@@ -1702,8 +1723,8 @@ fn nested_body_heading_and_non_title_markers_are_not_stamped() {
     assert_released_v124(root, &output);
     let written = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
     let expected_stamped = [
-        "- **題** 2026-10-20/v1.2.4: 本文の 2026-10-19 ⏳: は残す。",
-        "- **次の題** 2026-10-21/v1.2.4: 本文。",
+        "- **題（2026-10-20/[v1.2.4](https://github.com/owner/repo/releases/tag/v1.2.4)）**: 本文の 2026-10-19 ⏳: は残す。",
+        "- **次の題（2026-10-21/[v1.2.4](https://github.com/owner/repo/releases/tag/v1.2.4)）**: 本文。",
     ];
     assert_eq!(
         written,
@@ -1717,7 +1738,7 @@ fn nested_body_heading_and_non_title_markers_are_not_stamped() {
 
 #[test]
 fn declared_repo_without_unreleased_titles_releases_without_changelog() {
-    let changelog = "# CHANGELOG\n\n## 2026-10\n\n- **前の版で出した** 2026-10-19/v1.2.3: 本文。\n- **次の既刻印** 2026-10-18/v1.2.2: 本文。\n";
+    let changelog = "# CHANGELOG\n\n## 2026-10\n\n- **前の版で出した（2026-10-19/v1.2.3）**: 本文。\n- **次の既刻印（2026-10-18/v1.2.2）**: 本文。\n";
     let dir = changelog_fixture(true, Some(changelog));
     let root = dir.path();
 
@@ -3120,14 +3141,14 @@ fn english_ai_release_with_no_ai_accepts_the_declaration_and_tags() {
 #[test]
 fn compact_stamp_preserves_bytes_and_is_idempotent_without_final_newline() {
     let version = "1.2.4".parse().unwrap();
-    let text = "- **題 ⏳** 2026-11-05 ⏳: 本文 ⏳\r\n- **末尾** 2026-11-05 ⏳: 本文";
-    let expected = "- **題 ⏳** 2026-11-05/v1.2.4: 本文 ⏳\r\n- **末尾** 2026-11-05/v1.2.4: 本文";
+    let text = "- **題 ⏳（2026-11-05/⏳、補足）**: 本文 ⏳\r\n- **末尾（2026-11-05/⏳）**: 本文";
+    let expected = "- **題 ⏳（2026-11-05/[v1.2.4](https://github.com/owner/repo/releases/tag/v1.2.4)、補足）**: 本文 ⏳\r\n- **末尾（2026-11-05/[v1.2.4](https://github.com/owner/repo/releases/tag/v1.2.4)）**: 本文";
     assert_eq!(
-        develop_release::stamp_changelog(text, version),
+        develop_release::stamp_changelog(text, version, "owner/repo"),
         (expected.to_owned(), 2)
     );
     assert_eq!(
-        develop_release::stamp_changelog(expected, version),
+        develop_release::stamp_changelog(expected, version, "owner/repo"),
         (expected.to_owned(), 0)
     );
 }

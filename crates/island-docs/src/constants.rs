@@ -36,7 +36,7 @@ pub struct ByteLimit {
 /// 島標準（`docs/develop-docs.md`「上限と退避」）の TODO.md 上限。
 pub const TODO_MAX_BYTES: usize = 36_000;
 /// 島標準（`docs/develop-docs.md`「上限と退避」）の CHANGELOG.md 上限。
-pub const CHANGELOG_MAX_BYTES: usize = 120_000;
+pub const CHANGELOG_MAX_BYTES: usize = 360_000;
 /// 島の入口文書の上限（design §5.2）。repo ごとに変えない。
 pub const AGENTS_MAX_BYTES: usize = 12_000;
 pub const CLAUDE_MAX_BYTES: usize = 2_500;
@@ -767,7 +767,7 @@ mod tests {
             ("CLAUDE.md", 2_500),
             ("CONTEXT.md", 16_000),
             ("TODO.md", 36_000),
-            ("CHANGELOG.md", 120_000),
+            ("CHANGELOG.md", 360_000),
         ];
         for repo in [
             None,

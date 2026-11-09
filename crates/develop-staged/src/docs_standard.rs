@@ -27,27 +27,28 @@ pub fn inspect_changelog_with_git(
         .into_iter()
         .filter_map(|(_, link)| link.ok().map(|link| link.sha))
         .collect();
-    if prefixes.is_empty() {
-        return findings;
-    }
     let mut input = Input {
         repo: repo.github_name(),
-        changelog_stamp: style == ChangelogStyle::Compact,
+        changelog_stamp: style == ChangelogStyle::Stamped,
         ..Input::default()
     };
     input
         .snapshot
         .add_markdown("CHANGELOG.md", content.to_vec());
-    input.changelog_commits = match basis
-        .as_ref()
-        .map_err(Clone::clone)
-        .and_then(|basis| repo.commit_link_evidence(&prefixes, basis))
-    {
-        Ok(evidence) => evidence,
-        Err(problem) => prefixes
-            .into_iter()
-            .map(|prefix| (prefix.to_owned(), Err(problem.clone())))
-            .collect(),
+    input.changelog_commits = if prefixes.is_empty() {
+        Default::default()
+    } else {
+        match basis
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|basis| repo.commit_link_evidence(&prefixes, basis))
+        {
+            Ok(evidence) => evidence,
+            Err(problem) => prefixes
+                .into_iter()
+                .map(|prefix| (prefix.to_owned(), Err(problem.clone())))
+                .collect(),
+        }
     };
     let mut seen: HashSet<_> = findings
         .iter()

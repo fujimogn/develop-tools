@@ -1,9 +1,7 @@
-//! 刻印する repo の CHANGELOG の短い題。
-
+//! Release repo の CHANGELOG の括弧内刻印。
 use std::ops::Range;
 
-pub const UNRELEASED_STAMP: &str = " ⏳";
-pub const RELEASED_PREFIX: &str = "/v";
+pub const UNRELEASED_STAMP: &str = "/⏳";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stamp<'a> {
@@ -12,62 +10,117 @@ pub enum Stamp<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct CompactTitle<'a> {
+pub struct StampedTitle<'a> {
     pub title: &'a str,
     pub date: &'a str,
     pub stamp: Stamp<'a>,
+    pub release_url: Option<&'a str>,
+    pub supplement: Option<&'a str>,
     pub summary: &'a str,
-    /// 日付の前の空白から印の末尾まで（AI 入力から取り除く範囲）。
     pub metadata_range: Range<usize>,
-    /// 印だけの範囲（未リリースの印を版へ書き換える範囲）。
     pub stamp_range: Range<usize>,
 }
 
-/// トップレベルの短い題を読む。題は最初の閉じの `**` で終わる。
-pub fn parse(line: &str) -> Option<CompactTitle<'_>> {
+fn version(raw: &str) -> Option<&str> {
+    let mut parts = raw.split('.');
+    for _ in 0..3 {
+        let part = parts.next()?;
+        if part.is_empty()
+            || (part.len() > 1 && part.starts_with('0'))
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+    }
+    parts.next().is_none().then_some(raw)
+}
+
+fn github_release_url(url: &str, tag: &str) -> bool {
+    let Some(path) = url.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let Some((repo, actual_tag)) = path.split_once("/releases/tag/") else {
+        return false;
+    };
+    if actual_tag != tag {
+        return false;
+    }
+    let mut names = repo.split('/');
+    let valid = |name: &str| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    matches!((names.next(), names.next(), names.next()), (Some(owner), Some(name), None) if valid(owner) && valid(name))
+}
+
+/// トップレベルの `- **題（日付/印、補足）**: 本文` を読む。
+pub fn parse(line: &str) -> Option<StampedTitle<'_>> {
     let rest = line.strip_prefix("- **")?;
     let close = rest.find("**")?;
-    let title = &rest[..close];
+    let bold = &rest[..close];
+    let summary = rest[close + 2..].strip_prefix(':')?.trim();
+    if summary.is_empty() || !bold.ends_with('）') {
+        return None;
+    }
+    let open = bold.rfind('（')?;
+    let title = &bold[..open];
     if title.trim().is_empty() {
         return None;
     }
-    let metadata_start = "- **".len() + close + 2;
-    let metadata = line.get(metadata_start..)?.strip_prefix(' ')?;
+    let inner = &bold[open + '（'.len_utf8()..bold.len() - '）'.len_utf8()];
+    let date = inner.get(..10)?;
+    if !valid_date(date) {
+        return None;
+    }
+    let marked = inner.get(10..)?.strip_prefix('/')?;
+    let (marker, supplement) = match marked.split_once('、') {
+        Some((marker, note)) if !note.is_empty() => (marker, Some(note)),
+        Some(_) => return None,
+        None => (marked, None),
+    };
+    let (stamp, release_url) = if marker == "⏳" {
+        (Stamp::Unreleased, None)
+    } else if let Some(link) = marker.strip_prefix("[v") {
+        let (raw, tail) = link.split_once("](")?;
+        let raw = version(raw)?;
+        let url = tail.strip_suffix(')')?;
+        if !github_release_url(url, &format!("v{raw}")) {
+            return None;
+        }
+        (Stamp::Released(raw), Some(url))
+    } else {
+        (Stamp::Released(version(marker.strip_prefix('v')?)?), None)
+    };
+    let metadata_start = "- **".len() + open;
+    let stamp_start = metadata_start + '（'.len_utf8() + date.len();
+    Some(StampedTitle {
+        title,
+        date,
+        stamp,
+        release_url,
+        supplement,
+        summary,
+        metadata_range: metadata_start..metadata_start + bold.len() - open,
+        stamp_range: stamp_start..stamp_start + 1 + marker.len(),
+    })
+}
+
+/// 旧い括弧外の印は archive 等の読取互換だけに使う。
+pub fn parse_legacy_compact(line: &str) -> Option<(&str, Stamp<'_>)> {
+    let rest = line.strip_prefix("- **")?;
+    let close = rest.find("**")?;
+    let metadata = rest[close + 2..].strip_prefix(' ')?.split_once(':')?.0;
     let date = metadata.get(..10)?;
     if !valid_date(date) {
         return None;
     }
-    let (marker, summary) = metadata.get(10..)?.split_once(':')?;
-    let summary = summary.trim();
-    if summary.is_empty() {
-        return None;
-    }
-    let stamp = if marker == UNRELEASED_STAMP {
-        Stamp::Unreleased
-    } else {
-        let version = marker.strip_prefix(RELEASED_PREFIX)?;
-        let mut parts = version.split('.');
-        for _ in 0..3 {
-            let part = parts.next()?;
-            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
-                return None;
-            }
-        }
-        if parts.next().is_some() {
-            return None;
-        }
-        Stamp::Released(version)
+    let stamp = match metadata.get(10..)? {
+        " ⏳" => Stamp::Unreleased,
+        other => Stamp::Released(version(other.strip_prefix("/v")?)?),
     };
-    let stamp_start = metadata_start + 1 + date.len();
-    let end = stamp_start + marker.len();
-    Some(CompactTitle {
-        title,
-        date,
-        stamp,
-        summary,
-        metadata_range: metadata_start..end,
-        stamp_range: stamp_start..end,
-    })
+    Some((date, stamp))
 }
 
 /// YYYY-MM-DD の形の実在する日付か。
@@ -98,59 +151,51 @@ pub fn valid_date(date: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn reads_compact_title_and_stamp_byte_ranges() {
-        for (line, stamp) in [
-            ("- **題** 2026-11-05 ⏳: 要約", Stamp::Unreleased),
-            (
-                "- **題** 2026-11-05/v1.20.3: 要約",
-                Stamp::Released("1.20.3"),
-            ),
+    fn parses_stamps_and_ranges() {
+        let pending = "- **題（2026-11-05/⏳、補足）**: 要約";
+        let item = parse(pending).unwrap();
+        assert_eq!(item.title, "題");
+        assert_eq!(item.date, "2026-11-05");
+        assert_eq!(item.stamp, Stamp::Unreleased);
+        assert_eq!(item.supplement, Some("補足"));
+        assert_eq!(&pending[item.stamp_range], "/⏳");
+        assert_eq!(&pending[item.metadata_range], "（2026-11-05/⏳、補足）");
+        let released = "- **題（2026-11-05/[v1.2.3](https://github.com/owner/repo/releases/tag/v1.2.3)）**: 要約";
+        let item = parse(released).unwrap();
+        assert_eq!(item.stamp, Stamp::Released("1.2.3"));
+        assert_eq!(
+            item.release_url,
+            Some("https://github.com/owner/repo/releases/tag/v1.2.3")
+        );
+        assert_eq!(
+            parse("- **題（2026-11-05/v1.2.3）**: 要約").unwrap().stamp,
+            Stamp::Released("1.2.3")
+        );
+    }
+    #[test]
+    fn rejects_invalid_or_legacy_stamps() {
+        for item in [
+            "- **題（2026-11-05）**: 要約",
+            "- **題** 2026-11-05 ⏳: 要約",
+            "- **題（2026-11-05/[v1.2.3](https://github.com/owner/repo/releases/tag/v1.2.4)）**: 要約",
+            "- **題（2026-11-05/[v1.2.3](http://github.com/owner/repo/releases/tag/v1.2.3)）**: 要約",
+            "- **題（2026-11-05/v1.02.3）**: 要約",
+            "  - **題（2026-11-05/⏳）**: 要約",
         ] {
-            let parsed = parse(line).unwrap();
-            assert_eq!(parsed.title, "題");
-            assert_eq!(parsed.date, "2026-11-05");
-            assert_eq!(parsed.summary, "要約");
-            assert_eq!(parsed.stamp, stamp);
-            assert_eq!(
-                &line[parsed.metadata_range],
-                match stamp {
-                    Stamp::Unreleased => " 2026-11-05 ⏳",
-                    Stamp::Released(_) => " 2026-11-05/v1.20.3",
-                }
-            );
-            assert_eq!(
-                &line[parsed.stamp_range],
-                match stamp {
-                    Stamp::Unreleased => UNRELEASED_STAMP,
-                    Stamp::Released(_) => "/v1.20.3",
-                }
-            );
+            assert!(parse(item).is_none(), "{item}");
         }
     }
 
     #[test]
-    fn rejects_missing_or_malformed_compact_metadata() {
-        for line in [
-            "- **題** 2026-11-05: 要約",
-            "- **題** 2026-11-05 ⏳️: 要約",
-            "- **題**  2026-11-05 ⏳: 要約",
-            "- **題** 2026-11-05  ⏳: 要約",
-            "- **** 2026-11-05 ⏳: 要約",
-            "- **  ** 2026-11-05 ⏳: 要約",
-            "- **題** 2026-11-05 ⏳: ",
-            "- **題** 2026-02-29 ⏳: 要約",
-            "- **題** 0000-01-01 ⏳: 要約",
-            "- **題** 2026-11-05/v1.2: 要約",
-            "- **題** 2026-11-05/v1.2.3-rc1: 要約",
-            "- **題** 2026-11-05/v1.2.3.4: 要約",
-            "  - **題** 2026-11-05 ⏳: 要約",
-            "- **題（2026-11-05）**: 要約",
-        ] {
-            assert!(parse(line).is_none(), "{line}");
-        }
-        assert!(parse("- **題** 2024-02-29/v0.0.1: 要約").is_some());
-        assert!(parse("- **題** 2026-11-05/v１.2.3: 要約").is_none());
+    fn legacy_compact_does_not_read_bold_text_in_body() {
+        let item = "- **成果（2026-11-05）**: 前版の **修正** 2026-11-04/v1.2.2: の続き";
+        assert_eq!(parse_legacy_compact(item), None);
+    }
+
+    #[test]
+    fn stamped_parser_does_not_read_bold_text_in_body() {
+        let item = "- **題** 2026-11-05/v1.2.3: 本文 **強調（2026-11-05/v1.2.2）**: 続き";
+        assert_eq!(parse(item), None);
     }
 }

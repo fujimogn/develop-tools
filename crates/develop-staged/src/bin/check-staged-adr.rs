@@ -121,7 +121,7 @@ fn show_help() {
         "check-staged-adr [--index-file PATH] [--help]",
         "check-staged-adr — staged された ADR の構造と legacy archive を検査します。",
         "cwd の Git repo で git diff --cached の docs/adr 配下を検査します。対象 ADR が無い場合は正常終了します。",
-        "なし。staged diff と ADR、index の .develop-tools.json の ADR 番号の契約を読み取り、ファイルや index を変更しません。",
+        "なし。staged diff と ADR、index の .config/develop-tools.json（移行中は旧 .develop-tools.json）の ADR 番号の契約を読み取り、ファイルや index を変更しません。",
     )
     .exit("0 = 対象 ADR なしまたは指摘なし、1 = 指摘あり、2 = Git または ADR 番号の契約の読み取りエラー");
     print!("{}", help.render());

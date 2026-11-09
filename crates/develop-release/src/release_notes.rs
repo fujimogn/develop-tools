@@ -53,16 +53,16 @@ fn valid_repo(repo: &str) -> bool {
     matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(name), None) if valid_part(owner) && valid_part(name))
 }
 
-fn remote_repo(root: &Path) -> Result<String, String> {
+pub(crate) fn remote_repo(root: &Path) -> Result<String, String> {
     let remote = git(root, &["remote", "get-url", "origin"])?;
     let path = remote
         .strip_prefix("git@github.com:")
         .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
         .or_else(|| remote.strip_prefix("https://github.com/"))
-        .ok_or_else(|| format!("origin は GitHub URL ではありません: {remote}"))?;
+        .ok_or("origin は GitHub URL ではありません")?;
     let repo = path.strip_suffix(".git").unwrap_or(path);
     if !valid_repo(repo) {
-        return Err(format!("origin から repo を安全に決められません: {remote}"));
+        return Err("origin から repo を安全に決められません".to_owned());
     }
     Ok(repo.to_owned())
 }
@@ -179,14 +179,14 @@ fn legacy_title_stamp(
 fn released_for_other_tag(item: &str, tag: &str) -> Result<bool, String> {
     use develop_tools_core::changelog_title::{self, Stamp};
 
-    let compact = changelog_title::parse(item);
+    let compact = changelog_title::parse(item)
+        .map(|parsed| parsed.stamp)
+        .or_else(|| changelog_title::parse_legacy_compact(item).map(|(_, stamp)| stamp));
     let legacy = legacy_title_stamp(item);
     if compact.is_some() && legacy.is_some() {
         return Err("changelog_stamp_ambiguous: 題に短い刻印と旧刻印が併記されています".to_owned());
     }
-    let stamp = compact
-        .map(|parsed| parsed.stamp)
-        .or_else(|| legacy.map(|(stamp, _)| stamp));
+    let stamp = compact.or_else(|| legacy.map(|(stamp, _)| stamp));
     Ok(matches!(stamp, Some(Stamp::Released(version)) if format!("v{version}") != tag))
 }
 
@@ -499,6 +499,41 @@ pub fn extract_from(
     extract_range(root, base, &base.previous, end, tag, language)
 }
 
+/// tag 入口は終点の刻印宣言だけを読む。古い manifest の他の欄は再抽出の条件にしない。
+fn stamp_declared_at(root: &Path, end: &str) -> Result<bool, String> {
+    let paths = git(
+        root,
+        &[
+            "ls-tree",
+            "--name-only",
+            end,
+            "--",
+            develop_tools_manifest::PATH,
+            develop_tools_manifest::LEGACY_PATH,
+        ],
+    )?;
+    let Some(path) = [
+        develop_tools_manifest::PATH,
+        develop_tools_manifest::LEGACY_PATH,
+    ]
+    .into_iter()
+    .find(|path| paths.lines().any(|entry| entry == *path)) else {
+        return Ok(false);
+    };
+    let raw = git_raw(root, &["show", &format!("{end}:{path}")])?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| format!("{path}: JSON が不正です: {error}"))?;
+    let Some(stamp) = value
+        .get("release")
+        .and_then(|release| release.get("changelogStamp"))
+    else {
+        return Ok(false);
+    };
+    stamp
+        .as_bool()
+        .ok_or_else(|| format!("{path}: release.changelogStamp は boolean で指定してください"))
+}
+
 fn extract_range(
     root: &Path,
     base: &ReleaseBase,
@@ -572,6 +607,10 @@ pub fn extract_release(
         &["rev-parse", "--verify", &format!("{end}^{{commit}}")],
     )?;
     let base = resolve_base(root, &format!("{end}^"), repo_arg)?;
+    if stamp_declared_at(root, &end)? {
+        let changelog = git_raw(root, &["show", &format!("{end}:CHANGELOG.md")])?;
+        validate_stamped_text(&changelog, &base.repo)?;
+    }
     extract_from(root, &base, &end, tag, NotesLanguage::Ja)
 }
 
@@ -882,7 +921,17 @@ pub fn scrub_for_ai(item: &str) -> String {
         item.replace_range(link.suffix_range, "");
     }
     if let Some(parsed) = develop_tools_core::changelog_title::parse(&item) {
-        item.replace_range(parsed.metadata_range, "");
+        let replacement = parsed
+            .supplement
+            .map_or_else(String::new, |note| format!("（{note}）"));
+        item.replace_range(parsed.metadata_range, &replacement);
+    } else if let Some((date, _)) = develop_tools_core::changelog_title::parse_legacy_compact(&item)
+    {
+        let close = item["- **".len()..].find("**").unwrap() + "- **".len();
+        let marker = close + "** ".len();
+        let end = item[marker..].find(':').unwrap() + marker;
+        debug_assert!(item[marker..end].starts_with(date));
+        item.replace_range(close + "**".len()..end, "");
     }
     if let Some((_, range)) = legacy_title_stamp(&item) {
         item.replace_range(range, "");
@@ -981,6 +1030,45 @@ pub fn declared_notes(root: &Path) -> Result<Option<DeclaredNotes>, String> {
     normalize_notes(&notes).map(Some)
 }
 
+fn declares_stamp(root: &Path) -> Result<bool, String> {
+    let manifest = develop_tools_manifest::locate_in(|path| Ok(root.join(path).is_file()))?;
+    if manifest.is_none() {
+        return Ok(false);
+    }
+    Ok(crate::preflight::read_declaration(root)?.changelog_stamp)
+}
+
+fn validate_stamped_text(changelog: &str, repo: &str) -> Result<(), String> {
+    let mut monthly = MonthlyItems::default();
+    for line in changelog.lines() {
+        if !monthly.step(line) {
+            continue;
+        }
+        let Some(parsed) = develop_tools_core::changelog_title::parse(line) else {
+            return Err(
+                if develop_tools_core::changelog_title::parse_legacy_compact(line).is_some()
+                    && legacy_title_stamp(line).is_some()
+                {
+                    "changelog_stamp_ambiguous: 旧刻印が併記されています".to_owned()
+                } else {
+                    "changelog_stamp_invalid: release.changelogStamp の項目は括弧内に /⏳ または /版を置いてください".to_owned()
+                },
+            );
+        };
+        if let Some(url) = parsed.release_url {
+            let linked_repo = url
+                .strip_prefix("https://github.com/")
+                .and_then(|path| path.split_once("/releases/tag/").map(|(repo, _)| repo));
+            if !linked_repo.is_some_and(|linked| linked.eq_ignore_ascii_case(repo)) {
+                return Err(
+                    "changelog_stamp_invalid: Release URL が origin と一致しません".to_owned(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn normalize_notes(notes: &ReleaseNotes) -> Result<DeclaredNotes, String> {
     let source = match notes.mode {
         NotesMode::Changelog(source)
@@ -1011,6 +1099,11 @@ pub fn prepare_notes(
     declared: DeclaredNotes,
     tag: &str,
 ) -> Result<PreparedNotes, String> {
+    if declares_stamp(root)? {
+        let repo = remote_repo(root)?;
+        let changelog = git_raw(root, &["show", "HEAD:CHANGELOG.md"])?;
+        validate_stamped_text(&changelog, &repo)?;
+    }
     // tag が一つも無い初回だけ節の本文を使う。既存 tag の解決失敗は隠さない。
     let base = if git(
         root,
@@ -1042,7 +1135,7 @@ pub fn prepare_notes(
     } else {
         // 版 commit を作る前に、追記に含まれる刻印の構造エラーも検出する。
         prepared.extract(root, "HEAD")?;
-        if crate::preflight::read_declaration(root)?.changelog_stamp {
+        if declares_stamp(root)? {
             // 前 tag から変わっていない ⏳ も、版の刻印で新たな変更行になる。
             // stamp と同じ短い印を読み、抽出対象の月別項目だけを事前検証する。
             use develop_tools_core::changelog_title::{self, Stamp};
@@ -1466,6 +1559,7 @@ pub struct FixedNotes {
     to: String,
     tag: String,
     declared: DeclaredNotes,
+    stamped: bool,
 }
 
 impl FixedNotes {
@@ -1560,6 +1654,7 @@ impl FixedNotes {
             to: to_oid,
             tag: tag.to_owned(),
             declared: normalize_notes(&notes)?,
+            stamped: declaration.changelog_stamp,
         })
     }
 
@@ -1569,6 +1664,10 @@ impl FixedNotes {
     }
 
     fn extract_with_warning(&self, human_warning: bool) -> Result<ReleaseExtract, String> {
+        if self.stamped {
+            let changelog = git_raw(&self.root, &["show", &format!("{}:CHANGELOG.md", self.to)])?;
+            validate_stamped_text(&changelog, &self.base.repo)?;
+        }
         extract_declared(
             &self.root,
             &self.base,

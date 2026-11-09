@@ -212,7 +212,7 @@ fn parse_item(line: &str, number: usize) -> Option<Item> {
         });
     }
     let text = line.strip_prefix("- **")?;
-    let title_end = text.find("**")?;
+    let title_end = changelog_title::title_closing_marker(text)?;
     let title = &text[..title_end];
     let summary = text[title_end + 2..].strip_prefix(':')?;
     if title.trim().is_empty() || summary.trim().is_empty() {
@@ -277,7 +277,8 @@ fn parse_item(line: &str, number: usize) -> Option<Item> {
 fn parse_historical_item(line: &str, number: usize) -> Option<Item> {
     parse_item(line, number).or_else(|| {
         let (date, _) = changelog_title::parse_legacy_compact(line)?;
-        let title = line.strip_prefix("- **")?.split_once("**")?.0;
+        let rest = line.strip_prefix("- **")?;
+        let title = &rest[..changelog_title::title_closing_marker(rest)?];
         Some(Item {
             line: number,
             key: format!("{title}\u{1f}{date}"),

@@ -419,7 +419,7 @@ fn parse_changelog_item(line: &str) -> Result<String, String> {
                 .to_owned(),
         );
     };
-    let Some(close) = rest.find("**") else {
+    let Some(close) = develop_core::changelog_title::title_closing_marker(rest) else {
         return Err(
             "CHANGELOG.md のトップレベル項目は - **成果（YYYY-MM-DD）**: 要約 の形にしてください"
                 .to_owned(),
@@ -637,6 +637,20 @@ mod tests {
     fn body_bold_date_does_not_replace_title_date() {
         let item = "- **題** 2026-11-05/v1.2.3: 本文 **強調（2026-11-04）**: 続き";
         assert_eq!(changelog_item_date(item), Some("2026-11-05".to_owned()));
+    }
+
+    #[test]
+    fn title_with_nested_bold_and_colon_keeps_its_date() {
+        for item in [
+            "- **設定を **160 行 → 9 行** に短縮。（2026-06-13）**: 要約。",
+            "- **手順を **50 行 → 3 行** に短縮。（2026-06-13）**: 要約。",
+            "- **整形を撤去: 設定と依存を整理。（2026-06-13）**: 要約。",
+        ] {
+            assert_eq!(changelog_item_date(item), Some("2026-06-13".to_owned()));
+            let document =
+                format!("# Changelog\n\n> 古い分は git 履歴に任せる。\n\n## 2026-06\n{item}\n");
+            assert!(inspect_changelog(document.as_bytes()).is_empty(), "{item}");
+        }
     }
 
     #[test]

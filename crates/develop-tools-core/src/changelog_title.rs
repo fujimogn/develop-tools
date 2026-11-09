@@ -55,10 +55,23 @@ fn github_release_url(url: &str, tag: &str) -> bool {
     matches!((names.next(), names.next(), names.next()), (Some(owner), Some(name), None) if valid(owner) && valid(name))
 }
 
+/// `- **` の後から、題の終わりになる最初の `**` を見つける。
+pub fn title_closing_marker(rest: &str) -> Option<usize> {
+    rest.match_indices("**").find_map(|(index, _)| {
+        let after = &rest[index + 2..];
+        (after.starts_with(':')
+            || after
+                .strip_prefix(' ')
+                .and_then(|suffix| suffix.get(..10))
+                .is_some_and(valid_date))
+        .then_some(index)
+    })
+}
+
 /// トップレベルの `- **題（日付/印、補足）**: 本文` を読む。
 pub fn parse(line: &str) -> Option<StampedTitle<'_>> {
     let rest = line.strip_prefix("- **")?;
-    let close = rest.find("**")?;
+    let close = title_closing_marker(rest)?;
     let bold = &rest[..close];
     let summary = rest[close + 2..].strip_prefix(':')?.trim();
     if summary.is_empty() || !bold.ends_with('）') {
@@ -110,7 +123,7 @@ pub fn parse(line: &str) -> Option<StampedTitle<'_>> {
 /// 旧い括弧外の印は archive 等の読取互換だけに使う。
 pub fn parse_legacy_compact(line: &str) -> Option<(&str, Stamp<'_>)> {
     let rest = line.strip_prefix("- **")?;
-    let close = rest.find("**")?;
+    let close = title_closing_marker(rest)?;
     let metadata = rest[close + 2..].strip_prefix(' ')?.split_once(':')?.0;
     let date = metadata.get(..10)?;
     if !valid_date(date) {
@@ -197,5 +210,19 @@ mod tests {
     fn stamped_parser_does_not_read_bold_text_in_body() {
         let item = "- **題** 2026-11-05/v1.2.3: 本文 **強調（2026-11-05/v1.2.2）**: 続き";
         assert_eq!(parse(item), None);
+    }
+
+    #[test]
+    fn nested_bold_in_title_keeps_stamp_and_legacy_date() {
+        let stamped = "- **設定を **短縮** した（2026-06-13/⏳）**: 要約";
+        let parsed = parse(stamped).unwrap();
+        assert_eq!(parsed.title, "設定を **短縮** した");
+        assert_eq!(parsed.date, "2026-06-13");
+        assert_eq!(&stamped[parsed.metadata_range], "（2026-06-13/⏳）");
+        let legacy = "- **設定を **短縮** した** 2026-06-13/v1.2.3: 要約";
+        assert_eq!(
+            parse_legacy_compact(legacy),
+            Some(("2026-06-13", Stamp::Released("1.2.3")))
+        );
     }
 }

@@ -256,6 +256,10 @@ fn a_fence_whose_info_string_starts_with_the_other_marker_still_excludes_its_ite
 #[test]
 fn compact_metadata_and_parenthesized_dates_are_dropped() {
     assert_eq!(
+        scrub_for_ai("- **設定を **短縮** した** 2026-06-13/v1.2.3: 本文"),
+        "- **設定を **短縮** した**: 本文"
+    );
+    assert_eq!(
         scrub_for_ai("- **版の刻印を直した** 2026-10-05/v0.5.3: 本文"),
         "- **版の刻印を直した**: 本文"
     );

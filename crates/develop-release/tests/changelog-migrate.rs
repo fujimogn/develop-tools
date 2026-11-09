@@ -130,6 +130,21 @@ fn replays_introduction_and_chooses_first_containing_tag() {
 }
 
 #[test]
+fn nested_bold_in_existing_title_is_a_valid_migration_item() {
+    let f = Fixture::new();
+    f.changelog("## 2026-06\n- **設定を **短縮** した。（2026-06-13）**: 要約\n");
+    f.commit("add nested bold item");
+    let (out, plan) = f.check("[]", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(plan["invalid"], 0);
+    assert_eq!(plan["items"][0]["stamp"], "⏳");
+}
+
+#[test]
 fn tagless_items_are_pending_and_missing_github_release_has_no_link() {
     let f = Fixture::new();
     f.changelog("## 2026-11\n- **A（2026-11-01）**: 最初\n");
@@ -731,24 +746,33 @@ fn split_of_an_old_item_holds_both_new_keys() {
 
 #[test]
 fn old_undated_history_does_not_become_a_false_introduction() {
-    let f = Fixture::new();
-    f.changelog("## v0.1.0\n- **A**: 古い本文\n");
-    f.commit("old undated entry");
-    f.changelog("## 2026-11\n- **A（2026-11-01）**: 古い本文\n");
-    f.commit("convert to dated entry");
-    let (out, plan) = f.check("[]", &[]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(plan["holds"], 1);
-    assert!(
-        plan["items"][0]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("unparsed")
-    );
+    for old in [
+        "- **A**: 古い本文",
+        "- **A** 古い本文",
+        "- **A**：古い本文",
+        "- **A** — 古い本文",
+        "- **A** 本文 **B**: x",
+    ] {
+        let f = Fixture::new();
+        f.changelog(&format!("## v0.1.0\n{old}\n"));
+        f.commit("old undated entry");
+        f.changelog("## 2026-11\n- **A（2026-11-01）**: 古い本文\n");
+        f.commit("convert to dated entry");
+        let (out, plan) = f.check("[]", &[]);
+        assert!(
+            out.status.success(),
+            "{old}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(plan["holds"], 1, "{old}");
+        assert!(
+            plan["items"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("unparsed"),
+            "{old}"
+        );
+    }
 }
 
 #[test]

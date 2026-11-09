@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.15] - 2026-11-10
+
+### Fixed
+
+- Accept `CHANGELOG.md` items whose title contains bold text, such as `- **Shorten the config to **9 lines**（YYYY-MM-DD）**: Summary`. 0.6.14 rejected them. Bold text in an item body is still not read as the title, date or version stamp.
+
 ## [0.6.14] - 2026-11-10
 
 ### Added

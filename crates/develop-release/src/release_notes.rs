@@ -148,10 +148,9 @@ fn legacy_title_stamp(
 )> {
     use develop_tools_core::changelog_title::Stamp;
 
-    let title = item
-        .strip_prefix(crate::CHANGELOG_TITLE_PREFIX)?
-        .split_once("**")?
-        .0;
+    let rest = item.strip_prefix(crate::CHANGELOG_TITLE_PREFIX)?;
+    let close = develop_tools_core::changelog_title::title_closing_marker(rest)?;
+    let title = &rest[..close];
     let inner = title.strip_suffix('）')?;
     let marker_start = inner.rfind(['（', '、'])?;
     let marker = &inner[marker_start + '（'.len_utf8()..];
@@ -927,7 +926,10 @@ pub fn scrub_for_ai(item: &str) -> String {
         item.replace_range(parsed.metadata_range, &replacement);
     } else if let Some((date, _)) = develop_tools_core::changelog_title::parse_legacy_compact(&item)
     {
-        let close = item["- **".len()..].find("**").unwrap() + "- **".len();
+        let close =
+            develop_tools_core::changelog_title::title_closing_marker(&item["- **".len()..])
+                .unwrap()
+                + "- **".len();
         let marker = close + "** ".len();
         let end = item[marker..].find(':').unwrap() + marker;
         debug_assert!(item[marker..end].starts_with(date));

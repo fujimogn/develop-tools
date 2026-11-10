@@ -31,7 +31,7 @@ fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let arg = args
         .next()
-        .ok_or_else(|| "使い方: release <patch | minor | major | x.y.z> [--no-ai]".to_owned())?;
+        .ok_or_else(|| "使い方: release <patch | minor | major | x.y.z> [--no-ai] [--first-release-base <完全なOID>]".to_owned())?;
     if arg == "push" {
         return develop_release::push::push_cli(&args.collect::<Vec<_>>());
     }
@@ -42,10 +42,10 @@ fn run() -> Result<(), String> {
         print!(
             "{}",
             Help::new(
-                "release <patch | minor | major | x.y.z> [--no-ai]",
-                "Advance declared version files on the integration branch, fast-forward main, then create a local tag. It does not push. Publish with release push. When .config/develop-tools.json (or the legacy .develop-tools.json during migration) declares platforms, the latest release check run on HEAD must have a successful job for every declared OS; run release check first. When it declares release.notes, the tag is annotated with the release body; mode ai makes one Anthropic API request for the body and falls back to the CHANGELOG extract when that is not usable. A changelog-section body (mode or fallback) needs exactly one non-empty dated section for the version (## X.Y.Z (YYYY-MM-DD) or ## [X.Y.Z] - YYYY-MM-DD) in CHANGELOG.md at HEAD; otherwise it stops before writing with section_missing, section_duplicate, or section_empty. --no-ai skips the request.",
+                "release <patch | minor | major | x.y.z> [--no-ai] [--first-release-base <完全なOID>]",
+                "Advance declared version files on the integration branch, fast-forward main, then create a local tag. It does not push. Publish with release push. When .config/develop-tools.json (or the legacy .develop-tools.json during migration) declares platforms, the latest release check run on HEAD must have a successful job for every declared OS; run release check first. When it declares release.notes, the tag is annotated with the release body; mode ai makes one Anthropic API request for the body and falls back to the CHANGELOG extract when that is not usable. A changelog-section body (mode or fallback) needs exactly one non-empty dated section for the version (## X.Y.Z (YYYY-MM-DD) or ## [X.Y.Z] - YYYY-MM-DD) in CHANGELOG.md at HEAD. A tagless stamped monthly changelog-additions release instead requires --first-release-base with a full commit or tree OID; the full diff must match every pending monthly item. --no-ai skips the request.",
                 "applies changes when a version bump is supplied; without an argument, exits without writing",
-                "files declared by release.versionFiles, and root CHANGELOG.md when release.changelogStamp is true; creates a git commit, advances main, and creates a v<version> tag (annotated when release.notes is declared); no remote push. With release.notes mode ai and without --no-ai, sends the scrubbed CHANGELOG items to Anthropic once and records AI fallback reasons (timestamp_unix_seconds, tag, reason_code only) in release-notes-fallback.jsonl in the common Git directory, warning with fallback_reason_unrecorded if recording fails while continuing the release; appends one row per API request to the usage ledger named by usage_ledger in ~/.config/develop-tools/llm.json (without that field, nothing is sent), except when no previous tag exists, which skips inference and uses the version's CHANGELOG section. Publish with release push.",
+                "files declared by release.versionFiles, and root CHANGELOG.md when release.changelogStamp is true; creates a git commit, advances main, and creates a v<version> tag (annotated when release.notes is declared); no remote push. With release.notes mode ai and without --no-ai, sends the scrubbed CHANGELOG items to Anthropic once and records AI fallback reasons (timestamp_unix_seconds, tag, reason_code only) in release-notes-fallback.jsonl in the common Git directory, warning with fallback_reason_unrecorded if recording fails while continuing the release; appends one row per API request to the usage ledger named by usage_ledger in ~/.config/develop-tools/llm.json (without that field, nothing is sent). A first release skips inference and uses the version section, or the fixed monthly diff when --first-release-base is supplied. Publish with release push.",
             )
             .exit("0 success; 1 invalid input or failed release")
             .render()
@@ -53,13 +53,19 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let bump: Bump = arg.parse()?;
-    let no_ai = match args.next().as_deref() {
-        None => false,
-        Some("--no-ai") => true,
-        Some(other) => return Err(format!("知らない引数です: {other}")),
-    };
-    if let Some(other) = args.next() {
-        return Err(format!("知らない引数です: {other}"));
+    let mut no_ai = false;
+    let mut first_release_base = None;
+    while let Some(option) = args.next() {
+        match option.as_str() {
+            "--no-ai" if !no_ai => no_ai = true,
+            "--first-release-base" if first_release_base.is_none() => {
+                first_release_base = Some(
+                    args.next()
+                        .ok_or("first_release_base_invalid: 値がありません")?,
+                );
+            }
+            other => return Err(format!("知らない引数です: {other}")),
+        }
     }
     let root = develop_release::current_repo_root()?
         .ok_or_else(|| "Git repo の外では release を実行できません".to_owned())?;
@@ -102,8 +108,18 @@ fn run() -> Result<(), String> {
     // **本文の材料は書く前に決める。** 版 commit の後は CHANGELOG の diff を読むだけにし、
     // commit したのに tag を作れない状態を減らす。
     let notes = release_notes::declared_notes(&root)?
-        .map(|declared| release_notes::prepare_notes(&root, declared, &tag))
+        .map(|declared| {
+            release_notes::prepare_notes_with_first_release_base(
+                &root,
+                declared,
+                &tag,
+                first_release_base.as_deref(),
+            )
+        })
         .transpose()?;
+    if notes.is_none() && first_release_base.is_some() {
+        return Err("first_release_base_invalid: release.notes の宣言が必要です".to_owned());
+    }
 
     let written = versions.write(&root, next)?;
     println!("✓ {} を v{next} の版 commit 用に更新", written.join(" / "));

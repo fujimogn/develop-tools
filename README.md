@@ -84,6 +84,8 @@ All declared files must hold the same version. Set `release.changelogStamp` to `
 
 ## Release notes
 
+`release.changelogStamp: true` と `release.notes` の `changelog-additions`（または AI の fallback に同じ抽出）を宣言し、tag がまだない月次 CHANGELOG の最初の Release は `release <bump> --first-release-base <完全なOID> [--no-ai]` を使います。基点は完全な commit OID（HEAD の祖先）か tree OID で指定します。全現存項目を初回に含める場合は、対象 repo で `git hash-object -w -t tree --stdin </dev/null` が返す空 tree OID を明示します。実行前に基点から HEAD への CHANGELOG 全文 diff と、月次節の全 `/⏳` 項目が同じ順・同じ内容で一致することを確かめます。基点の欠落・短縮・不一致、空本文では版 file、commit、tag を作りません。本文は版刻印済みの項目を注釈付き tag に入れ、初回は推論しません。初回専用の指定なので、既存 tag がある repo では拒否します。通常の前 tag がある Release と版の節を使う初回 Release は従来どおりです。
+
 `release-notes <vX.Y.Z> [--repo owner/name]` は前 tag から指定 tag までの月別追記を決定論で抽出します。宣言のうち終点 commit の `release.changelogStamp` だけを読み、LLM は使いません。旧刻印 `（…、vX.Y.Z で prod 反映）` の他版項目は非宣言 repo で除外します。宣言 repo は括弧内の新版だけを受けます。旧刻印と短い刻印が重なる曖昧な題は構造エラーになります。成功は本文を stdout に出して exit 0、tag・repo・履歴・宣言・抽出の不備は exit 1 です。
 
 ### 本文だけの生成

@@ -1092,6 +1092,7 @@ pub struct PreparedNotes {
     declared: DeclaredNotes,
     base: Option<ReleaseBase>,
     tag: String,
+    monthly_first: Option<(String, ReleaseBody)>,
 }
 
 /// `HEAD` を版 commit の親として材料を決める。版の節が使えなければ理由 code で止める
@@ -1100,6 +1101,16 @@ pub fn prepare_notes(
     root: &Path,
     declared: DeclaredNotes,
     tag: &str,
+) -> Result<PreparedNotes, String> {
+    prepare_notes_with_first_release_base(root, declared, tag, None)
+}
+
+/// 初回の月次 Release だけ、呼出側が固定した Git object を基点にする。
+pub fn prepare_notes_with_first_release_base(
+    root: &Path,
+    declared: DeclaredNotes,
+    tag: &str,
+    first_release_base: Option<&str>,
 ) -> Result<PreparedNotes, String> {
     if declares_stamp(root)? {
         let repo = remote_repo(root)?;
@@ -1122,16 +1133,119 @@ pub fn prepare_notes(
     } else {
         Some(release_base(root, "HEAD")?)
     };
+    if base.is_some() && first_release_base.is_some() {
+        return Err(
+            "first_release_base_invalid: 既存 tag がある repo では指定できません".to_owned(),
+        );
+    }
+    let head = git(
+        root,
+        &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
+    )?;
+    let monthly_first = if let Some(from) = first_release_base {
+        if declared.source != NotesSource::ChangelogAdditions || !declares_stamp(root)? {
+            return Err("first_release_base_invalid: 月次の刻印対象でだけ指定できます".to_owned());
+        }
+        let oid_length = match git(root, &["rev-parse", "--show-object-format"])?.as_str() {
+            "sha1" => 40,
+            "sha256" => 64,
+            _ => return Err("first_release_base_invalid: object format が不明です".to_owned()),
+        };
+        if from.len() != oid_length || !from.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("first_release_base_invalid: 完全な object OID が必要です".to_owned());
+        }
+        let kind = git(root, &["cat-file", "-t", from])
+            .map_err(|_| "first_release_base_invalid: 基点 object を確認できません".to_owned())?;
+        if kind == "commit" {
+            git(root, &["merge-base", "--is-ancestor", from, &head]).map_err(|_| {
+                "first_release_base_invalid: 基点 commit は HEAD の祖先である必要があります"
+                    .to_owned()
+            })?;
+        } else if kind != "tree" {
+            return Err(
+                "first_release_base_invalid: 基点は commit または tree に限ります".to_owned(),
+            );
+        }
+        let repo = remote_repo(root)?;
+        let extract = extract_range_with_warning(
+            root,
+            &ReleaseBase {
+                previous: from.to_owned(),
+                repo: repo.clone(),
+            },
+            from,
+            &head,
+            tag,
+            declared.language,
+            true,
+        )?;
+        let changelog = git_raw(root, &["show", "HEAD:CHANGELOG.md"])?;
+        let mut monthly = MonthlyItems::default();
+        let pending: Vec<String> = changelog
+            .lines()
+            .filter(|line| monthly.step(line))
+            .filter(|line| {
+                develop_tools_core::changelog_title::parse(line).is_some_and(|parsed| {
+                    parsed.stamp == develop_tools_core::changelog_title::Stamp::Unreleased
+                })
+            })
+            .map(str::to_owned)
+            .collect();
+        if pending.is_empty() {
+            return Err("first_release_body_empty: 月次の未リリース項目がありません".to_owned());
+        }
+        if extract.items != pending {
+            return Err(
+                "first_release_base_invalid: 全文 diff と月次の未リリース項目が一致しません"
+                    .to_owned(),
+            );
+        }
+        let version = tag
+            .strip_prefix('v')
+            .ok_or("first_release_base_invalid: tag は v<semver> が必要です")?
+            .parse()?;
+        if crate::stamp_changelog(&changelog, version, &repo).1 != pending.len() {
+            return Err("first_release_base_invalid: 刻印対象と月次項目が一致しません".to_owned());
+        }
+        let stamped: Vec<String> = pending
+            .iter()
+            .map(|item| crate::stamp_changelog(item, version, &repo).0)
+            .collect();
+        let heading = match declared.language {
+            NotesLanguage::Ja => format!("変更範囲: 初回 Release（基点 {from}）"),
+            NotesLanguage::En => format!("Changes: Initial release (base {from})"),
+        };
+        let text = format!("{heading}\n\n{}\n", stamped.join("\n"));
+        Some((
+            head.clone(),
+            ReleaseBody {
+                text,
+                source: BodySource::MonthlyFirstRelease,
+            },
+        ))
+    } else {
+        None
+    };
     let prepared = PreparedNotes {
         declared,
         base,
         tag: tag.to_owned(),
+        monthly_first,
     };
+    if prepared.monthly_first.is_some() {
+        return Ok(prepared);
+    }
     if prepared.base.is_none() || declared.source == NotesSource::ChangelogSection {
-        let head = git(
-            root,
-            &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
-        )?;
+        if prepared.base.is_none()
+            && declared.source == NotesSource::ChangelogAdditions
+            && declares_stamp(root)?
+        {
+            let changelog = git_raw(root, &["show", "HEAD:CHANGELOG.md"])?;
+            let mut monthly = MonthlyItems::default();
+            if changelog.lines().any(|line| monthly.step(line)) {
+                return Err("first_release_base_required: 月次の初回 Release には --first-release-base が必要です".to_owned());
+            }
+        }
         let section = prepared.section_at(root, &head)?;
         section.verified_links(root, &head)?;
     } else {
@@ -1166,6 +1280,16 @@ impl PreparedNotes {
         settings_path: &Path,
         runtime: &AiRuntime<'_>,
     ) -> Result<ReleaseBody, String> {
+        if let Some((parent, body)) = &self.monthly_first {
+            let actual_parent = git(root, &["rev-parse", &format!("{end}^")])?;
+            if &actual_parent != parent {
+                return Err(
+                    "first_release_base_invalid: 版 commit の親が固定した HEAD と一致しません"
+                        .to_owned(),
+                );
+            }
+            return Ok(body.clone());
+        }
         if self.base.is_none() {
             let end = git(
                 root,
@@ -1305,6 +1429,7 @@ fn fallback_recording_failed(root: &Path, tag: &str, body: &ReleaseBody) -> bool
 pub enum BodySource {
     /// 前 tag が無いため比較・推論をせず版の節を使った。
     FirstRelease,
+    MonthlyFirstRelease,
     /// CHANGELOG の抽出だけの宣言。
     Changelog,
     /// 照合を通った AI の本文。private で辞書が無いまま推論したら `dictionary_missing`。
@@ -1320,6 +1445,7 @@ impl std::fmt::Display for BodySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FirstRelease => write!(f, "前 tag が無いため、推論せず CHANGELOG の版の節を抽出"),
+            Self::MonthlyFirstRelease => write!(f, "明示基点から月次 CHANGELOG を抽出"),
             Self::Changelog => write!(f, "CHANGELOG の抽出"),
             Self::Ai {
                 dictionary_missing: false,
@@ -1355,7 +1481,7 @@ fn finalize_body(root: &Path, tag: &str, body: ReleaseBody) -> RenderedNotes {
             serde_json::json!({"source":"fallback","reason_code":code})
         }
         BodySource::NoAi => serde_json::json!({"source":"no_ai","reason_code":null}),
-        BodySource::Changelog | BodySource::FirstRelease => {
+        BodySource::Changelog | BodySource::FirstRelease | BodySource::MonthlyFirstRelease => {
             serde_json::json!({"source":"changelog","reason_code":null})
         }
     };

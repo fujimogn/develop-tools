@@ -2841,6 +2841,138 @@ fn section_fixture(notes: &str, changelog: &str) -> Fixture {
     fixture
 }
 
+fn monthly_first_fixture(changelog: &str) -> (Fixture, String) {
+    let fixture = notes_fixture(Some(AI_PRIVATE), None);
+    let root = fixture.path();
+    git(root, &["tag", "-d", "v1.2.3"]);
+    let mut manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join(".config/develop-tools.json")).unwrap(),
+    )
+    .unwrap();
+    manifest["release"]["changelogStamp"] = true.into();
+    std::fs::write(
+        root.join(".config/develop-tools.json"),
+        format!("{}\n", serde_json::to_string_pretty(&manifest).unwrap()),
+    )
+    .unwrap();
+    std::fs::write(root.join("CHANGELOG.md"), changelog).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "monthly changelog"]);
+    let empty_tree = git(root, &["hash-object", "-w", "-t", "tree", "--stdin"]);
+    (fixture, empty_tree)
+}
+
+fn assert_first_release_unchanged(root: &Path, before: &str, output: &Output) {
+    assert!(!output.status.success());
+    assert_eq!(git(root, &["rev-parse", "develop"]), before);
+    assert_eq!(
+        git(root, &["rev-parse", "main"]),
+        git(root, &["merge-base", "main", "develop"])
+    );
+    assert!(git(root, &["tag", "--list"]).is_empty());
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn monthly_first_release_requires_an_explicit_base_before_writing() {
+    let (fixture, _) =
+        monthly_first_fixture("# CHANGELOG\n\n## 2026-10\n\n- **First（2026-10-01/⏳）**: done\n");
+    let root = fixture.path();
+    let before = git(root, &["rev-parse", "HEAD"]);
+    let (output, _) = release_with(root, &["patch", "--no-ai"]);
+    assert_first_release_unchanged(root, &before, &output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("first_release_base_required"));
+}
+
+#[test]
+fn monthly_first_release_rejects_an_ambiguous_base_before_writing() {
+    let (fixture, _) =
+        monthly_first_fixture("# CHANGELOG\n\n## 2026-10\n\n- **First（2026-10-01/⏳）**: done\n");
+    let root = fixture.path();
+    let before = git(root, &["rev-parse", "HEAD"]);
+    let (output, _) = release_with(root, &["patch", "--first-release-base", "HEAD", "--no-ai"]);
+    assert_first_release_unchanged(root, &before, &output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("first_release_base_invalid"));
+}
+
+#[test]
+fn monthly_first_release_rejects_a_base_that_omits_pending_items() {
+    let (fixture, _) =
+        monthly_first_fixture("# CHANGELOG\n\n## 2026-10\n\n- **First（2026-10-01/⏳）**: done\n");
+    let root = fixture.path();
+    let before = git(root, &["rev-parse", "HEAD"]);
+    let (output, _) = release_with(root, &["patch", "--first-release-base", &before, "--no-ai"]);
+    assert_first_release_unchanged(root, &before, &output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("first_release_base_invalid"));
+}
+
+#[test]
+fn an_existing_tag_rejects_the_initial_base_without_writing() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let root = fixture.path();
+    let before = git(root, &["rev-parse", "HEAD"]);
+    let (output, _) = release_with(root, &["patch", "--first-release-base", &before, "--no-ai"]);
+    assert!(!output.status.success());
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), before);
+    assert_eq!(git(root, &["tag", "--list"]), "v1.2.3");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("first_release_base_invalid"));
+}
+
+#[test]
+fn monthly_first_release_rejects_empty_body_before_writing() {
+    let (fixture, base) = monthly_first_fixture("# CHANGELOG\n\n## 2026-10\n\nNo monthly items.\n");
+    let root = fixture.path();
+    let before = git(root, &["rev-parse", "HEAD"]);
+    let (output, _) = release_with(root, &["patch", "--first-release-base", &base, "--no-ai"]);
+    assert_first_release_unchanged(root, &before, &output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("first_release_body_empty"));
+}
+
+#[test]
+fn monthly_first_release_stamps_every_pending_item_and_annotates_the_tag() {
+    let (fixture, base) = monthly_first_fixture(
+        "# CHANGELOG\n\n## 2026-10\n\n- **First（2026-10-01/⏳）**: done\n\n## 2026-11\n\n- **Second（2026-11-02/⏳）**: done\n\n```md\n- **Example（2026-11-03/⏳）**: sample\n```\n",
+    );
+    let root = fixture.path();
+    let (output, _) = release_with(root, &["patch", "--first-release-base", &base, "--no-ai"]);
+    let body = assert_annotated_v124(root, &output);
+    assert!(body.contains("First（2026-10-01/[v1.2.4]"));
+    assert!(body.contains("Second（2026-11-02/[v1.2.4]"));
+    assert!(!body.contains("Example"));
+    assert!(!body.contains("## 1.2.4"));
+    let stamped = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    assert!(stamped.contains("First（2026-10-01/[v1.2.4]"));
+    assert!(stamped.contains("Second（2026-11-02/[v1.2.4]"));
+    assert!(stamped.contains("Example（2026-11-03/⏳）"));
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn monthly_first_release_uses_english_for_the_base_label_when_declared() {
+    let (fixture, base) =
+        monthly_first_fixture("# CHANGELOG\n\n## 2026-10\n\n- **First（2026-10-01/⏳）**: done\n");
+    let root = fixture.path();
+    let manifest = root.join(".config/develop-tools.json");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        text.replace(
+            "\"audience\": \"private\"",
+            "\"audience\": \"private\", \"language\": \"en\"",
+        ),
+    )
+    .unwrap();
+    git(root, &["add", ".config/develop-tools.json"]);
+    git(root, &["commit", "-qm", "english release notes"]);
+
+    let (output, _) = release_with(root, &["patch", "--first-release-base", &base, "--no-ai"]);
+    let body = assert_annotated_v124(root, &output);
+    assert!(
+        body.starts_with(&format!("Changes: Initial release (base {base})\n\n")),
+        "{body}"
+    );
+}
+
 #[test]
 fn declared_first_release_annotates_the_tag_with_only_the_version_section() {
     for notes in [

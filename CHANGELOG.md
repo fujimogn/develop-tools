@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.16] - 2026-11-10
+
+### Added
+
+- `release <bump> --first-release-base <full OID>` builds the first Release of a repository that has a monthly `CHANGELOG.md` and no previous tag. The body comes from the items added since the given commit or tree, and every item marked `/⏳` must match the body. When the base is ambiguous or the body is empty, `release` makes no version commit and no tag.
+
 ## [0.6.15] - 2026-11-10
 
 ### Fixed

@@ -3,6 +3,8 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use develop_core::develop_tools_manifest::NotesLanguage;
+
 pub use island_docs::records::{
     ChangelogStyle, Finding, FindingKind, TODO_ITEM_WARNING_BYTES, inspect_changelog,
     inspect_changelog_with_style, inspect_todo,
@@ -89,6 +91,20 @@ pub fn plan_changelog_archive(
     current_month: &str,
     commit_sha: &str,
 ) -> Result<ChangelogArchivePlan, String> {
+    plan_changelog_archive_with_language(content, current_month, commit_sha, NotesLanguage::Ja)
+}
+
+/// 設定で選んだ言語の履歴注記を作る。退避対象の選び方や保持する byte 列は言語によらない。
+pub fn plan_changelog_archive_with_language(
+    content: &str,
+    current_month: &str,
+    commit_sha: &str,
+    language: NotesLanguage,
+) -> Result<ChangelogArchivePlan, String> {
+    let history = ArchiveHistory {
+        commit_sha,
+        language,
+    };
     let bytes_before = content.len();
     if bytes_before <= CHANGELOG_MAX_BYTES {
         return Ok(ChangelogArchivePlan {
@@ -118,7 +134,7 @@ pub fn plan_changelog_archive(
     let target = CHANGELOG_MAX_BYTES * CHANGELOG_ARCHIVE_TARGET_PERCENT / 100;
     let mut archived = Vec::new();
     loop {
-        let candidate_preamble = archive_preamble(&preamble, newest(&archived), commit_sha);
+        let candidate_preamble = archive_preamble(&preamble, newest(&archived), &history);
         let candidate = render(&candidate_preamble, &sections);
         if candidate.len() <= target {
             return Ok(finished_plan(candidate, archived, Vec::new(), bytes_before));
@@ -138,7 +154,7 @@ pub fn plan_changelog_archive(
                 &mut sections,
                 &protected_month,
                 archived.clone(),
-                commit_sha,
+                &history,
                 target,
                 bytes_before,
             ) {
@@ -185,7 +201,7 @@ fn archive_old_dates(
     sections: &mut [MonthSection],
     protected_month: &str,
     archived_months: Vec<String>,
-    commit_sha: &str,
+    history: &ArchiveHistory<'_>,
     target: usize,
     bytes_before: usize,
 ) -> Option<ChangelogArchivePlan> {
@@ -211,7 +227,7 @@ fn archive_old_dates(
             .map(|segment| segment.raw.as_str())
             .collect();
         let candidate = render(
-            &archive_preamble(preamble, newest(&archived_dates), commit_sha),
+            &archive_preamble(preamble, newest(&archived_dates), history),
             sections,
         );
         if candidate.len() <= target {
@@ -322,11 +338,28 @@ fn parse_sections(content: &str) -> Result<(String, Vec<MonthSection>), String> 
     Ok((preamble, sections))
 }
 
-fn archive_preamble(preamble: &str, newest_archived: Option<&str>, commit_sha: &str) -> String {
+struct ArchiveHistory<'a> {
+    commit_sha: &'a str,
+    language: NotesLanguage,
+}
+
+fn archive_preamble(
+    preamble: &str,
+    newest_archived: Option<&str>,
+    history: &ArchiveHistory<'_>,
+) -> String {
     let Some(newest_archived) = newest_archived else {
         return preamble.to_owned();
     };
-    let note = format!("> {newest_archived} 以前は git 履歴（退避直前の commit: {commit_sha}）");
+    let commit_sha = history.commit_sha;
+    let note = match history.language {
+        NotesLanguage::Ja => {
+            format!("> {newest_archived} 以前は git 履歴（退避直前の commit: {commit_sha}）")
+        }
+        NotesLanguage::En => format!(
+            "> Entries through {newest_archived} are in git history (commit before archiving: {commit_sha})."
+        ),
+    };
 
     let records = preamble.split_inclusive('\n').collect::<Vec<_>>();
     if let Some(note_index) = records

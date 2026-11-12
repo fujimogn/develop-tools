@@ -710,3 +710,121 @@ fn staged_version_items_use_release_date_instead_of_month() {
         }
     }
 }
+
+#[test]
+fn archive_cli_uses_declared_english_and_preserves_retained_bytes() {
+    let (repo, head, _) = link_history();
+    fs::create_dir(repo.path().join(".config")).unwrap();
+    fs::write(repo.path().join(".config/develop-tools.json"), r#"{"release":{"changelogStamp":true,"notes":{"mode":"changelog-section","language":"en"}}}"#).unwrap();
+    let retained = format!(
+        "## 2099-12\r\n\r\n### 1.2.3 (2099-12-31)\r\n\r\nRelease summary.\r\n\r\n- **Keep (2099-12-31/v1.2.3, fast pane)**: Keeps the body. [{}](https://github.com/example/current/commit/{})\r\n  Continuation.\r\n",
+        &head[..8],
+        &head[..8]
+    );
+    let original = format!(
+        "# Changelog\r\n\r\n> Older entries remain in git history.\r\n\r\n{retained}\r\n## 2000-01\r\n- **Old (2000-01-01/v1.0.0)**: {}\r\n",
+        "x".repeat(361_000)
+    );
+    let path = repo.path().join("CHANGELOG.md");
+    fs::write(&path, &original).unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_archive-changelog"))
+            .current_dir(repo.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run(&[]);
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    run(&["--yes"]);
+    let expected = format!(
+        "# Changelog\r\n\r\n> Entries through 2000-01 are in git history (commit before archiving: {head}).\r\n\r\n{retained}\r\n"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+    run(&["--yes"]);
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+    git_ok(repo.path(), &["add", "."]);
+    let checked = run_checker(repo.path(), &[]);
+    assert_eq!(
+        checked.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+}
+
+#[test]
+fn archive_cli_uses_language_for_protected_month_dates_and_defaults_to_japanese() {
+    let (repo, head, _) = link_history();
+    fs::create_dir(repo.path().join(".config")).unwrap();
+    let manifest = repo.path().join(".config/develop-tools.json");
+    let retained = "- **Keep (2099-12-31/⏳, fast pane)**: Keeps the body.\n  Continuation.\n";
+    let original = format!(
+        "# Changelog\n\n> 2000-01 以前は git 履歴（退避直前の commit: old）\n\n## 2099-12\n{retained}\n- **Old (2099-12-01/⏳)**: {}\n",
+        "x".repeat(361_000)
+    );
+    let path = repo.path().join("CHANGELOG.md");
+    for (declaration, note) in [
+        (
+            r#"{"release":{"notes":{"mode":"changelog-additions","language":"en"}}}"#,
+            format!(
+                "> Entries through 2099-12-01 are in git history (commit before archiving: {head})."
+            ),
+        ),
+        (
+            r#"{"release":{"notes":{"mode":"changelog-additions","language":"ja"}}}"#,
+            format!("> 2099-12-01 以前は git 履歴（退避直前の commit: {head}）"),
+        ),
+        (
+            "{}",
+            format!("> 2099-12-01 以前は git 履歴（退避直前の commit: {head}）"),
+        ),
+    ] {
+        fs::write(&manifest, declaration).unwrap();
+        fs::write(&path, &original).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_archive-changelog"))
+            .current_dir(repo.path())
+            .arg("--yes")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("# Changelog\n\n{note}\n\n## 2099-12\n{retained}\n")
+        );
+    }
+}
+
+#[test]
+fn archive_cli_rejects_invalid_language_without_writing() {
+    let (repo, _, _) = link_history();
+    fs::create_dir(repo.path().join(".config")).unwrap();
+    fs::write(
+        repo.path().join(".config/develop-tools.json"),
+        r#"{"release":{"notes":{"mode":"changelog-additions","language":"fr"}}}"#,
+    )
+    .unwrap();
+    let path = repo.path().join("CHANGELOG.md");
+    let original = format!(
+        "# Changelog\n\n> Older entries remain in git history.\n\n## 2099-12\n- **Keep (2099-12-31)**: Kept.\n\n## 2000-01\n- **Old (2000-01-01)**: {}\n",
+        "x".repeat(361_000)
+    );
+    fs::write(&path, &original).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_archive-changelog"))
+        .current_dir(repo.path())
+        .arg("--yes")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("language"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+}

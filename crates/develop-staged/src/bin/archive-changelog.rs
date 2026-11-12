@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use develop_core::cli_help::Help;
-use develop_core::git;
-use develop_staged::docs_standard::plan_changelog_archive;
+use develop_core::{develop_tools_manifest, git};
+use develop_staged::docs_standard::plan_changelog_archive_with_language;
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -44,10 +44,16 @@ fn main() {
         Ok(sha) => sha,
         Err(message) => fatal(2, &message),
     };
-    let plan = match plan_changelog_archive(&content, &current_month, &commit_sha) {
-        Ok(plan) => plan,
-        Err(message) => fatal(1, &message),
+    let language = match changelog_language(&repo) {
+        Ok(language) => language,
+        Err(message) => fatal(2, &message),
     };
+    let plan =
+        match plan_changelog_archive_with_language(&content, &current_month, &commit_sha, language)
+        {
+            Ok(plan) => plan,
+            Err(message) => fatal(1, &message),
+        };
 
     println!(
         "CHANGELOG.md: {} bytes → {} bytes",
@@ -77,6 +83,17 @@ fn main() {
         fatal(2, &format!("{}: {error}", path.display()));
     }
     println!("CHANGELOG.md を更新しました。");
+}
+
+fn changelog_language(repo: &Path) -> Result<develop_tools_manifest::NotesLanguage, String> {
+    let Some(path) = develop_tools_manifest::locate(repo)? else {
+        return Ok(develop_tools_manifest::NotesLanguage::Ja);
+    };
+    let bytes = fs::read(repo.join(path)).map_err(|error| format!("{path}: {error}"))?;
+    let value = serde_json::from_slice(&bytes).map_err(|error| format!("{path}: {error}"))?;
+    let declared =
+        develop_tools_manifest::declaration(&value).map_err(|error| format!("{path}: {error}"))?;
+    Ok(declared.changelog_language())
 }
 
 fn git_toplevel() -> Result<PathBuf, String> {

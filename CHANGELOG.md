@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.18] - 2026-11-13
+
+### Changed
+
+- Update two Rust dependencies: `errno` to 0.3.15 and `ureq` to 3.5.2.
+
+### Fixed
+
+- Write the archive note of `archive-changelog` in the language selected by `release.notes.language` (English for `en`, Japanese when unset). Reject an unknown language without changing the file.
+
 ## [0.6.17] - 2026-11-12
 
 ### Added

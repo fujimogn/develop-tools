@@ -1,4 +1,4 @@
-# <!-- BEGIN develop-tools:ci-develop:standard v1 sha256=d8173ee6c846ba4f7409403c73c9534701d931924a4056cf1f72f2c7a4d1b63b -->
+# <!-- BEGIN develop-tools:ci-develop:standard v1 sha256=919249c52fa259587d43732722253ddc6a566dd8722510e08041f4d84f65c82f -->
 name: CI (develop)
 
 # develop の push と PR で走らせる軽い CI の標準の区画。develop-sync が .config/develop-tools.json の ci 宣言から作る。
@@ -63,7 +63,7 @@ jobs:
           gitleaks git . --redact --no-banner "$@" --log-opts=--all
       # 公開版の形: .config/develop-tools.json の版で固定した道具を入れ、変わった文書を見る。
       - name: Install develop tools
-        uses: fujimogn/develop-tools-action@7a8d259bb8b5ca07b2eea1fcd1d103d24c20ff0f # v0.3.6
+        uses: fujimogn/develop-tools-action@f2ec0193a6e9c880e3a0823f48538fa694a8e5dd # v0.3.7
       - name: Check tracked documentation
         if: github.event_name == 'push'
         run: develop-docs-check --tracked
@@ -89,7 +89,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - id: scope-install
-        uses: fujimogn/develop-tools-action@7a8d259bb8b5ca07b2eea1fcd1d103d24c20ff0f # v0.3.6
+        uses: fujimogn/develop-tools-action@f2ec0193a6e9c880e3a0823f48538fa694a8e5dd # v0.3.7
         continue-on-error: true
       - id: dependencies
         if: steps.scope-install.outcome == 'success'

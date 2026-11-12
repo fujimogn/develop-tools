@@ -132,7 +132,10 @@ fn changelog_style(
         serde_json::from_slice(&bytes).map_err(|error| format!("{path}（index）: {error}"))?;
     let declared = develop_tools_manifest::declaration(&value)
         .map_err(|error| format!("{path}（index）: {error}"))?;
-    Ok(ChangelogStyle::from_stamp(declared.changelog_stamp))
+    Ok(ChangelogStyle::from_language(
+        declared.changelog_stamp,
+        declared.changelog_language(),
+    ))
 }
 
 fn parse_args(args: &[OsString]) -> Result<Option<PathBuf>, String> {

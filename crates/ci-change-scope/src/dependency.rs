@@ -138,10 +138,25 @@ fn job_field(key: &str, value: &yaml_serde::Value) -> bool {
     }
 }
 
-fn step_field(key: &str, value: &yaml_serde::Value) -> bool {
+const GENERATED_CHECKOUT: &str = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
+
+fn generated_checkout_with(step: &yaml_serde::Value, value: &yaml_serde::Value) -> bool {
+    step.get("uses").and_then(yaml_serde::Value::as_str) == Some(GENERATED_CHECKOUT)
+        && step.as_mapping().is_some_and(|fields| fields.len() == 2)
+        && value.as_mapping().is_some_and(|inputs| {
+            inputs.len() == 1
+                && inputs
+                    .get("persist-credentials")
+                    .and_then(yaml_serde::Value::as_bool)
+                    == Some(false)
+        })
+}
+
+fn step_field(step: &yaml_serde::Value, key: &str, value: &yaml_serde::Value) -> bool {
     match key {
         "name" | "id" | "if" | "run" | "uses" | "working-directory" => value.as_str().is_some(),
         "continue-on-error" => value.as_bool() == Some(false),
+        "with" => generated_checkout_with(step, value),
         _ => false,
     }
 }
@@ -266,10 +281,9 @@ fn workflow_entries(tree: &Tree<'_>) -> Result<Vec<(String, String, String)>, St
                 .ok_or_else(|| format!("unknown job: {path}:{name}"))?;
             for (index, step) in steps.iter().enumerate() {
                 let fields = step.as_mapping().ok_or("non-mapping step")?;
-                if fields
-                    .iter()
-                    .any(|(key, value)| !key.as_str().is_some_and(|key| step_field(key, value)))
-                {
+                if fields.iter().any(|(key, value)| {
+                    !key.as_str().is_some_and(|key| step_field(step, key, value))
+                }) {
                     return Err(format!("unresolved step setting: {path}:{name}:{index}"));
                 }
                 if let Some(run) = step.get("run") {
@@ -285,6 +299,13 @@ fn workflow_entries(tree: &Tree<'_>) -> Result<Vec<(String, String, String)>, St
                     };
                     entries.push((id, run.to_owned(), dir.trim_matches('\'').to_owned()));
                 } else if let Some(action) = step.get("uses").and_then(yaml_serde::Value::as_str) {
+                    if action.starts_with("actions/checkout@")
+                        && !step
+                            .get("with")
+                            .is_some_and(|value| generated_checkout_with(step, value))
+                    {
+                        return Err(format!("unresolved checkout step: {path}:{name}:{index}"));
+                    }
                     if action.starts_with("./") || !known_action(action) {
                         return Err(format!("unknown action: {action}"));
                     }

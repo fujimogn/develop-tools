@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.17] - 2026-11-12
+
+### Added
+
+- Validate English `CHANGELOG.md` entries when `release.notes.language` is `en`, including ASCII date parentheses, optional supplements and version stamps. Monthly version subsections must have dates in the enclosing month, and stamped entries must match the subsection version.
+- Extract Release notes from dated version subsections under monthly headings. Render entry titles without dates or version stamps while preserving supplements, bodies and fenced examples.
+- Stamp English unreleased entries with Release links and move them into the target version subsection, preserving continuation lines and nested content. The subsection must already contain a summary paragraph.
+- Allow unreleased entries from earlier months to move into the current version subsection; reject entries dated after that subsection.
+- Validate implementation links in entries being moved before writing release files.
+
+### Changed
+
+- Update six Rust dependencies: `const-oid` to 0.10.3, `crc32fast` to 1.5.5, `itoa` to 1.0.19, `rustls-pki-types` to 1.16.0, `syn` to 3.0.10 and `webpki-roots` to 1.0.12.
+
+### Fixed
+
+- Archive English changelog entries by date, including stamped entries and supplements. Keep entries from the same day together and preserve entries whose dates cannot be parsed.
+- Accept the generated pinned checkout step with `persist-credentials: false` in the CI dependency proof and reject every other checkout step, including one without `with`.
+
 ## [0.6.16] - 2026-11-10
 
 ### Added

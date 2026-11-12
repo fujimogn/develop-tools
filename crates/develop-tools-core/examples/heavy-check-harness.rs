@@ -273,8 +273,28 @@ fn family_main() -> i32 {
             .arg(&home)
             .arg(&mode)
             .arg(sender.fd().to_string());
+        let control =
+            (mode == "logical-term").then(|| std::os::unix::net::UnixStream::pair().unwrap());
+        if let Some((_, descendant)) = &control {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            let fd = descendant.as_raw_fd();
+            command.env(LOGICAL_CLOCK_FD_ENV, fd.to_string());
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         sender.configure_worker(&mut command);
         let worker = supervisor::spawn(&mut command).unwrap();
+        let clock_control = control.map(|(supervisor, descendant)| {
+            drop(descendant);
+            supervisor
+        });
         drop(sender);
         let mut family = Family::new(worker, receiver).unwrap();
         println!("group:{}", family.group());
@@ -296,7 +316,13 @@ fn family_main() -> i32 {
             while !home.join("descendant-ready").exists() {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            let clock = StepClock(Cell::new(Duration::ZERO));
+            let peer = clock_control.unwrap();
+            // Only a deadlock guard; elapsed wall time is not a test oracle.
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let clock = StepClock {
+                now: Cell::new(Duration::ZERO),
+                peer: std::cell::RefCell::new(peer),
+            };
             family.signal(libc::SIGTERM, &clock).unwrap();
             let code = wait_preserving_family(&mut family, &clock);
             println!("logical-stopped:{}", clock.now().as_secs());
@@ -417,6 +443,17 @@ fn family_main() -> i32 {
     unsafe {
         libc::close(libc::STDOUT_FILENO);
     }
+    if let Some(fd) = std::env::var_os(LOGICAL_CLOCK_FD_ENV) {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        let fd = fd.to_str().unwrap().parse().unwrap();
+        let mut peer = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        loop {
+            let mut byte = [0];
+            peer.read_exact(&mut byte).unwrap();
+            peer.write_all(&byte).unwrap();
+        }
+    }
     loop {
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -429,14 +466,38 @@ fn ignore_signals() {
     }
 }
 
-struct StepClock(Cell<Duration>);
+const LOGICAL_CLOCK_FD_ENV: &str = "HEAVY_CHECK_TEST_CLOCK_FD";
+struct StepClock {
+    now: Cell<Duration>,
+    peer: std::cell::RefCell<std::os::unix::net::UnixStream>,
+}
 impl Clock for StepClock {
     fn now(&self) -> Duration {
-        self.0.get()
+        self.now.get()
     }
     fn sleep(&self, _: Duration) {
-        self.0.set(self.now() + Duration::from_secs(1));
-        std::thread::sleep(Duration::from_millis(10));
+        use std::io::Read;
+        let mut peer = self.peer.borrow_mut();
+        let mut byte = [0];
+        if self.now() < Duration::from_secs(5) {
+            // Each reply proves the descendant survived this logical tick,
+            // including the wait iteration at four seconds, before advancing.
+            peer.write_all(&byte)
+                .expect("group killed before five seconds");
+            peer.read_exact(&mut byte)
+                .expect("group killed before five seconds");
+            self.now.set(self.now() + Duration::from_secs(1));
+        } else {
+            // Freeze time at five. EOF proves KILL occurred at this tick;
+            // OS scheduling and reaping must not advance the grace clock.
+            assert_eq!(
+                peer.read(&mut byte)
+                    .expect("group not killed at five seconds"),
+                0,
+                "unexpected descendant reply after five seconds"
+            );
+            std::thread::yield_now();
+        }
     }
 }
 

@@ -29,7 +29,8 @@ pub fn inspect_changelog_with_git(
         .collect();
     let mut input = Input {
         repo: repo.github_name(),
-        changelog_stamp: style == ChangelogStyle::Stamped,
+        changelog_stamp: style.is_stamped(),
+        changelog_language: style.language(),
         ..Input::default()
     };
     input

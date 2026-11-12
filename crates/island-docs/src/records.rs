@@ -128,11 +128,38 @@ pub enum ChangelogStyle {
     #[default]
     Parenthesized,
     Stamped,
+    ParenthesizedEn,
+    StampedEn,
     /// 旧形式の比較試験用。宣言からは選ばない。
     Compact,
 }
 
 impl ChangelogStyle {
+    pub fn from_language(
+        enabled: bool,
+        language: develop_core::develop_tools_manifest::NotesLanguage,
+    ) -> Self {
+        use develop_core::develop_tools_manifest::NotesLanguage;
+        match (enabled, language) {
+            (false, NotesLanguage::Ja) => Self::Parenthesized,
+            (true, NotesLanguage::Ja) => Self::Stamped,
+            (false, NotesLanguage::En) => Self::ParenthesizedEn,
+            (true, NotesLanguage::En) => Self::StampedEn,
+        }
+    }
+
+    pub fn language(self) -> develop_core::develop_tools_manifest::NotesLanguage {
+        use develop_core::develop_tools_manifest::NotesLanguage;
+        match self {
+            Self::ParenthesizedEn | Self::StampedEn => NotesLanguage::En,
+            _ => NotesLanguage::Ja,
+        }
+    }
+
+    pub fn is_stamped(self) -> bool {
+        matches!(self, Self::Stamped | Self::StampedEn)
+    }
+
     pub fn from_stamp(enabled: bool) -> Self {
         if enabled {
             Self::Stamped
@@ -263,13 +290,27 @@ pub fn changelog_format_with_style(text: &str, style: ChangelogStyle) -> Vec<Fin
     let mut current_month = None;
     let mut previous_month = None;
     let mut previous_date: Option<String> = None;
+    let mut current_version = None;
     let mut item_indices = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let line_number = index + 1;
         if fenced[index] {
             continue;
         }
+        if let Some((version, date)) = develop_core::changelog_title::parse_version_heading(line) {
+            if current_month.as_deref() != date.get(..7) {
+                findings.push(finding(
+                    FindingKind::Error,
+                    Some(line_number),
+                    "版小節の日付の年月が月見出しと一致しません",
+                ));
+            }
+            current_version = Some((version, date));
+            previous_date = None;
+            continue;
+        }
         if line.starts_with("##") {
+            current_version = None;
             match parse_month_heading(line) {
                 Some(month) => {
                     if let Some(previous) = previous_month.as_deref() {
@@ -305,23 +346,43 @@ pub fn changelog_format_with_style(text: &str, style: ChangelogStyle) -> Vec<Fin
             ));
             continue;
         };
+        if let Some((version, _)) = current_version
+            && style.is_stamped()
+            && develop_core::changelog_title::parse_with_language(line, style.language())
+                .is_some_and(|item| {
+                    item.stamp != develop_core::changelog_title::Stamp::Released(version)
+                })
+        {
+            findings.push(finding(
+                FindingKind::Error,
+                Some(line_number),
+                "項目の印の版が版小節の版と一致しません",
+            ));
+        }
         let parsed = match style {
             ChangelogStyle::Parenthesized => parse_changelog_item(line),
-            ChangelogStyle::Stamped => develop_core::changelog_title::parse(line)
+            ChangelogStyle::ParenthesizedEn => parse_english_dated_item(line),
+            ChangelogStyle::Stamped | ChangelogStyle::StampedEn => develop_core::changelog_title::parse_with_language(line, style.language())
                 .map(|item| item.date.to_owned())
-                .ok_or_else(|| "この repo は release.changelogStamp を宣言しているので - **題（YYYY-MM-DD/⏳）**: 要約 か - **題（YYYY-MM-DD/[vX.Y.Z](Release URL)）**: 要約 にしてください".to_owned()),
+                .ok_or_else(|| match style {
+                    ChangelogStyle::StampedEn => "この repo は release.changelogStamp を宣言しているので - **Title (YYYY-MM-DD/⏳)**: Body か - **Title (YYYY-MM-DD/[vX.Y.Z](Release URL))**: Body にしてください",
+                    _ => "この repo は release.changelogStamp を宣言しているので - **題（YYYY-MM-DD/⏳）**: 要約 か - **題（YYYY-MM-DD/[vX.Y.Z](Release URL)）**: 要約 にしてください",
+                }.to_owned()),
             ChangelogStyle::Compact => develop_core::changelog_title::parse_legacy_compact(line)
                 .map(|(date, _)| date.to_owned())
                 .ok_or_else(|| "release.changelogStamp の旧い短形項目が不正です".to_owned()),
         };
         match parsed {
             Ok(date) => {
-                if date.get(..7) != Some(month) {
-                    findings.push(finding(
-                        FindingKind::Error,
-                        Some(line_number),
-                        format!("成果項目の日付の年月が見出し {month} と一致しません"),
-                    ));
+                let invalid_date = if let Some((_, release_date)) = current_version {
+                    (date.as_str() > release_date)
+                        .then(|| "成果項目の日付が版小節の日付より後になっています".to_owned())
+                } else {
+                    (date.get(..7) != Some(month))
+                        .then(|| format!("成果項目の日付の年月が見出し {month} と一致しません"))
+                };
+                if let Some(message) = invalid_date {
+                    findings.push(finding(FindingKind::Error, Some(line_number), message));
                 } else {
                     if previous_date
                         .as_deref()
@@ -410,6 +471,25 @@ pub fn changelog_item_date(line: &str) -> Option<String> {
             develop_core::changelog_title::parse_legacy_compact(line)
                 .map(|(date, _)| date.to_owned())
         })
+        .or_else(|| parse_english_dated_item(line).ok())
+        .or_else(|| {
+            develop_core::changelog_title::parse_with_language(
+                line,
+                develop_core::develop_tools_manifest::NotesLanguage::En,
+            )
+            .map(|item| item.date.to_owned())
+        })
+}
+
+fn parse_english_dated_item(line: &str) -> Result<String, String> {
+    develop_core::changelog_title::parse_dated(
+        line,
+        develop_core::develop_tools_manifest::NotesLanguage::En,
+    )
+    .map(str::to_owned)
+    .ok_or_else(|| {
+        "英語の成果項目は - **Title (YYYY-MM-DD, supplement)**: Body の形にしてください".to_owned()
+    })
 }
 
 fn parse_changelog_item(line: &str) -> Result<String, String> {
@@ -533,7 +613,7 @@ pub fn check(input: &Input) -> Vec<RuleFinding> {
                 Rule::Changelog,
                 changelog_format_with_style(
                     text,
-                    ChangelogStyle::from_stamp(input.changelog_stamp),
+                    ChangelogStyle::from_language(input.changelog_stamp, input.changelog_language),
                 ),
             ),
             _ => continue,
@@ -562,7 +642,10 @@ pub fn check(input: &Input) -> Vec<RuleFinding> {
                     if fenced[index] {
                         continue;
                     }
-                    let Some(parsed) = develop_core::changelog_title::parse(line) else {
+                    let Some(parsed) = develop_core::changelog_title::parse_with_language(
+                        line,
+                        input.changelog_language,
+                    ) else {
                         continue;
                     };
                     let Some(url) = parsed.release_url else {
@@ -632,6 +715,39 @@ mod tests {
 
     const TODO: &str = "# TODO\n\n## 進行中\n\n- [ ] **項目**。現在地。\n  - 補足\n";
     const CHANGELOG: &str = "# Changelog\n\n> 古い分は git 履歴に任せる。\n\n## 2026-09\n\n- **成果（2026-09-30）**: 要約。\n";
+
+    #[test]
+    fn archive_reads_english_dates_without_relaxing_language_specific_validation() {
+        for item in [
+            "- **Docs (2026-11-05)**: Body",
+            "- **Docs (2026-11-05, note)**: Body",
+            "- **Docs (2026-11-05/⏳)**: Body",
+            "- **Docs (2026-11-05/v1.2.3)**: Body",
+            "- **Docs (2026-11-05/[v1.2.3](https://github.com/example/notes/releases/tag/v1.2.3), note)**: Body",
+        ] {
+            assert_eq!(
+                changelog_item_date(item).as_deref(),
+                Some("2026-11-05"),
+                "{item}"
+            );
+            let document = format!("# Changelog\n> git history\n\n## 2026-11\n{item}\n");
+            assert!(
+                inspect_changelog(document.as_bytes())
+                    .iter()
+                    .any(|finding| finding.kind == FindingKind::Error),
+                "{item}"
+            );
+        }
+        for item in [
+            "- **Mixed (2026-11-05、note)**: Body",
+            "- **Mixed (2026-11-05/⏳）**: Body",
+            "- **Docs (2026-02-30)**: Body",
+            "- **Docs (2026-11-05/[v1.2.3](https://github.com/example/notes/releases/tag/v1.2.2))**: Body",
+            "- **Docs (2026-11-05/⏳)**:",
+        ] {
+            assert_eq!(changelog_item_date(item), None, "{item}");
+        }
+    }
 
     #[test]
     fn body_bold_date_does_not_replace_title_date() {

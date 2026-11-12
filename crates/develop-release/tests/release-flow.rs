@@ -2841,6 +2841,324 @@ fn section_fixture(notes: &str, changelog: &str) -> Fixture {
     fixture
 }
 
+fn english_stamp_fixture(changelog: &str, source: &str) -> Fixture {
+    let fixture = section_fixture(
+        &format!(r#"{{"mode":"{source}","language":"en"}}"#),
+        changelog,
+    );
+    let root = fixture.path();
+    let path = root.join(".config/develop-tools.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    manifest["release"]["changelogStamp"] = true.into();
+    std::fs::write(path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "declare English stamps"]);
+    fixture
+}
+
+fn assert_english_stamp_check(root: &Path) {
+    use island_docs::records::{ChangelogStyle, FindingKind, inspect_changelog_with_style};
+    let content = std::fs::read(root.join("CHANGELOG.md")).unwrap();
+    let errors: Vec<_> = inspect_changelog_with_style(&content, ChangelogStyle::StampedEn)
+        .into_iter()
+        .filter(|finding| finding.kind == FindingKind::Error)
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn english_pending_commit_checks_then_moves_into_the_release_section_and_extracts() {
+    let before = include_str!("english-section-before.txt");
+    let fixture = english_stamp_fixture(before, "changelog-section");
+    let root = fixture.path();
+    assert_english_stamp_check(root);
+    let (output, _) = release_with(root, &["patch", "--no-ai"]);
+    let body = assert_annotated_v124(root, &output);
+    let expected = include_str!("english-section-after.txt");
+    assert_eq!(
+        std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+        expected
+    );
+    assert_english_stamp_check(root);
+    assert!(
+        body.contains("Release summary stays.\n\n- **New (fast pane)**: Fix:"),
+        "{body}"
+    );
+    assert!(!body.contains("Older summary"), "{body}");
+    assert!(!body.contains("Independent paragraph"), "{body}");
+    assert!(!body.contains("Standalone example"), "{body}");
+    assert!(!body.contains("2026-11-11/"), "{body}");
+    let fixed = FixedNotes::resolve(
+        root,
+        "v1.2.3",
+        &git(root, &["rev-parse", "HEAD"]),
+        "v1.2.4",
+        None,
+    )
+    .unwrap();
+    assert_eq!(fixed.extract().unwrap().items.len(), 1);
+}
+
+#[test]
+fn english_cross_month_pending_checks_moves_and_extracts() {
+    let input = "# Changelog\n\n> Older entries live in git history.\n\n## 2026-11\n\n### 1.2.4 (2026-11-11)\n\nRelease summary stays.\n\n## 2026-10\n\n- **October (2026-10-31/⏳, fast pane)**: Carried over.\n  Details remain.\n\n## 2026-09\n\n- **Past (2026-09-30/v1.2.3)**: Keep.\n";
+    let expected = "# Changelog\n\n> Older entries live in git history.\n\n## 2026-11\n\n### 1.2.4 (2026-11-11)\n\nRelease summary stays.\n\n- **October (2026-10-31/[v1.2.4](https://github.com/example/notes-repo/releases/tag/v1.2.4), fast pane)**: Carried over.\n  Details remain.\n\n## 2026-10\n\n## 2026-09\n\n- **Past (2026-09-30/v1.2.3)**: Keep.\n";
+    let fixture = english_stamp_fixture(input, "changelog-section");
+    let root = fixture.path();
+    assert_english_stamp_check(root);
+    let (output, _) = release_with(root, &["patch", "--no-ai"]);
+    let body = assert_annotated_v124(root, &output);
+    assert_eq!(
+        std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+        expected
+    );
+    assert_english_stamp_check(root);
+    assert!(
+        body.contains(
+            "Release summary stays.\n\n- **October (fast pane)**: Carried over.\n  Details remain."
+        ),
+        "{body}"
+    );
+    assert!(!body.contains("Past"), "{body}");
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn english_pending_block_moves_to_the_last_section_with_its_indented_fence() {
+    let input = "# Changelog\n\n> Older entries live in git history.\n\n## 2026-11\n\n- **New (2026-11-11/⏳)**: Body.\n\n  ```md\n  - **Example (2026-11-11/⏳)**: Keep.\n  ```\n\n### 1.2.4 (2026-11-11)\n\nSummary without a final newline.";
+    let expected = "# Changelog\n\n> Older entries live in git history.\n\n## 2026-11\n\n### 1.2.4 (2026-11-11)\n\nSummary without a final newline.\n\n- **New (2026-11-11/[v1.2.4](https://github.com/example/notes-repo/releases/tag/v1.2.4))**: Body.\n\n  ```md\n  - **Example (2026-11-11/⏳)**: Keep.\n  ```\n\n";
+    let fixture = english_stamp_fixture(input, "changelog-section");
+    let root = fixture.path();
+    assert_english_stamp_check(root);
+    let (output, _) = release_with(root, &["patch", "--no-ai"]);
+    let body = assert_annotated_v124(root, &output);
+    assert_eq!(
+        std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+        expected
+    );
+    assert!(body.contains("Summary without a final newline."), "{body}");
+    assert_english_stamp_check(root);
+}
+
+#[test]
+fn english_moved_pending_commit_links_are_verified_before_any_version_write() {
+    let input = "# Changelog\n\n> Older entries live in git history.\n\n## 2026-11\n\n- **New (2026-11-11/⏳)**: Body.\n\n### 1.2.4 (2026-11-11)\n\nSummary.\n";
+    for first_release in [false, true] {
+        for repo in ["other/repo", "example/notes-repo"] {
+            let fixture = english_stamp_fixture(input, "changelog-section");
+            let root = fixture.path();
+            if first_release {
+                git(root, &["tag", "-d", "v1.2.3"]);
+            }
+            let oid = git(root, &["rev-parse", "HEAD"]);
+            let sha = &oid[..7];
+            let suffix = format!("[{sha}](https://github.com/{repo}/commit/{sha})");
+            let text = input.replace("Body.", &format!("Body. {suffix}"));
+            std::fs::write(root.join("CHANGELOG.md"), &text).unwrap();
+            git(root, &["add", "CHANGELOG.md"]);
+            git(root, &["commit", "-qm", "pending with commit link"]);
+            let before = git(root, &["rev-parse", "HEAD"]);
+            let main = git(root, &["rev-parse", "main"]);
+            let package = std::fs::read(root.join("package.json")).unwrap();
+            let tags = git(root, &["tag", "--list"]);
+            let (output, _) = release_with(root, &["patch", "--no-ai"]);
+            if repo == "other/repo" {
+                assert!(!output.status.success());
+                assert!(String::from_utf8_lossy(&output.stderr).contains("commit_link"));
+                assert_eq!(git(root, &["rev-parse", "HEAD"]), before);
+                assert_eq!(git(root, &["rev-parse", "main"]), main);
+                assert_eq!(git(root, &["tag", "--list"]), tags);
+                assert_eq!(std::fs::read(root.join("package.json")).unwrap(), package);
+                assert_eq!(
+                    std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+                    text
+                );
+            } else {
+                let body = assert_annotated_v124(root, &output);
+                assert!(body.contains(&suffix), "{body}");
+                let stamped = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+                assert!(stamped.contains(&format!("Body. {suffix}")), "{stamped}");
+                assert!(stamped.contains("New (2026-11-11/[v1.2.4]"), "{stamped}");
+                assert_english_stamp_check(root);
+            }
+            assert_eq!(git(root, &["status", "--porcelain"]), "");
+        }
+    }
+}
+
+#[test]
+fn english_stamp_preserves_supplements_existing_versions_fences_and_line_endings() {
+    let before = "- **New (2026-11-11/⏳, 2026-11-10/v1.2.3)**: Body /⏳.\r\n  - **Nested (2026-11-11/⏳)**: Keep.\r\n```md\r\n- **Example (2026-11-11/⏳)**: Keep.\r\n```\r\n- **Past (2026-11-10/v1.2.3)**: Keep.\r\n- **Linked (2026-11-09/[v1.2.2](https://github.com/example/notes-repo/releases/tag/v1.2.2))**: Keep.";
+    let expected = "- **New (2026-11-11/[v1.2.4](https://github.com/example/notes-repo/releases/tag/v1.2.4), 2026-11-10/v1.2.3)**: Body /⏳.\r\n  - **Nested (2026-11-11/⏳)**: Keep.\r\n```md\r\n- **Example (2026-11-11/⏳)**: Keep.\r\n```\r\n- **Past (2026-11-10/v1.2.3)**: Keep.\r\n- **Linked (2026-11-09/[v1.2.2](https://github.com/example/notes-repo/releases/tag/v1.2.2))**: Keep.";
+    let version = "1.2.4".parse().unwrap();
+    assert_eq!(
+        develop_release::stamp_changelog_with_language(
+            before,
+            version,
+            "example/notes-repo",
+            NotesLanguage::En
+        ),
+        (expected.to_owned(), 1)
+    );
+    assert_eq!(
+        develop_release::stamp_changelog_with_language(
+            expected,
+            version,
+            "example/notes-repo",
+            NotesLanguage::En
+        ),
+        (expected.to_owned(), 0)
+    );
+    assert_eq!(
+        develop_release::stamp_changelog(before, version, "example/notes-repo"),
+        (before.to_owned(), 0)
+    );
+}
+
+#[test]
+fn english_section_errors_leave_every_file_branch_and_tag_unchanged() {
+    let valid = "# Changelog\n\n> Older entries live in git history.\n\n## 2026-11\n\n- **New (2026-11-11/⏳)**: Body.\n\n### 1.2.4 (2026-11-11)\n\nRelease summary.\n";
+    for (input, code, detail) in [
+        (
+            valid.replace("New (2026-11-11", "New (2026-11-12"),
+            "changelog_section_date",
+            "New",
+        ),
+        (
+            format!("{valid}\n## 2026-12\n\n- **Future item (2026-12-01/⏳)**: Body.\n"),
+            "changelog_section_date",
+            "Future item",
+        ),
+        (
+            valid.replace(
+                "/⏳",
+                "/[v1.2.3](https://github.com/wrong/repo/releases/tag/v1.2.3)",
+            ),
+            "changelog_stamp_invalid",
+            "origin",
+        ),
+        (
+            valid.replace(
+                "/⏳",
+                "/[v1.2.4](https://github.com/example/notes-repo/releases/tag/v1.2.3)",
+            ),
+            "changelog_stamp_invalid",
+            "",
+        ),
+        (valid.replace("Release summary.", ""), "section_empty", ""),
+        (
+            valid.replace(
+                "Release summary.",
+                "- **Already (2026-11-11/v1.2.4)**: Existing item without a summary.",
+            ),
+            "changelog_section_summary_missing",
+            "要約段落",
+        ),
+        (
+            format!("{valid}\n### 1.2.4 (2026-11-11)\n\nDuplicate.\n"),
+            "section_duplicate",
+            "",
+        ),
+        (
+            valid.replace("### 1.2.4 (2026-11-11)", "### 1.2.5 (2026-11-11)"),
+            "section_missing",
+            "",
+        ),
+        (
+            valid.replace("/⏳", "/v1.2.3"),
+            "changelog_section_pending_empty",
+            "",
+        ),
+        (
+            format!(
+                "{valid}\n### 1.2.3 (2026-11-10)\n\n- **Old pending (2026-11-10/⏳)**: Keep.\n"
+            ),
+            "changelog_section_pending:",
+            "Old pending (2026-11)",
+        ),
+    ] {
+        let fixture = english_stamp_fixture(&input, "changelog-section");
+        let root = fixture.path();
+        let head = git(root, &["rev-parse", "HEAD"]);
+        let main = git(root, &["rev-parse", "main"]);
+        let package = std::fs::read(root.join("package.json")).unwrap();
+        let (output, _) = release_with(root, &["patch", "--no-ai"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{input}");
+        assert!(stderr.contains(code) && stderr.contains(detail), "{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+            input
+        );
+        assert_eq!(std::fs::read(root.join("package.json")).unwrap(), package);
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(root, &["rev-parse", "main"]), main);
+        assert_eq!(git(root, &["tag", "--list"]), "v1.2.3");
+        assert_eq!(git(root, &["status", "--porcelain"]), "");
+    }
+}
+
+#[test]
+fn english_monthly_additions_stamp_pending_and_exclude_other_versions() {
+    let before = "# Changelog\n\n> Older entries live in git history.\n\n## 2026-11\n\n- **New (2026-11-11/⏳, fast pane)**: Body.\n\n- **Old (2026-11-10/v1.2.2)**: Old body.\n";
+    let fixture = english_stamp_fixture(before, "changelog-additions");
+    let root = fixture.path();
+    assert_english_stamp_check(root);
+    let (output, _) = release_with(root, &["patch", "--no-ai"]);
+    let body = assert_annotated_v124(root, &output);
+    assert_english_stamp_check(root);
+    assert!(body.contains("New (2026-11-11/[v1.2.4]"), "{body}");
+    assert!(!body.contains("Old body"), "{body}");
+    let extract = extract_release(root, "HEAD", "v1.2.4", None).unwrap();
+    assert_eq!(extract.language, NotesLanguage::En);
+    assert_eq!(extract.items.len(), 1);
+}
+
+#[test]
+fn english_additions_ai_input_removes_the_stamp_but_keeps_the_supplement() {
+    let fixture = english_stamp_fixture(
+        "# Changelog\n\n## 2026-11\n\n- **New (2026-11-11/⏳, fast pane)**: Body.\n",
+        "changelog-additions",
+    );
+    let root = fixture.path();
+    let declared = develop_release::release_notes::declared_notes(root)
+        .unwrap()
+        .unwrap();
+    let extract = prepare_notes(root, declared, "v1.2.4")
+        .unwrap()
+        .extract(root, "HEAD")
+        .unwrap();
+    let env = NotesEnv::new(Some(&full_settings()));
+    let transport = CountingTransport::json(
+        serde_json::json!({"summary":"New behavior.","items":[{"text":"Body.","sources":[1]}]}),
+    );
+    let runtime = AiRuntime {
+        home: env.temp.path().to_owned(),
+        op_program: fake_op().join("fake-op"),
+        op_service_account_token: Some("fixture".to_owned()),
+        transport: &transport,
+    };
+    release_body(
+        &extract,
+        NotesPlan::Ai {
+            audience: Audience::Private,
+        },
+        false,
+        &env.settings(),
+        &runtime,
+    );
+    let request = transport.last_body.borrow();
+    let input = request.as_ref().expect("AI transport called")["messages"][0]["content"]
+        .as_str()
+        .unwrap();
+    assert!(input.contains("New (fast pane)"), "{input}");
+    assert!(
+        !input.contains("2026-11-11") && !input.contains("/⏳"),
+        "{input}"
+    );
+}
+
 fn monthly_first_fixture(changelog: &str) -> (Fixture, String) {
     let fixture = notes_fixture(Some(AI_PRIVATE), None);
     let root = fixture.path();
@@ -2950,7 +3268,7 @@ fn monthly_first_release_stamps_every_pending_item_and_annotates_the_tag() {
 #[test]
 fn monthly_first_release_uses_english_for_the_base_label_when_declared() {
     let (fixture, base) =
-        monthly_first_fixture("# CHANGELOG\n\n## 2026-10\n\n- **First（2026-10-01/⏳）**: done\n");
+        monthly_first_fixture("# CHANGELOG\n\n## 2026-10\n\n- **First (2026-10-01/⏳)**: done\n");
     let root = fixture.path();
     let manifest = root.join(".config/develop-tools.json");
     let text = std::fs::read_to_string(&manifest).unwrap();
@@ -3283,4 +3601,64 @@ fn compact_stamp_preserves_bytes_and_is_idempotent_without_final_newline() {
         develop_release::stamp_changelog(expected, version, "owner/repo"),
         (expected.to_owned(), 0)
     );
+}
+
+#[test]
+fn section_ai_input_does_not_parse_a_normalized_supplement_as_a_second_stamp() {
+    for (language, item, expected, purpose_name, summary) in [
+        (
+            NotesLanguage::Ja,
+            "- **題（2026-11-09/⏳、2026-11-08/v1.2.3）**: 本文",
+            "- **題（2026-11-08/v1.2.3）**: 本文",
+            "release-notes",
+            "表示を改善しました。",
+        ),
+        (
+            NotesLanguage::En,
+            "- **Title (2026-11-09/⏳, 2026-11-08/v1.2.3)**: Body",
+            "- **Title (2026-11-08/v1.2.3)**: Body",
+            "release-notes-en",
+            "Display improved.",
+        ),
+    ] {
+        let fixture = section_fixture(
+            AI_SECTION_PUBLIC,
+            &format!("## 2026-11\n### 1.2.4 (2026-11-09)\n\n{item}\n"),
+        );
+        let root = fixture.path();
+        let env = NotesEnv::new(Some(&full_settings()));
+        let transport = CountingTransport::json(serde_json::json!({
+            "summary": summary,
+            "items": [{"text": summary, "sources": [1]}],
+        }));
+        let declared = DeclaredNotes {
+            plan: NotesPlan::Ai {
+                audience: Audience::Public,
+            },
+            source: NotesSource::ChangelogSection,
+            language,
+        };
+        let prepared = prepare_notes(root, declared, "v1.2.4").unwrap();
+        let extract = prepared.extract(root, "HEAD").unwrap();
+        assert_eq!(extract.items, [expected]);
+        assert!(extract.render().contains(expected));
+        let body = release_body(
+            &extract,
+            prepared.plan(),
+            false,
+            &env.settings(),
+            &env.runtime(&transport),
+        );
+        assert!(
+            matches!(body.source, BodySource::Ai { .. }),
+            "{:?}",
+            body.source
+        );
+        assert_eq!(transport.calls.get(), 1);
+        let purpose = island_llm::purpose::find(purpose_name).unwrap();
+        assert_eq!(
+            transport.last_body.borrow().as_ref().unwrap()["messages"][0]["content"],
+            format!("{}[1] {expected}\n", purpose.instruction)
+        );
+    }
 }

@@ -275,6 +275,21 @@ pub(crate) fn is_date(text: &str) -> bool {
 /// トップレベル項目の未リリース印を Release link へ書き換える。
 /// 日付・本文・改行は保ち、入れ子・見出し・code fence の中は触らない。
 pub fn stamp_changelog(text: &str, version: Version, repo: &str) -> (String, usize) {
+    stamp_changelog_with_language(
+        text,
+        version,
+        repo,
+        develop_tools_core::develop_tools_manifest::NotesLanguage::Ja,
+    )
+}
+
+/// 宣言した言語の未公開印だけを置換する。
+pub fn stamp_changelog_with_language(
+    text: &str,
+    version: Version,
+    repo: &str,
+    language: develop_tools_core::develop_tools_manifest::NotesLanguage,
+) -> (String, usize) {
     use develop_tools_core::changelog_title::{self, Stamp};
 
     let mut count = 0;
@@ -284,7 +299,8 @@ pub fn stamp_changelog(text: &str, version: Version, repo: &str) -> (String, usi
         let parsed = if fence.step(line) || fence.is_open() {
             None
         } else {
-            changelog_title::parse(line).filter(|parsed| parsed.stamp == Stamp::Unreleased)
+            changelog_title::parse_with_language(line, language)
+                .filter(|parsed| parsed.stamp == Stamp::Unreleased)
         };
         if let Some(parsed) = parsed {
             out.push_str(&line[..parsed.stamp_range.start]);
@@ -298,6 +314,164 @@ pub fn stamp_changelog(text: &str, version: Version, repo: &str) -> (String, usi
         out.push_str(line);
     }
     (out, count)
+}
+
+/// 事前照合と実書込みで、同じ宣言から同じ移動・刻印の結果を作る。
+pub(crate) fn stamp_changelog_for_notes(
+    text: &str,
+    version: Version,
+    repo: &str,
+    notes: Option<release_notes::DeclaredNotes>,
+) -> Result<(String, usize), String> {
+    use develop_tools_core::develop_tools_manifest::{NotesLanguage, NotesSource};
+    let language = notes.map_or(NotesLanguage::Ja, |notes| notes.language);
+    let planned = notes
+        .filter(|notes| notes.source == NotesSource::ChangelogSection)
+        .map(|_| prepare_changelog_section(text, version, language))
+        .transpose()?;
+    Ok(stamp_changelog_with_language(
+        planned.as_deref().unwrap_or(text),
+        version,
+        repo,
+        language,
+    ))
+}
+
+/// 月直下の未公開項目を、作成側が用意した今回版の要約の後へ移す。
+/// 旧 ## 版の節は変更せず、書込み前に全対象の所属を確かめる。
+pub(crate) fn prepare_changelog_section(
+    text: &str,
+    version: Version,
+    language: develop_tools_core::develop_tools_manifest::NotesLanguage,
+) -> Result<String, String> {
+    use develop_tools_core::changelog_title::{Stamp, parse_version_heading, parse_with_language};
+
+    let expected = version.to_string();
+    let mut month = None;
+    let mut saw_month = false;
+    let mut in_version = false;
+    let mut target = None;
+    let mut target_end = None;
+    let mut pending = Vec::new();
+    let mut item: Option<(String, String, usize)> = None;
+    let mut fence = release_notes::Fence::default();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        // 空行は項目と一緒に保ち、独立した段落や fence は元の位置へ残す。
+        if !fence.is_open()
+            && !line.trim().is_empty()
+            && !line.starts_with([' ', '\t'])
+            && let Some((title, date, start)) = item.take()
+        {
+            pending.push((title, date, start..offset));
+        }
+        let fenced = fence.step(line) || fence.is_open();
+        if !fenced {
+            let heading =
+                line.starts_with("# ") || line.starts_with("## ") || line.starts_with("### ");
+            if target.is_some() && target_end.is_none() && heading {
+                target_end = Some(offset);
+            }
+            let plain = line.trim_end_matches(['\r', '\n']);
+            if line.starts_with("# ") || line.starts_with("## ") {
+                month = release_notes::monthly_heading(plain).then(|| plain[3..].to_owned());
+                saw_month |= month.is_some();
+                in_version = false;
+            } else if let Some((found, date)) = parse_version_heading(plain) {
+                in_version = true;
+                if found == expected {
+                    if target.is_some() {
+                        return Err(
+                            "changelog_section_duplicate: 今回版の小節が複数あります".to_owned()
+                        );
+                    }
+                    if month.as_deref() != date.get(..7) {
+                        return Err(
+                            "changelog_section_month: 今回版の日付と月見出しが一致しません"
+                                .to_owned(),
+                        );
+                    }
+                    target = Some(date.to_owned());
+                    target_end = None;
+                }
+            }
+            if let Some(parsed) = parse_with_language(line, language)
+                && parsed.stamp == Stamp::Unreleased
+                && let Some(month) = &month
+            {
+                if in_version {
+                    return Err(format!(
+                        "changelog_section_pending: {} ({month}) は版小節内にあります。未公開項目は月の直下に置いてください",
+                        parsed.title
+                    ));
+                }
+                item = Some((parsed.title.to_owned(), parsed.date.to_owned(), offset));
+            }
+        }
+        offset += line.len();
+    }
+    if let Some((title, date, start)) = item {
+        pending.push((title, date, start..text.len()));
+    }
+    let Some(target_date) = target else {
+        // 旧版節は従来の読取・刻印契約を維持する。
+        if saw_month {
+            return Err(format!(
+                "changelog_section_missing: ### {version} (YYYY-MM-DD) と要約を用意してください"
+            ));
+        }
+        return Ok(text.to_owned());
+    };
+    let section = release_notes::extract_changelog_section(text, &expected)
+        .map_err(|error| format!("changelog_section_invalid: {error}"))?;
+    if section.body.starts_with("- ") {
+        return Err(
+            "changelog_section_summary_missing: 今回版小節の直下に要約段落が必要です".to_owned(),
+        );
+    }
+    let future_items: Vec<_> = pending
+        .iter()
+        .filter(|(_, date, _)| date > &target_date)
+        .map(|(title, date, _)| format!("{title} ({date})"))
+        .collect();
+    if !future_items.is_empty() {
+        return Err(format!(
+            "changelog_section_date: {} は今回版の日付 {target_date} より後です",
+            future_items.join(", ")
+        ));
+    }
+    if pending.is_empty() {
+        return Err("changelog_section_pending_empty: 月直下に未公開項目がありません".to_owned());
+    }
+    let insert = target_end.unwrap_or(text.len());
+    let mut moved = String::new();
+    let mut edits = Vec::with_capacity(pending.len() + 1);
+    for (_, _, range) in pending {
+        moved.push_str(&text[range.clone()]);
+        edits.push((range, String::new()));
+    }
+    let separator = if text[..insert].ends_with("\n\n") {
+        ""
+    } else if text[..insert].ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    moved.insert_str(0, separator);
+    if insert < text.len() && !moved.ends_with('\n') {
+        moved.push('\n');
+    }
+    edits.push((insert..insert, moved));
+    edits.sort_by_key(|(range, _)| range.start);
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (range, replacement) in edits {
+        out.push_str(&text[cursor..range.start]);
+        out.push_str(&replacement);
+        cursor = range.end;
+    }
+    out.push_str(&text[cursor..]);
+    Ok(out)
 }
 
 /// JSON の top-level version の文字列値だけを探す。JSON の妥当性は呼出側が先に検証する。

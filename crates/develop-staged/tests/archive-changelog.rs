@@ -314,3 +314,41 @@ fn yes_archives_old_dates_of_the_current_month_when_it_alone_is_over_the_cap() {
     )));
     assert!(result.len() <= 288_000);
 }
+
+#[test]
+fn english_items_archive_by_date_and_preserve_unreadable_items() {
+    let month = current_month();
+    let newest = format!("- **Newest ({month}-20/⏳)**: {}\n", "n".repeat(150_000));
+    let released = format!(
+        "- **Released ({month}-10/[v1.2.3](https://github.com/example/notes/releases/tag/v1.2.3), shipped)**: {}\n  Release details.\n",
+        "x".repeat(150_000)
+    );
+    let same_day = format!("- **Same day ({month}-10/v1.2.2)**: Archive together.\n");
+    let oldest = format!("- **Oldest ({month}-01)**: {}\n", "x".repeat(150_000));
+    let unreadable = format!(
+        "- **Mixed ({month}-01、note)**: Keep mixed punctuation.\n- **Mixed ({month}-01/⏳）**: Keep mixed brackets.\n- **Undated**: Keep this entry too.\n"
+    );
+    let content = format!(
+        "# Changelog\n> Older entries remain in git history.\n\n## {month}\n{newest}{released}{same_day}{oldest}{unreadable}"
+    );
+    assert!(content.len() > 360_000);
+    let repo = repo_with_changelog(&content);
+
+    let dry = run_archiver(repo.path(), &[]);
+    assert!(dry.status.success(), "{}", output_text(&dry));
+    assert!(output_text(&dry).contains(&format!("退避する保護月の日付: {month}-01〜{month}-10")));
+    assert_eq!(
+        fs::read_to_string(repo.path().join("CHANGELOG.md")).unwrap(),
+        content
+    );
+
+    let output = run_archiver(repo.path(), &["--yes"]);
+    assert!(output.status.success(), "{}", output_text(&output));
+    let result = fs::read_to_string(repo.path().join("CHANGELOG.md")).unwrap();
+    assert!(result.contains(&newest));
+    assert!(!result.contains(&released));
+    assert!(!result.contains(&same_day));
+    assert!(!result.contains(&oldest));
+    assert!(result.contains(&unreadable));
+    assert!(result.len() <= 288_000);
+}

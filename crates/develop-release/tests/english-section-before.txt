@@ -1,0 +1,25 @@
+# Changelog
+
+> Older entries live in git history.
+
+## 2026-11
+
+- **New (2026-11-11/⏳, fast pane)**: Fix: keeps /⏳ in the body.
+  Continuation stays.
+  - Nested text stays.
+
+Independent paragraph remains in the month.
+
+```md
+- **Standalone example (2026-11-11/⏳)**: Keep this unindented fence in place.
+```
+
+### 1.2.4 (2026-11-11)
+
+Release summary stays.
+
+### 1.2.3 (2026-11-09)
+
+Older summary.
+
+- **Older (2026-11-09/v1.2.3)**: Maintenance: already shipped.

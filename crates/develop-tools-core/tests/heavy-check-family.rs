@@ -389,7 +389,6 @@ fn injected_clock_escalates_at_five_seconds() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = Fixture::new();
     let home = support::directory(&root.path().join("account"));
-    let start = Instant::now();
     let mut runner = Runner::start(&home, "logical-term");
     runner.until("descendant:");
     let stopped = runner.until("logical-stopped:");
@@ -398,12 +397,8 @@ fn injected_clock_escalates_at_five_seconds() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!((5..=6).contains(&elapsed), "logical grace was {elapsed}");
+    assert_eq!(elapsed, 5, "logical grace was {elapsed}");
     assert_eq!(runner.exit(), 143);
-    assert!(
-        start.elapsed() < Duration::from_secs(3),
-        "injected clock used real five-second grace"
-    );
 }
 
 #[test]

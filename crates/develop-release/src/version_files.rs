@@ -49,6 +49,7 @@ pub struct VersionFiles {
     files: Vec<(String, String, Kind)>,
     current: Version,
     changelog_stamp: bool,
+    notes: Option<crate::release_notes::DeclaredNotes>,
 }
 
 fn read(root: &Path, relative: &str) -> Result<String, String> {
@@ -325,6 +326,11 @@ impl VersionFiles {
         }
         let mut files = Self::from_source(source, release.version_files)?;
         files.changelog_stamp = declared.changelog_stamp;
+        files.notes = declared
+            .release_notes
+            .as_ref()
+            .map(crate::release_notes::normalize_notes)
+            .transpose()?;
         Ok(files)
     }
 
@@ -387,6 +393,7 @@ impl VersionFiles {
             files,
             current: first.expect("not empty").1,
             changelog_stamp: false,
+            notes: None,
         })
     }
 
@@ -420,7 +427,8 @@ impl VersionFiles {
         // 宣言の無い repo では CHANGELOG を読まない。宣言があって file が無いのは宣言の誤りなので止める。
         if self.changelog_stamp {
             let repo = crate::release_notes::remote_repo(root)?;
-            let (stamped, count) = crate::stamp_changelog(&read(root, CHANGELOG)?, next, &repo);
+            let (stamped, count) =
+                crate::stamp_changelog_for_notes(&read(root, CHANGELOG)?, next, &repo, self.notes)?;
             if count > 0 {
                 changes.push((root.join(CHANGELOG), stamped));
                 written.push(CHANGELOG.to_owned());

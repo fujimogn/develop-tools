@@ -1,0 +1,146 @@
+# <!-- BEGIN develop-tools:ci-develop:standard v1 sha256=d8173ee6c846ba4f7409403c73c9534701d931924a4056cf1f72f2c7a4d1b63b -->
+name: CI (develop)
+
+# develop の push と PR で走らせる軽い CI の標準の区画。develop-sync が .config/develop-tools.json の ci 宣言から作る。
+# Rust は cargo test --workspace --locked --lib --bins を使い、標準 step では integration test と doc test は走らせない。
+# integration test と doc test は main と Release の CI で確かめる。ci.rust.extraSteps に宣言したコマンドは、この区画の rust job の最後で走る。
+# 区画の中は手で直さず、宣言を直して develop-sync --ci-develop で配り直す。repo 固有の job は END の目印の後ろに書く。
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+# PR の更新だけを集約する。push は各 run の検査を残す。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  common:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+      - name: gitleaks
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version=8.30.1
+          archive="gitleaks_${version}_linux_x64.tar.gz"
+          checksum=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          curl --help all | grep -q -- --retry-all-errors || { echo 'curl requires --retry-all-errors' >&2; exit 1; }
+          token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+          if [ -n "$token" ]; then
+            command -v jq >/dev/null || { echo 'jq is required for authenticated release download' >&2; exit 1; }
+            release=$(curl --fail --silent --show-error --location --retry 3 --retry-all-errors --connect-timeout 10 --max-time 60 --proto '=https' --proto-redir '=https' \
+              -H "Authorization: Bearer $token" -H 'Accept: application/vnd.github+json' \
+              "https://api.github.com/repos/gitleaks/gitleaks/releases/tags/v${version}" 2>/dev/null) || { echo 'gitleaks release metadata unavailable' >&2; exit 1; }
+            asset_id=$(printf '%s' "$release" | jq -er --arg name "$archive" '[.assets[] | select(.name == $name) | .id] | if length == 1 and (.[0] | type == "number") then .[0] else error("asset_not_unique") end') || { echo 'gitleaks asset is not unique' >&2; exit 1; }
+            curl --fail --silent --show-error --location --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 --proto '=https' --proto-redir '=https' \
+              -H "Authorization: Bearer $token" -H 'Accept: application/octet-stream' -o "$RUNNER_TEMP/$archive" \
+              "https://api.github.com/repos/gitleaks/gitleaks/releases/assets/$asset_id" 2>/dev/null || { echo 'gitleaks asset unavailable' >&2; exit 1; }
+          else
+            curl --fail --silent --show-error --location --retry 3 --retry-all-errors --connect-timeout 10 --max-time 120 --proto '=https' --proto-redir '=https' \
+              -o "$RUNNER_TEMP/$archive" "https://github.com/gitleaks/gitleaks/releases/download/v${version}/${archive}" 2>/dev/null || { echo 'gitleaks asset unavailable' >&2; exit 1; }
+          fi
+          echo "${checksum}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+          export PATH="$RUNNER_TEMP:$PATH"
+          # 移した設定があれば明示して渡す。無ければ旧配置と標準の規則を gitleaks の探索に任せる。
+          set --
+          if [ -f .config/gitleaks.toml ]; then
+            set -- --config .config/gitleaks.toml
+          fi
+          gitleaks git . --redact --no-banner "$@" --log-opts=--all
+      # 公開版の形: .config/develop-tools.json の版で固定した道具を入れ、変わった文書を見る。
+      - name: Install develop tools
+        uses: fujimogn/develop-tools-action@7a8d259bb8b5ca07b2eea1fcd1d103d24c20ff0f # v0.3.6
+      - name: Check tracked documentation
+        if: github.event_name == 'push'
+        run: develop-docs-check --tracked
+      - name: Check changed documentation
+        if: github.event_name != 'push'
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before || '0000000000000000000000000000000000000000' }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE_SHA="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          fi
+          develop-docs-check --range "$BASE_SHA" "$HEAD_SHA"
+
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      light: ${{ steps.publish.outputs.light }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: scope-install
+        uses: fujimogn/develop-tools-action@7a8d259bb8b5ca07b2eea1fcd1d103d24c20ff0f # v0.3.6
+        continue-on-error: true
+      - id: dependencies
+        if: steps.scope-install.outcome == 'success'
+        run: ci-change-scope --check-dependencies .config/ci-change-scope-coverage.json
+        continue-on-error: true
+      - id: classify
+        if: steps.scope-install.outcome == 'success' && steps.dependencies.outcome == 'success'
+        continue-on-error: true
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          FORCED_PUSH: ${{ toJSON(github.event.forced) }}
+        run: ci-change-scope >> "$GITHUB_OUTPUT"
+      - id: publish
+        env:
+          INSTALL_OUTCOME: ${{ steps.scope-install.outcome }}
+          DEPENDENCIES_OUTCOME: ${{ steps.dependencies.outcome }}
+          CLASSIFY_OUTCOME: ${{ steps.classify.outcome }}
+          CLASSIFIED_LIGHT: ${{ steps.classify.outputs.light }}
+        run: |
+          light=false
+          if [ "$INSTALL_OUTCOME" = success ] && [ "$DEPENDENCIES_OUTCOME" = success ] && [ "$CLASSIFY_OUTCOME" = success ] && [ "$CLASSIFIED_LIGHT" = true ]; then
+            light=true
+          fi
+          echo "light=$light" >> "$GITHUB_OUTPUT"
+
+  rust:
+    needs: [scope]
+    if: ${{ !cancelled() && !(github.event_name == 'push' && toJSON(github.event.forced) == 'false' && needs.scope.result == 'success' && needs.scope.outputs.light == 'true') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show
+        working-directory: '.'
+      # 1 つの cache を全 workspace で使う。PR は復元だけにして cache を汚さない。
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        continue-on-error: true
+        with:
+          workspaces: |
+            .
+          shared-key: ci-develop
+          save-if: ${{ github.event_name == 'push' }}
+      - run: cargo fmt --all --check
+        working-directory: '.'
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        working-directory: '.'
+      - run: cargo test --workspace --locked --lib --bins
+        working-directory: '.'
+      # 宣言の extraSteps。repo の直下で、同じ cache を使う。
+      - run: 'cargo xtask records:check-root'
+      - run: 'cargo xtask forbidden-content --pattern ''#: x'''
+# <!-- END develop-tools:ci-develop:standard -->

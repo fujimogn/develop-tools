@@ -237,11 +237,15 @@ fn commit_link_syntax_is_checked_without_git_and_fenced_examples_are_ignored() {
     for style in [
         ChangelogStyle::Parenthesized,
         ChangelogStyle::Stamped,
+        ChangelogStyle::ParenthesizedEn,
+        ChangelogStyle::StampedEn,
         ChangelogStyle::Compact,
     ] {
         let item = match style {
             ChangelogStyle::Parenthesized => "- **成果（2026-09-30）**: 要約。",
             ChangelogStyle::Stamped => "- **成果（2026-09-30/⏳）**: 要約。",
+            ChangelogStyle::ParenthesizedEn => "- **Result (2026-09-30)**: Summary.",
+            ChangelogStyle::StampedEn => "- **Result (2026-09-30/⏳)**: Summary.",
             ChangelogStyle::Compact => "- **成果** 2026-09-30 ⏳: 要約。",
         };
         for body in [

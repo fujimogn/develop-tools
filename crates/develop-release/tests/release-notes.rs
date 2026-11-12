@@ -1150,7 +1150,7 @@ fn fixed_stamped_render_uses_explicit_repo_with_token_origin() {
     git(root, &["add", ".config/develop-tools.json"]);
     commit(
         root,
-        "# Changelog\n\n## 2026-11\n- **追加（2026-11-05/[v0.3.0](https://github.com/example/project/releases/tag/v0.3.0)）**: 本文\n",
+        "# Changelog\n\n## 2026-11\n- **Added (2026-11-05/[v0.3.0](https://github.com/example/project/releases/tag/v0.3.0))**: Body\n",
         "end",
     );
     let end = git(root, &["rev-parse", "HEAD"]);
@@ -2015,6 +2015,10 @@ fn commit_link_suffix_is_removed_before_scrubbing_without_losing_numbers() {
             "- **成果**\n 継続"
         );
         assert_eq!(scrub_for_ai(&format!("- {}", commit_link(sha))), "-");
+        assert_eq!(
+            scrub_for_ai(&format!("- 成果 （2026-11-05） {}", commit_link(sha))),
+            "- 成果"
+        );
     }
     assert_eq!(
         numbered_ai_input(&[String::new(), "本文".to_owned()]),

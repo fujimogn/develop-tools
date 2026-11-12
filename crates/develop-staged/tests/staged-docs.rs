@@ -58,6 +58,34 @@ fn valid_changelog() -> &'static str {
 }
 
 #[test]
+fn english_changelog_reads_language_and_stamp_gate_from_index() {
+    let repo = repository();
+    fs::create_dir(repo.path().join(".config")).unwrap();
+    let manifest = repo.path().join(".config/develop-tools.json");
+    let declared = r#"{"release":{"changelogStamp":true,"notes":{"mode":"changelog-section","language":"en"}}}"#;
+    fs::write(&manifest, declared).unwrap();
+    fs::write(repo.path().join("CHANGELOG.md"), "# Changelog\n> Older entries remain in git history.\n\n## 2026-11\n\n### 1.2.3 (2026-11-09)\n\nSummary.\n\n- **Stop (2026-11-09/v1.2.3, fast pane)**: Shares a deadline.\n").unwrap();
+    git_ok(repo.path(), &["add", "."]);
+    fs::write(&manifest, "{}").unwrap();
+    let out = run_checker(repo.path(), &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    git_ok(repo.path(), &["add", ".config/develop-tools.json"]);
+    fs::write(&manifest, declared).unwrap();
+    let out = run_checker(repo.path(), &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn checker_reads_staged_content_instead_of_working_tree_content() {
     let repo = repository();
     fs::write(repo.path().join("TODO.md"), valid_todo()).unwrap();
@@ -663,4 +691,22 @@ fn archive_changelog_preserves_retained_commit_link_suffix_bytes() {
         develop_staged::docs_standard::plan_changelog_archive(&text, "2099-12", &head).unwrap();
     assert_eq!(plan.archived_dates, ["2099-12-01"]);
     assert!(plan.content.ends_with(&retained));
+}
+
+#[test]
+fn staged_version_items_use_release_date_instead_of_month() {
+    let repo = repository();
+    fs::create_dir(repo.path().join(".config")).unwrap();
+    fs::write(repo.path().join(".config/develop-tools.json"), r#"{"release":{"changelogStamp":true,"notes":{"mode":"changelog-section","language":"en"}}}"#).unwrap();
+    for (date, exit) in [("2026-10-31", 0), ("2026-11-09", 0), ("2026-11-10", 1)] {
+        fs::write(repo.path().join("CHANGELOG.md"), format!("# Changelog\n> Older entries remain in git history.\n\n## 2026-11\n\n### 1.2.3 (2026-11-09)\n\nSummary.\n\n- **October ({date}/v1.2.3)**: Carried over.\n")).unwrap();
+        git_ok(repo.path(), &["add", "."]);
+        fs::write(repo.path().join("CHANGELOG.md"), "unstaged broken document").unwrap();
+        let out = run_checker(repo.path(), &[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(exit), "{date}: {stderr}");
+        if exit == 1 {
+            assert!(stderr.contains("版小節の日付より後"), "{stderr}");
+        }
+    }
 }

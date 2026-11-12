@@ -37,6 +37,7 @@ pub struct Input {
     pub repo: Option<String>,
     pub snapshot: Snapshot,
     pub changelog_stamp: bool,
+    pub changelog_language: develop_tools_manifest::NotesLanguage,
     /// prefixごとの固定基準commitへの包含証拠（full OIDまたは安全な診断）。
     pub changelog_commits: BTreeMap<String, Result<String, String>>,
     /// 容量上限の対象 path の byte 数。
@@ -203,9 +204,10 @@ pub fn run(repo: &Repo, mut mode: Mode) -> Result<Outcome, String> {
         if manifest == Some(entry.path.as_str()) {
             let value = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("{}: {error}", entry.path))?;
-            input.changelog_stamp = develop_tools_manifest::declaration(&value)
-                .map_err(|error| format!("{}: {error}", entry.path))?
-                .changelog_stamp;
+            let declared = develop_tools_manifest::declaration(&value)
+                .map_err(|error| format!("{}: {error}", entry.path))?;
+            input.changelog_stamp = declared.changelog_stamp;
+            input.changelog_language = declared.changelog_language();
         }
         if limit_paths.contains(entry.path.as_str()) {
             input

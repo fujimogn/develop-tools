@@ -67,7 +67,7 @@ pub(crate) fn remote_repo(root: &Path) -> Result<String, String> {
     Ok(repo.to_owned())
 }
 
-fn monthly_heading(line: &str) -> bool {
+pub(crate) fn monthly_heading(line: &str) -> bool {
     let Some(month) = line.strip_prefix("## ") else {
         return false;
     };
@@ -175,10 +175,10 @@ fn legacy_title_stamp(
     Some((stamp, start..end))
 }
 
-fn released_for_other_tag(item: &str, tag: &str) -> Result<bool, String> {
+fn released_for_other_tag(item: &str, tag: &str, language: NotesLanguage) -> Result<bool, String> {
     use develop_tools_core::changelog_title::{self, Stamp};
 
-    let compact = changelog_title::parse(item)
+    let compact = changelog_title::parse_with_language(item, language)
         .map(|parsed| parsed.stamp)
         .or_else(|| changelog_title::parse_legacy_compact(item).map(|(_, stamp)| stamp));
     let legacy = legacy_title_stamp(item);
@@ -219,7 +219,16 @@ struct ChangelogAdditions {
 /// Unchanged context or diff metadata ends a change run. If an old monthly item
 /// was removed, its replacements have no stable identity and cannot safely be
 /// called new items.
+#[cfg(test)]
 fn changelog_additions(diff: &str, tag: &str) -> ChangelogAdditions {
+    changelog_additions_with_language(diff, tag, NotesLanguage::Ja)
+}
+
+fn changelog_additions_with_language(
+    diff: &str,
+    tag: &str,
+    language: NotesLanguage,
+) -> ChangelogAdditions {
     let mut result = ChangelogAdditions::default();
     let mut old = MonthlyItems::default();
     let mut new = MonthlyItems::default();
@@ -251,7 +260,7 @@ fn changelog_additions(diff: &str, tag: &str) -> ChangelogAdditions {
             "-" => removed_item |= old.step(content),
             "+" => {
                 if new.step(content) {
-                    match released_for_other_tag(content, tag) {
+                    match released_for_other_tag(content, tag, language) {
                         Ok(false) => pending.push(content.to_owned()),
                         Ok(true) => {}
                         Err(error) => result.error = Some(error),
@@ -290,7 +299,16 @@ fn additions_with_warning(
     tag: &str,
     human_warning: bool,
 ) -> Result<Vec<String>, String> {
-    let result = changelog_additions(diff, tag);
+    additions_with_language(diff, tag, NotesLanguage::Ja, human_warning)
+}
+
+fn additions_with_language(
+    diff: &str,
+    tag: &str,
+    language: NotesLanguage,
+    human_warning: bool,
+) -> Result<Vec<String>, String> {
+    let result = changelog_additions_with_language(diff, tag, language);
     if let Some(error) = result.error {
         return Err(error);
     }
@@ -458,6 +476,21 @@ impl ReleaseExtract {
     }
 }
 
+/// 版節の表示では題の日付と印だけを除き、補足・本文・fence は保持する。
+fn render_section(section: &str, language: NotesLanguage) -> String {
+    outside_fences(section)
+        .map(|(_, line, fenced)| {
+            if fenced {
+                line.to_owned()
+            } else {
+                develop_tools_core::changelog_title::render_without_stamp(line, language)
+                    .unwrap_or_else(|| line.to_owned())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 抽出の起点。`release` は版 commit を打つ前にこれを決め、書いた後に失敗しうる処理を減らす。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseBase {
@@ -498,8 +531,8 @@ pub fn extract_from(
     extract_range(root, base, &base.previous, end, tag, language)
 }
 
-/// tag 入口は終点の刻印宣言だけを読む。古い manifest の他の欄は再抽出の条件にしない。
-fn stamp_declared_at(root: &Path, end: &str) -> Result<bool, String> {
+/// tag 入口は終点の印と言語だけを読む。本文方式など他の欄は再抽出の条件にしない。
+fn stamp_settings_at(root: &Path, end: &str) -> Result<(bool, NotesLanguage), String> {
     let paths = git(
         root,
         &[
@@ -517,19 +550,29 @@ fn stamp_declared_at(root: &Path, end: &str) -> Result<bool, String> {
     ]
     .into_iter()
     .find(|path| paths.lines().any(|entry| entry == *path)) else {
-        return Ok(false);
+        return Ok((false, NotesLanguage::Ja));
     };
     let raw = git_raw(root, &["show", &format!("{end}:{path}")])?;
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|error| format!("{path}: JSON が不正です: {error}"))?;
+    // tag 入口は月次差分を読む。言語の検証は共有 reader に任せ、古い本文方式は解釈しない。
+    let mut notes = serde_json::json!({"mode": "changelog-additions"});
+    if let Some(language) = value.pointer("/release/notes/language") {
+        notes["language"] = language.clone();
+    }
+    let language =
+        develop_tools_manifest::declaration(&serde_json::json!({"release": {"notes": notes}}))
+            .map_err(|error| format!("{path}: {error}"))?
+            .changelog_language();
     let Some(stamp) = value
         .get("release")
         .and_then(|release| release.get("changelogStamp"))
     else {
-        return Ok(false);
+        return Ok((false, language));
     };
     stamp
         .as_bool()
+        .map(|stamp| (stamp, language))
         .ok_or_else(|| format!("{path}: release.changelogStamp は boolean で指定してください"))
 }
 
@@ -573,7 +616,7 @@ fn extract_range_with_warning(
             "CHANGELOG.md",
         ],
     )?;
-    let items = additions_with_warning(&diff, tag, human_warning)?;
+    let items = additions_with_language(&diff, tag, language, human_warning)?;
     let commit_links = verified_links(root, &end, &items)?;
     Ok(ReleaseExtract {
         items,
@@ -606,11 +649,12 @@ pub fn extract_release(
         &["rev-parse", "--verify", &format!("{end}^{{commit}}")],
     )?;
     let base = resolve_base(root, &format!("{end}^"), repo_arg)?;
-    if stamp_declared_at(root, &end)? {
+    let (stamped, language) = stamp_settings_at(root, &end)?;
+    if stamped {
         let changelog = git_raw(root, &["show", &format!("{end}:CHANGELOG.md")])?;
-        validate_stamped_text(&changelog, &base.repo)?;
+        validate_stamped_text(&changelog, &base.repo, language)?;
     }
-    extract_from(root, &base, &end, tag, NotesLanguage::Ja)
+    extract_from(root, &base, &end, tag, language)
 }
 
 /// 既存の tag の本文。tag の commit を終点に `extract_release` を使う。
@@ -637,6 +681,7 @@ pub enum SectionError {
     NoChangelog,
     Duplicate,
     Empty,
+    MonthMismatch,
 }
 
 impl SectionError {
@@ -645,6 +690,7 @@ impl SectionError {
             Self::Missing { .. } | Self::NoChangelog => "section_missing",
             Self::Duplicate => "section_duplicate",
             Self::Empty => "section_empty",
+            Self::MonthMismatch => "section_month_mismatch",
         }
     }
 }
@@ -659,33 +705,30 @@ impl std::fmt::Display for SectionError {
             Self::NoChangelog => "CHANGELOG.md がありません",
             Self::Duplicate => "その版の日付付きの見出しが 2 つ以上あります",
             Self::Empty => "その版の節が空です",
+            Self::MonthMismatch => "月見出しと版小節の日付が一致しません",
         };
         write!(f, "{}: {reason}", self.code())
     }
 }
 
-/// 版の見出しなら版と、`## X.Y.Z (YYYY-MM-DD)` / `## [X.Y.Z] - YYYY-MM-DD` の日付付きの形かを返す。
-/// 版の後が日付の形でない見出し（`## 1.2.3`・`## [1.2.3]`・`## 1.2.3 (2026/10/13)`）は `false`。
-fn version_heading(line: &str) -> Option<(&str, bool)> {
+/// 旧版節から版と有効な日付を読む。月下の版小節は共通 parser を使う。
+fn version_heading(line: &str) -> Option<(&str, Option<&str>)> {
     let heading = line.strip_prefix("## ")?.trim_end();
-    let (version, dated) = match heading.strip_prefix('[') {
+    let (version, date) = match heading.strip_prefix('[') {
         Some(bracketed) => {
             let (version, rest) = bracketed.split_once(']')?;
-            (
-                version,
-                rest.strip_prefix(" - ").is_some_and(crate::is_date),
-            )
+            (version, rest.strip_prefix(" - "))
         }
         None => {
             let (version, rest) = heading.split_once(' ').unwrap_or((heading, ""));
             let date = rest
                 .strip_prefix('(')
                 .and_then(|rest| rest.strip_suffix(')'));
-            (version, date.is_some_and(crate::is_date))
+            (version, date)
         }
     };
     version.parse::<crate::Version>().ok()?;
-    Some((version, dated))
+    Some((version, date.filter(|date| crate::is_date(date))))
 }
 
 /// 各行に、fence の印か fence の中かを付けて返す。
@@ -696,7 +739,7 @@ fn outside_fences(text: &str) -> impl Iterator<Item = (usize, &str, bool)> {
         .map(move |(index, line)| (index, line, fence.step(line) || fence.is_open()))
 }
 
-/// CHANGELOG から `version` の版の節を取り出す。見出しは本文に含めず、`###` 以下は含める（design §10）。
+/// CHANGELOG から旧版節か月下の版小節を取り出す。旧版節の分類小見出しは保つ。
 pub fn extract_changelog_section(
     changelog: &str,
     version: &str,
@@ -705,22 +748,41 @@ pub fn extract_changelog_section(
     let mut start = None;
     let mut end = lines.len();
     let mut undated = false;
+    let mut month = None;
+    let mut nested_section = false;
     for (index, line, fenced) in outside_fences(changelog) {
-        if fenced || !(line.starts_with("# ") || line.starts_with("## ")) {
+        if fenced {
             continue;
         }
-        if start.is_some() && end == lines.len() {
+        let top_level = line.starts_with("# ") || line.starts_with("## ");
+        let subsection = line.starts_with("### ");
+        if (top_level || (subsection && nested_section)) && start.is_some() && end == lines.len() {
             end = index;
         }
-        match version_heading(line) {
-            Some((found, true)) if found == version => {
+        if top_level {
+            month = monthly_heading(line).then(|| &line[3..]);
+        } else if !subsection || month.is_none() {
+            continue;
+        }
+        let heading = if subsection {
+            develop_tools_core::changelog_title::parse_version_heading(line)
+                .map(|(version, date)| (version, Some(date)))
+        } else {
+            version_heading(line)
+        };
+        match heading {
+            Some((found, Some(date))) if found == version => {
                 if start.is_some() {
                     return Err(SectionError::Duplicate);
                 }
+                if subsection && month != date.get(..7) {
+                    return Err(SectionError::MonthMismatch);
+                }
                 start = Some(index + 1);
                 end = lines.len();
+                nested_section = subsection;
             }
-            Some((found, false)) if found == version => undated = true,
+            Some((found, None)) if found == version => undated = true,
             _ => {}
         }
     }
@@ -915,15 +977,15 @@ fn drop_internal_words(text: &str) -> String {
 /// lessons の番号・link の URL）を落とす。別の版の項目を除く `released_for_other_tag` とは
 /// 責務が違い、抽出の後に掛ける。
 pub fn scrub_for_ai(item: &str) -> String {
-    let mut item = item.to_owned();
-    if let Ok(Some(link)) = develop_tools_core::changelog_commit_link::parse(&item) {
-        item.replace_range(link.suffix_range, "");
-    }
-    if let Some(parsed) = develop_tools_core::changelog_title::parse(&item) {
-        let replacement = parsed
-            .supplement
-            .map_or_else(String::new, |note| format!("（{note}）"));
-        item.replace_range(parsed.metadata_range, &replacement);
+    scrub_for_ai_with_language(item, NotesLanguage::Ja)
+}
+
+fn scrub_for_ai_with_language(item: &str, language: NotesLanguage) -> String {
+    let mut item = without_commit_link(item);
+    if let Some(rendered) =
+        develop_tools_core::changelog_title::render_without_stamp(&item, language)
+    {
+        item = rendered;
     } else if let Some((date, _)) = develop_tools_core::changelog_title::parse_legacy_compact(&item)
     {
         let close =
@@ -938,9 +1000,29 @@ pub fn scrub_for_ai(item: &str) -> String {
     if let Some((_, range)) = legacy_title_stamp(&item) {
         item.replace_range(range, "");
     }
-    let scrubbed = drop_internal_words(&drop_date_stamps(&drop_bare_urls(&drop_link_targets(
-        &item,
-    ))));
+    finish_ai_scrub(&drop_date_stamps(&without_link_targets(&item)))
+}
+
+/// 版節の現行印は抽出時に除去済み。補足を再解釈せず、link と社内語だけを落とす。
+fn scrub_normalized_for_ai(item: &str) -> String {
+    finish_ai_scrub(&without_link_targets(&without_commit_link(item)))
+}
+
+/// ほかの置換で suffix の空白・位置を変える前に、元の行から commit link を落とす。
+fn without_commit_link(item: &str) -> String {
+    let mut item = item.to_owned();
+    if let Ok(Some(link)) = develop_tools_core::changelog_commit_link::parse(&item) {
+        item.replace_range(link.suffix_range, "");
+    }
+    item
+}
+
+fn without_link_targets(item: &str) -> String {
+    drop_bare_urls(&drop_link_targets(item))
+}
+
+fn finish_ai_scrub(item: &str) -> String {
+    let scrubbed = drop_internal_words(item);
     let mut out = String::with_capacity(scrubbed.len());
     for word in scrubbed.split(' ').filter(|word| !word.is_empty()) {
         if !out.is_empty() {
@@ -1040,13 +1122,18 @@ fn declares_stamp(root: &Path) -> Result<bool, String> {
     Ok(crate::preflight::read_declaration(root)?.changelog_stamp)
 }
 
-fn validate_stamped_text(changelog: &str, repo: &str) -> Result<(), String> {
+fn validate_stamped_text(
+    changelog: &str,
+    repo: &str,
+    language: NotesLanguage,
+) -> Result<(), String> {
     let mut monthly = MonthlyItems::default();
     for line in changelog.lines() {
         if !monthly.step(line) {
             continue;
         }
-        let Some(parsed) = develop_tools_core::changelog_title::parse(line) else {
+        let Some(parsed) = develop_tools_core::changelog_title::parse_with_language(line, language)
+        else {
             return Err(
                 if develop_tools_core::changelog_title::parse_legacy_compact(line).is_some()
                     && legacy_title_stamp(line).is_some()
@@ -1071,7 +1158,7 @@ fn validate_stamped_text(changelog: &str, repo: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn normalize_notes(notes: &ReleaseNotes) -> Result<DeclaredNotes, String> {
+pub(crate) fn normalize_notes(notes: &ReleaseNotes) -> Result<DeclaredNotes, String> {
     let source = match notes.mode {
         NotesMode::Changelog(source)
         | NotesMode::Ai {
@@ -1115,7 +1202,7 @@ pub fn prepare_notes_with_first_release_base(
     if declares_stamp(root)? {
         let repo = remote_repo(root)?;
         let changelog = git_raw(root, &["show", "HEAD:CHANGELOG.md"])?;
-        validate_stamped_text(&changelog, &repo)?;
+        validate_stamped_text(&changelog, &repo, declared.language)?;
     }
     // tag が一つも無い初回だけ節の本文を使う。既存 tag の解決失敗は隠さない。
     let base = if git(
@@ -1185,9 +1272,10 @@ pub fn prepare_notes_with_first_release_base(
             .lines()
             .filter(|line| monthly.step(line))
             .filter(|line| {
-                develop_tools_core::changelog_title::parse(line).is_some_and(|parsed| {
-                    parsed.stamp == develop_tools_core::changelog_title::Stamp::Unreleased
-                })
+                develop_tools_core::changelog_title::parse_with_language(line, declared.language)
+                    .is_some_and(|parsed| {
+                        parsed.stamp == develop_tools_core::changelog_title::Stamp::Unreleased
+                    })
             })
             .map(str::to_owned)
             .collect();
@@ -1204,12 +1292,16 @@ pub fn prepare_notes_with_first_release_base(
             .strip_prefix('v')
             .ok_or("first_release_base_invalid: tag は v<semver> が必要です")?
             .parse()?;
-        if crate::stamp_changelog(&changelog, version, &repo).1 != pending.len() {
+        if crate::stamp_changelog_with_language(&changelog, version, &repo, declared.language).1
+            != pending.len()
+        {
             return Err("first_release_base_invalid: 刻印対象と月次項目が一致しません".to_owned());
         }
         let stamped: Vec<String> = pending
             .iter()
-            .map(|item| crate::stamp_changelog(item, version, &repo).0)
+            .map(|item| {
+                crate::stamp_changelog_with_language(item, version, &repo, declared.language).0
+            })
             .collect();
         let heading = match declared.language {
             NotesLanguage::Ja => format!("変更範囲: 初回 Release（基点 {from}）"),
@@ -1247,6 +1339,22 @@ pub fn prepare_notes_with_first_release_base(
             }
         }
         let section = prepared.section_at(root, &head)?;
+        // A改の項目はHEADでは月直下にある。版commit後に初めてlink検証が失敗しないよう、
+        // 同じ移動・刻印をメモリ上で行い、予定の小節を固定HEADの履歴で照合する。
+        let section = if declared.source == NotesSource::ChangelogSection && declares_stamp(root)? {
+            let version = tag.strip_prefix('v').unwrap_or(tag).parse()?;
+            let changelog = git_raw(root, &["show", &format!("{head}:CHANGELOG.md")])?;
+            let (stamped, _) = crate::stamp_changelog_for_notes(
+                &changelog,
+                version,
+                &remote_repo(root)?,
+                Some(declared),
+            )?;
+            extract_changelog_section(&stamped, &version.to_string())
+                .map_err(|error| format!("release.notes の予定版小節を作れません（{error}）"))?
+        } else {
+            section
+        };
         section.verified_links(root, &head)?;
     } else {
         // 版 commit を作る前に、追記に含まれる刻印の構造エラーも検出する。
@@ -1259,10 +1367,10 @@ pub fn prepare_notes_with_first_release_base(
             let mut monthly = MonthlyItems::default();
             for line in changelog.lines() {
                 if monthly.step(line)
-                    && changelog_title::parse(line)
+                    && changelog_title::parse_with_language(line, declared.language)
                         .is_some_and(|parsed| parsed.stamp == Stamp::Unreleased)
                 {
-                    released_for_other_tag(line, tag)?;
+                    released_for_other_tag(line, tag, declared.language)?;
                 }
             }
         }
@@ -1338,7 +1446,7 @@ impl PreparedNotes {
     }
 
     fn section_at(&self, root: &Path, commit: &str) -> Result<ChangelogSection, String> {
-        section_at(root, commit, &self.tag)
+        section_at(root, commit, &self.tag, self.declared.language)
     }
 }
 
@@ -1371,7 +1479,7 @@ fn extract_declared(
             &format!("{end}^{{commit}}"),
         ],
     )?;
-    let section = section_at(root, &end, tag)?;
+    let section = section_at(root, &end, tag, declared.language)?;
     let commit_links = section.verified_links(root, &end)?;
     let ChangelogSection { body, items } = section;
     Ok(ReleaseExtract {
@@ -1385,14 +1493,76 @@ fn extract_declared(
     })
 }
 
-fn section_at(root: &Path, commit: &str, tag: &str) -> Result<ChangelogSection, String> {
+/// 別版や別 repo の印を黙って消して公開しない。origin の照会は節全体で一度だけ。
+fn validate_section_stamps(
+    root: &Path,
+    section: &ChangelogSection,
+    tag: &str,
+    language: NotesLanguage,
+) -> Result<(), String> {
+    use develop_tools_core::changelog_title::{self, Stamp};
+    let invalid =
+        || "changelog_stamp_invalid: 版節の印が予定 tag・origin と一致しません".to_owned();
+    let mut stamps = Vec::new();
+    for (_, line, fenced) in outside_fences(&section.body) {
+        if fenced {
+            continue;
+        }
+        if let Some(parsed) = changelog_title::parse_with_language(line, language) {
+            stamps.push(parsed);
+        } else if let Some(rest) = line.strip_prefix("- **")
+            && let Some(close) = changelog_title::title_closing_marker(rest)
+        {
+            // 本文中の印は対象にせず、共通 parser が拒否した題の印だけを失敗にする。
+            let title = &rest[..close];
+            if title.contains(changelog_title::UNRELEASED_STAMP) || title.contains("/[v") {
+                return Err(invalid());
+            }
+        }
+    }
+    let expected_url = if stamps.iter().any(|stamp| stamp.release_url.is_some()) {
+        Some(format!(
+            "https://github.com/{}/releases/tag/{tag}",
+            remote_repo(root)?
+        ))
+    } else {
+        None
+    };
+    for parsed in stamps {
+        if let Stamp::Released(version) = parsed.stamp
+            && Some(version) != tag.strip_prefix('v')
+        {
+            return Err(invalid());
+        }
+        if let Some(url) = parsed.release_url
+            && Some(url) != expected_url.as_deref()
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn section_at(
+    root: &Path,
+    commit: &str,
+    tag: &str,
+    language: NotesLanguage,
+) -> Result<ChangelogSection, String> {
     let path = format!("{commit}:CHANGELOG.md");
     let version = tag.strip_prefix('v').unwrap_or(tag);
     let section = match git(root, &["cat-file", "-e", &path]) {
         Ok(_) => extract_changelog_section(&git_raw(root, &["show", &path])?, version),
         Err(_) => Err(SectionError::NoChangelog),
     };
-    section.map_err(|error| format!("release.notes の changelog-section を作れません（{error}）"))
+    let section = section
+        .map_err(|error| format!("release.notes の changelog-section を作れません（{error}）"))?;
+    validate_section_stamps(root, &section, tag, language)?;
+    let body = render_section(&section.body, language);
+    Ok(ChangelogSection {
+        items: section_items(&body),
+        body,
+    })
 }
 
 /// 本文や環境設定を受け取らず、既存の code と対象 tag だけを保存する。
@@ -1551,7 +1721,13 @@ fn ai_body(
     let scrubbed: Vec<String> = extract
         .items
         .iter()
-        .map(|item| scrub_for_ai(item))
+        .map(|item| {
+            if extract.section.is_some() {
+                scrub_normalized_for_ai(item)
+            } else {
+                scrub_for_ai_with_language(item, extract.language)
+            }
+        })
         .collect();
     let input = numbered_ai_input(&scrubbed);
     // 台帳の置き場が無い古い設定では、費用の記録が残らないので送らない。
@@ -1794,7 +1970,7 @@ impl FixedNotes {
     fn extract_with_warning(&self, human_warning: bool) -> Result<ReleaseExtract, String> {
         if self.stamped {
             let changelog = git_raw(&self.root, &["show", &format!("{}:CHANGELOG.md", self.to)])?;
-            validate_stamped_text(&changelog, &self.base.repo)?;
+            validate_stamped_text(&changelog, &self.base.repo, self.declared.language)?;
         }
         extract_declared(
             &self.root,

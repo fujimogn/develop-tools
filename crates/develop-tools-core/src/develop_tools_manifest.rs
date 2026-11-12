@@ -170,8 +170,9 @@ pub enum NotesSource {
     ChangelogSection,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NotesLanguage {
+    #[default]
     Ja,
     En,
 }
@@ -200,6 +201,15 @@ pub struct Declaration {
     pub adr_contract: Option<AdrContract>,
     /// `ci` の欄が無ければ `None`。
     pub ci: Option<CiDeclaration>,
+}
+
+impl Declaration {
+    /// CHANGELOG と Release 本文は同じ言語宣言を使う。未宣言は日本語。
+    pub fn changelog_language(&self) -> NotesLanguage {
+        self.release_notes
+            .as_ref()
+            .map_or(NotesLanguage::Ja, |notes| notes.language)
+    }
 }
 
 fn optional_string(

@@ -1721,6 +1721,90 @@ fn check_local_version_skips_fields_added_beside_the_version() {
 const COMPACT_CHANGELOG: &str = "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-11\n- **成果（2026-11-05/v1.2.3）**: 要約\n";
 
 #[test]
+fn english_changelog_uses_language_from_tracked_manifest() {
+    let dir = island_repo(Some("https://github.com/example/island.git"));
+    write(
+        dir.path(),
+        ".config/develop-tools.json",
+        r#"{"release":{"notes":{"mode":"changelog-section","language":"en"}}}"#,
+    );
+    write(
+        dir.path(),
+        "CHANGELOG.md",
+        "# Changelog\n> Older entries remain in git history.\n\n## 2026-11\n- **Docs (2026-11-09, setup (fast))**: Clarifies setup.\n",
+    );
+    git(dir.path(), &["add", "."]);
+    write(dir.path(), ".config/develop-tools.json", "{}");
+    let out = run(dir.path(), &["--tracked"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+}
+
+#[test]
+fn tracked_accepts_version_subsections_and_summaries_in_both_languages() {
+    for (language, item) in [
+        (
+            "en",
+            "- **Stop (2026-11-09/[v1.2.3](https://github.com/example/island/releases/tag/v1.2.3))**: Fix: shares a deadline.",
+        ),
+        (
+            "ja",
+            "- **停止（2026-11-09/[v1.2.3](https://github.com/example/island/releases/tag/v1.2.3)）**: 期限を共有する。",
+        ),
+    ] {
+        let dir = island_repo(Some("https://github.com/example/island.git"));
+        write(
+            dir.path(),
+            ".config/develop-tools.json",
+            &format!(
+                r#"{{"release":{{"changelogStamp":true,"notes":{{"mode":"changelog-section","language":"{language}"}}}}}}"#
+            ),
+        );
+        write(
+            dir.path(),
+            "CHANGELOG.md",
+            &format!(
+                "# Changelog\n> Older entries remain in git history.\n\n## 2026-11\n\n### 1.2.3 (2026-11-09)\n\nSummary for this release.\n\n{item}\n\n### 1.2.2 (2026-11-01)\n\nOlder summary.\n"
+            ),
+        );
+        git(dir.path(), &["add", "."]);
+        let out = run(dir.path(), &["--tracked"]);
+        assert_eq!(out.status.code(), Some(0), "{language}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn tracked_rejects_version_subsection_month_and_stamp_mismatches() {
+    for (heading, marker, expected) in [
+        ("### 1.2.3 (2026-10-09)", "v1.2.3", "版小節の日付"),
+        ("### 1.2.3 (2026-11-09)", "v1.2.2", "版小節の版"),
+        ("### 1.2.3 (2026-11-09)", "⏳", "版小節の版"),
+    ] {
+        let dir = island_repo(Some("https://github.com/example/island.git"));
+        write(
+            dir.path(),
+            ".config/develop-tools.json",
+            r#"{"release":{"changelogStamp":true,"notes":{"mode":"changelog-section","language":"en"}}}"#,
+        );
+        write(
+            dir.path(),
+            "CHANGELOG.md",
+            &format!(
+                "# Changelog\n> Older entries remain in git history.\n\n## 2026-11\n\n{heading}\n\nSummary.\n\n- **Stop (2026-11-09/{marker})**: Shares a deadline.\n"
+            ),
+        );
+        git(dir.path(), &["add", "."]);
+        let out = run(dir.path(), &["--tracked"]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{heading} / {marker}: {}",
+            stderr(&out)
+        );
+        assert!(stderr(&out).contains(expected), "{}", stderr(&out));
+    }
+}
+
+#[test]
 fn changelog_shape_follows_tracked_manifest_snapshot() {
     for (manifest, compact, expected) in [
         (Some(r#"{"release":{"changelogStamp":true}}"#), true, 0),
@@ -2085,4 +2169,33 @@ fn commit_links_reject_sha256_repository_only_when_linked() {
     assert!(out.status.success(), "{}", stderr(&out));
     stage_commit_link(d, &commit_link(&oid[..7]));
     assert_link_failure(d, &["--tracked"], "SHA-256");
+}
+
+#[test]
+fn tracked_version_items_use_release_date_instead_of_month() {
+    for (date, exit) in [("2026-10-31", 0), ("2026-11-09", 0), ("2026-11-10", 1)] {
+        let dir = island_repo(Some("https://github.com/example/island.git"));
+        write(
+            dir.path(),
+            ".config/develop-tools.json",
+            r#"{"release":{"changelogStamp":true,"notes":{"mode":"changelog-section","language":"en"}}}"#,
+        );
+        write(
+            dir.path(),
+            "CHANGELOG.md",
+            &format!(
+                "# Changelog\n> Older entries remain in git history.\n\n## 2026-11\n\n### 1.2.3 (2026-11-09)\n\nSummary.\n\n- **October ({date}/v1.2.3)**: Carried over.\n\n### 1.2.2 (2026-11-01)\n\nOlder summary.\n\n- **Previous (2026-11-01/v1.2.2)**: Remains.\n"
+            ),
+        );
+        git(dir.path(), &["add", "."]);
+        let out = run(dir.path(), &["--tracked"]);
+        assert_eq!(out.status.code(), Some(exit), "{date}: {}", stderr(&out));
+        if exit == 1 {
+            assert!(
+                stderr(&out).contains("版小節の日付より後"),
+                "{}",
+                stderr(&out)
+            );
+        }
+    }
 }

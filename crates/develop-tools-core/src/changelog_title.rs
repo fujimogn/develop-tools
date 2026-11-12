@@ -1,4 +1,5 @@
 //! Release repo の CHANGELOG の括弧内刻印。
+use crate::develop_tools_manifest::NotesLanguage;
 use std::ops::Range;
 
 pub const UNRELEASED_STAMP: &str = "/⏳";
@@ -70,26 +71,110 @@ pub fn title_closing_marker(rest: &str) -> Option<usize> {
 
 /// トップレベルの `- **題（日付/印、補足）**: 本文` を読む。
 pub fn parse(line: &str) -> Option<StampedTitle<'_>> {
+    parse_with_language(line, NotesLanguage::Ja)
+}
+
+struct TitleSyntax {
+    opening: &'static str,
+    closing: &'static str,
+    supplement: &'static str,
+    summary: &'static str,
+    // 英語の開き文字列に含む、括弧の前の区切り空白。
+    leading_space_bytes: usize,
+}
+
+const JAPANESE_SYNTAX: TitleSyntax = TitleSyntax {
+    opening: "（",
+    closing: "）",
+    supplement: "、",
+    summary: ":",
+    leading_space_bytes: 0,
+};
+const ENGLISH_SYNTAX: TitleSyntax = TitleSyntax {
+    opening: " (",
+    closing: ")",
+    supplement: ", ",
+    summary: ": ",
+    leading_space_bytes: 1,
+};
+
+fn title_syntax(language: NotesLanguage) -> &'static TitleSyntax {
+    match language {
+        NotesLanguage::Ja => &JAPANESE_SYNTAX,
+        NotesLanguage::En => &ENGLISH_SYNTAX,
+    }
+}
+
+struct TitleMetadata<'a> {
+    title: &'a str,
+    date: &'a str,
+    suffix: &'a str,
+    summary: &'a str,
+    range: Range<usize>,
+    suffix_start: usize,
+}
+
+// 日付型と刻印型の外形を同じ文法で読み、印の有無だけを各入口で判定する。
+fn title_metadata(line: &str, language: NotesLanguage) -> Option<TitleMetadata<'_>> {
+    let syntax = title_syntax(language);
     let rest = line.strip_prefix("- **")?;
     let close = title_closing_marker(rest)?;
     let bold = &rest[..close];
-    let summary = rest[close + 2..].strip_prefix(':')?.trim();
-    if summary.is_empty() || !bold.ends_with('）') {
+    let summary = rest[close + 2..].strip_prefix(syntax.summary)?.trim();
+    if summary.is_empty() || !bold.ends_with(syntax.closing) {
         return None;
     }
-    let open = bold.rfind('（')?;
+    let open = match language {
+        NotesLanguage::Ja => bold.rfind(syntax.opening),
+        NotesLanguage::En => bold.rmatch_indices(syntax.opening).find_map(|(index, _)| {
+            bold.get(index + syntax.opening.len()..index + syntax.opening.len() + 10)
+                .is_some_and(valid_date)
+                .then_some(index)
+        }),
+    }?;
     let title = &bold[..open];
-    if title.trim().is_empty() {
+    if title.trim().is_empty() || (language == NotesLanguage::En && title != title.trim_end()) {
         return None;
     }
-    let inner = &bold[open + '（'.len_utf8()..bold.len() - '）'.len_utf8()];
+    let inner = &bold[open + syntax.opening.len()..bold.len() - syntax.closing.len()];
     let date = inner.get(..10)?;
     if !valid_date(date) {
         return None;
     }
-    let marked = inner.get(10..)?.strip_prefix('/')?;
-    let (marker, supplement) = match marked.split_once('、') {
-        Some((marker, note)) if !note.is_empty() => (marker, Some(note)),
+    Some(TitleMetadata {
+        title,
+        date,
+        suffix: &inner[10..],
+        summary,
+        range: "- **".len() + open + syntax.leading_space_bytes.."- **".len() + bold.len(),
+        suffix_start: "- **".len() + open + syntax.opening.len() + date.len(),
+    })
+}
+
+/// 印の無い日付型の成果項目を検査し、完了日を返す。
+pub fn parse_dated(line: &str, language: NotesLanguage) -> Option<&str> {
+    let metadata = title_metadata(line, language)?;
+    if !metadata.suffix.is_empty() {
+        let supplement = metadata
+            .suffix
+            .strip_prefix(title_syntax(language).supplement)?;
+        if supplement.trim().is_empty() {
+            return None;
+        }
+    }
+    Some(metadata.date)
+}
+
+/// 宣言された言語の括弧・区切りで刻印を読む。既存の入口は日本語を保つ。
+pub fn parse_with_language(line: &str, language: NotesLanguage) -> Option<StampedTitle<'_>> {
+    let metadata = title_metadata(line, language)?;
+    let marked = metadata.suffix.strip_prefix('/')?;
+    let (marker, supplement) = match marked.split_once(title_syntax(language).supplement) {
+        Some((marker, note))
+            if !note.is_empty() && (language == NotesLanguage::Ja || !note.trim().is_empty()) =>
+        {
+            (marker, Some(note))
+        }
         Some(_) => return None,
         None => (marked, None),
     };
@@ -106,18 +191,30 @@ pub fn parse(line: &str) -> Option<StampedTitle<'_>> {
     } else {
         (Stamp::Released(version(marker.strip_prefix('v')?)?), None)
     };
-    let metadata_start = "- **".len() + open;
-    let stamp_start = metadata_start + '（'.len_utf8() + date.len();
     Some(StampedTitle {
-        title,
-        date,
+        title: metadata.title,
+        date: metadata.date,
         stamp,
         release_url,
         supplement,
-        summary,
-        metadata_range: metadata_start..metadata_start + bold.len() - open,
-        stamp_range: stamp_start..stamp_start + 1 + marker.len(),
+        summary: metadata.summary,
+        metadata_range: metadata.range,
+        stamp_range: metadata.suffix_start..metadata.suffix_start + 1 + marker.len(),
     })
+}
+
+/// 表示用に日付と印を一度だけ除き、題・補足・本文の byte を保つ。
+/// 戻り値を再度この関数へ渡さず、抽出時に一度だけ呼ぶ。
+pub fn render_without_stamp(line: &str, language: NotesLanguage) -> Option<String> {
+    let parsed = parse_with_language(line, language)?;
+    let syntax = title_syntax(language);
+    let replacement = parsed.supplement.map_or_else(String::new, |note| {
+        format!("{}{note}{}", syntax.opening, syntax.closing)
+    });
+    let range = parsed.metadata_range.start - syntax.leading_space_bytes..parsed.metadata_range.end;
+    let mut rendered = line.to_owned();
+    rendered.replace_range(range, &replacement);
+    Some(rendered)
 }
 
 /// 旧い括弧外の印は archive 等の読取互換だけに使う。
@@ -134,6 +231,13 @@ pub fn parse_legacy_compact(line: &str) -> Option<(&str, Stamp<'_>)> {
         other => Stamp::Released(version(other.strip_prefix("/v")?)?),
     };
     Some((date, stamp))
+}
+
+/// 月内の版小節。言語によらず ASCII の版と ISO 日付を使う。
+pub fn parse_version_heading(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("### ")?.trim_end_matches('\r');
+    let (release, date) = rest.strip_suffix(')')?.split_once(" (")?;
+    Some((version(release)?, valid_date(date).then_some(date)?))
 }
 
 /// YYYY-MM-DD の形の実在する日付か。
@@ -164,6 +268,49 @@ pub fn valid_date(date: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::develop_tools_manifest::NotesLanguage;
+
+    #[test]
+    fn english_stamps_preserve_metadata_and_byte_ranges() {
+        let line = "- **Tests (2026-11-09/⏳, fast (pane))**: Keeps ordering deterministic.";
+        let item = parse_with_language(line, NotesLanguage::En).unwrap();
+        assert_eq!(item.title, "Tests");
+        assert_eq!(item.date, "2026-11-09");
+        assert_eq!(item.stamp, Stamp::Unreleased);
+        assert_eq!(item.supplement, Some("fast (pane)"));
+        assert_eq!(&line[item.stamp_range], "/⏳");
+        assert_eq!(&line[item.metadata_range], "(2026-11-09/⏳, fast (pane))");
+        assert!(parse(line).is_none());
+    }
+
+    #[test]
+    fn english_stamp_grammar_rejects_mixed_or_empty_metadata() {
+        for line in [
+            "- **Stop  (2026-11-09/⏳)**: Body",
+            "- **Stop (2026-11-09/⏳)**:Body",
+            "- **Stop（2026-11-09/⏳）**: Body",
+            "- **Stop (2026-11-09/⏳、note)**: Body",
+            "- **Stop (2026-11-09/⏳,  )**: Body",
+            "- **Stop (2026-11-09/⏳/v1.2.3)**: Body",
+            "- **Stop (2026-11-09/[v1.2.3](https://github.com/owner/repo/releases/tag/v1.2.4))**: Body",
+            "- **Stop (2026-11-09/[v1.2.3](/releases/tag/v1.2.3))**: Body",
+        ] {
+            assert!(
+                parse_with_language(line, NotesLanguage::En).is_none(),
+                "{line}"
+            );
+        }
+        for marker in [
+            "v1.2.3",
+            "[v1.2.3](https://github.com/owner/repo/releases/tag/v1.2.3)",
+        ] {
+            let line = format!("- **History (2026-11-09/{marker})**: Preserves the note.");
+            assert_eq!(
+                parse_with_language(&line, NotesLanguage::En).unwrap().stamp,
+                Stamp::Released("1.2.3")
+            );
+        }
+    }
     #[test]
     fn parses_stamps_and_ranges() {
         let pending = "- **題（2026-11-05/⏳、補足）**: 要約";

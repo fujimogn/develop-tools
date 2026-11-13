@@ -16,7 +16,7 @@ fn help() -> String {
         "cwd を含む git repo を読みます。--tracked は index の全文書、--staged は staged の変更、--range は base..head の変更に関わる問題だけを報告します。--range は head の tree を読み、base が全 0 または手元に無ければ head の第一親との差（root commit は自身の追加分）に絞ります。上限値と repo ごとの行は、検査する snapshot（index または head の tree）にある scope 表の写しだけから決めます。写しは必須で、無ければ exit 2 で止まります。",
         "なし（git の index・commit tree・remote.origin.url を読むだけ）。",
     )
-    .exit("0 = 問題なし、1 = 問題あり、2 = 引数・git の読み取りエラー")
+    .exit("0 = 問題なし（常駐注記の warning は許可）、1 = 問題あり、2 = 引数・git の読み取りエラー")
     .examples(&[
         "develop-docs-check --tracked",
         "develop-docs-check --staged",
@@ -132,11 +132,14 @@ fn main() -> ExitCode {
             eprintln!("{NAME}: {message}");
             ExitCode::from(2)
         }
-        Ok(outcome) if outcome.findings.is_empty() => {
-            println!("{NAME}: OK ({} 文書)", outcome.checked);
-            ExitCode::SUCCESS
-        }
         Ok(outcome) => {
+            for warning in &outcome.warnings {
+                eprintln!("{NAME}: warning: {warning}");
+            }
+            if outcome.findings.is_empty() {
+                println!("{NAME}: OK ({} 文書)", outcome.checked);
+                return ExitCode::SUCCESS;
+            }
             for finding in &outcome.findings {
                 eprintln!("{NAME}: {finding}");
             }

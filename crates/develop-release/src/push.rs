@@ -83,10 +83,14 @@ where
 }
 
 fn push_help() -> String {
+    let release = develop_tools_core::RELEASE_BRANCH;
+    let description = format!(
+        "Push the integration branch, then {release}, then the release tag. The tag is pushed only after every {release} push workflow run for the tag commit succeeds. When {release} is the integration branch and its tip has no version tag, use the tag for the version declared at {release}; its commit must be an ancestor of origin/{release}."
+    );
     let examples = ["release push", "release push --tag-without-ci-check"];
     Help::new(
         "release push [--tag-without-ci-check]",
-        "Push the integration branch, then main, then the release tag. The tag is pushed only after every main push workflow run for the tag commit succeeds. When main is the integration branch and its tip has no version tag, use the tag for the version declared at main; its commit must be an ancestor of origin/main.",
+        &description,
         "waits for GitHub Actions up to the tool's CI_WAIT constant",
         "pushes branch and tag refs to origin; leaves the tag local when CI cannot be confirmed",
     )
@@ -157,9 +161,13 @@ fn find_tag(root: &Path, sha: &str, main_only: bool) -> Result<String, String> {
             let version = crate::version_files::VersionFiles::load_at(root, sha)?.current();
             Ok(format!("v{version}"))
         }
-        0 => Err("main の SHA に v<semver> の tag がありません".to_owned()),
+        0 => Err(format!(
+            "{} の SHA に v<semver> の tag がありません",
+            develop_tools_core::RELEASE_BRANCH
+        )),
         _ => Err(format!(
-            "main の SHA に版の tag が複数あります: {}",
+            "{} の SHA に版の tag が複数あります: {}",
+            develop_tools_core::RELEASE_BRANCH,
             tags.join(" ")
         )),
     }
@@ -169,7 +177,10 @@ fn require_ancestor(root: &Path, commit: &str, main: &str) -> Result<(), String>
     git_stdout(root, &["merge-base", "--is-ancestor", commit, main])
         .map(drop)
         .map_err(|err| {
-            format!("tag の commit {commit} が main {main} に含まれると確認できません: {err}")
+            format!(
+                "tag の commit {commit} が {} {main} に含まれると確認できません: {err}",
+                develop_tools_core::RELEASE_BRANCH
+            )
         })
 }
 

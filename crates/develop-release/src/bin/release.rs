@@ -39,13 +39,20 @@ fn run() -> Result<(), String> {
         return develop_release::preflight::check_cli(&args.collect::<Vec<_>>());
     }
     if arg == "--help" || arg == "-h" {
+        let release = RELEASE_BRANCH;
+        let description = format!(
+            "Advance declared version files on the integration branch, fast-forward {release}, then create a local tag. It does not push. Publish with release push. When .config/develop-tools.json (or the legacy .develop-tools.json during migration) declares platforms, the latest release check run on HEAD must have a successful job for every declared OS; run release check first. When it declares release.notes, the tag is annotated with the release body; mode ai makes one Anthropic API request for the body and falls back to the CHANGELOG extract when that is not usable. A changelog-section body (mode or fallback) needs exactly one non-empty dated section for the version (## X.Y.Z (YYYY-MM-DD) or ## [X.Y.Z] - YYYY-MM-DD) in CHANGELOG.md at HEAD. A tagless stamped monthly changelog-additions release instead requires --first-release-base with a full commit or tree OID; the full diff must match every pending monthly item. --no-ai skips the request."
+        );
+        let writes = format!(
+            "files declared by release.versionFiles, and root CHANGELOG.md when release.changelogStamp is true; creates a git commit, advances {release}, and creates a v<version> tag (annotated when release.notes is declared); no remote push. With release.notes mode ai and without --no-ai, sends the scrubbed CHANGELOG items to Anthropic once and records AI fallback reasons (timestamp_unix_seconds, tag, reason_code only) in release-notes-fallback.jsonl in the common Git directory, warning with fallback_reason_unrecorded if recording fails while continuing the release; appends one row per API request to the usage ledger named by usage_ledger in ~/.config/develop-tools/llm.json (without that field, nothing is sent). A first release skips inference and uses the version section, or the fixed monthly diff when --first-release-base is supplied. Publish with release push."
+        );
         print!(
             "{}",
             Help::new(
                 "release <patch | minor | major | x.y.z> [--no-ai] [--first-release-base <完全なOID>]",
-                "Advance declared version files on the integration branch, fast-forward main, then create a local tag. It does not push. Publish with release push. When .config/develop-tools.json (or the legacy .develop-tools.json during migration) declares platforms, the latest release check run on HEAD must have a successful job for every declared OS; run release check first. When it declares release.notes, the tag is annotated with the release body; mode ai makes one Anthropic API request for the body and falls back to the CHANGELOG extract when that is not usable. A changelog-section body (mode or fallback) needs exactly one non-empty dated section for the version (## X.Y.Z (YYYY-MM-DD) or ## [X.Y.Z] - YYYY-MM-DD) in CHANGELOG.md at HEAD. A tagless stamped monthly changelog-additions release instead requires --first-release-base with a full commit or tree OID; the full diff must match every pending monthly item. --no-ai skips the request.",
+                &description,
                 "applies changes when a version bump is supplied; without an argument, exits without writing",
-                "files declared by release.versionFiles, and root CHANGELOG.md when release.changelogStamp is true; creates a git commit, advances main, and creates a v<version> tag (annotated when release.notes is declared); no remote push. With release.notes mode ai and without --no-ai, sends the scrubbed CHANGELOG items to Anthropic once and records AI fallback reasons (timestamp_unix_seconds, tag, reason_code only) in release-notes-fallback.jsonl in the common Git directory, warning with fallback_reason_unrecorded if recording fails while continuing the release; appends one row per API request to the usage ledger named by usage_ledger in ~/.config/develop-tools/llm.json (without that field, nothing is sent). A first release skips inference and uses the version section, or the fixed monthly diff when --first-release-base is supplied. Publish with release push.",
+                &writes,
             )
             .exit("0 success; 1 invalid input or failed release")
             .render()

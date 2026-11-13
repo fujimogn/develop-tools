@@ -11,16 +11,7 @@ use std::time::{Duration, Instant};
 static PROCESS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn harness() -> PathBuf {
-    let path = std::env::var_os("HEAVY_CHECK_TEST_HARNESS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::current_exe()
-                .expect("test executable path")
-                .parent()
-                .and_then(Path::parent)
-                .expect("test executable must be in target/<profile>/deps")
-                .join("examples/heavy-check-harness")
-        });
+    let path = support::harness_executable();
     assert!(
         path.is_file(),
         "heavy-check harness missing at {}; run cargo test --manifest-path packages/cli/Cargo.toml -p develop-tools-core to build the example",

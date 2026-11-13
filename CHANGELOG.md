@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.19] - 2026-11-14
+
+### Added
+
+- Accept `"docsProfile": "public-independent"` in `.config/develop-tools.json`. `develop-docs-check` then keeps link checks, the index rule, size limits, and resident-annotation warnings, and skips the other document rules, including changelog, todo layout, required files, and headings. The profile is one named set. Omitting the field keeps the full rule set. An unknown, empty, or non-string value fails the check.
+- Warn, without changing the exit status, when a resident document contains a parenthetical decision note with a date. `TODO.md`, `CHANGELOG.md`, indexed records, and ADRs are excluded. Resident-document paths and `@path` import targets come from one shared reader. Callers still resolve paths. A target counts only when the line starts with `@`, and the trimmed target is non-empty and contains no whitespace.
+- Accept `ci.rust.fetchHistory` as a boolean, default false, so a repository can declare a full-history checkout for its Rust CI job. Any other type is rejected. Omitting the field keeps the previous manifest.
+
+### Changed
+
+- Read the release branch in `release`, `release push`, and `check-release-version` from the shared `RELEASE_BRANCH` constant. Help text is unchanged.
+- Add `LEGACY_DEFAULT_BRANCH` (`master`), `CI_DEVELOP_BRANCH` (`develop`), and `is_protected_branch`. Protected branches are the release branch and the legacy default branch. A repository that does not declare `integrationBranch` still uses `develop` as the CI push branch.
+- Pin the Rust toolchain for this package to 1.100.0. The test-support helper reads Cargo artifact paths from Cargo's JSON output, because Cargo 1.100 does not treat the build-dir layout as a stable interface.
+- Update `rustls-webpki` to 0.103.17.
+- Remove the unused `publish = false` from `[workspace.package]`.
+
+### Fixed
+
+- Stop treating a numeric range as a date in resident-annotation warnings. A parenthetical that is only a Markdown link label is not a decision note. A decision note that follows a link still warns.
+
 ## [0.6.18] - 2026-11-13
 
 ### Changed

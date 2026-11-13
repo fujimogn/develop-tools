@@ -16,7 +16,7 @@ use crate::constants::{
 };
 use crate::git::{Entry, Repo};
 use crate::links::{self, BrokenLink, Snapshot};
-use crate::rules::RuleFinding;
+use crate::rules::{Profile, Rule, RuleFinding};
 use crate::{adr, docs, emoji, openspec, records, retired};
 
 /// 見る範囲。
@@ -33,6 +33,7 @@ pub enum Mode {
 /// 検査の入力。git から作るが、検査自体は git に触れない。
 #[derive(Debug, Default)]
 pub struct Input {
+    pub profile: Profile,
     /// GitHub の `owner/name`。定数表の repo 行を選ぶ。
     pub repo: Option<String>,
     pub snapshot: Snapshot,
@@ -97,6 +98,8 @@ impl fmt::Display for Finding {
 pub struct Outcome {
     pub findings: Vec<Finding>,
     pub checked: usize,
+    /// 案内のみ。検査の失敗には数えない。
+    pub warnings: Vec<String>,
 }
 
 /// `entries`（index か commit tree）から scope 表の写しの entry を選ぶ。
@@ -168,10 +171,11 @@ pub fn run(repo: &Repo, mut mode: Mode) -> Result<Outcome, String> {
         changed,
         ..Input::default()
     };
-    let manifest = if entries
-        .iter()
-        .any(|entry| entry.path == crate::constants::CHANGELOG_PATH)
-    {
+    // CHANGELOG のない旧設定だけの repo は従来どおり無視する。
+    // 新しい profile の宣言元は canonical manifest だけであり、写しは持たない。
+    let manifest = if entries.iter().any(|entry| {
+        entry.path == crate::constants::CHANGELOG_PATH || entry.path == develop_tools_manifest::PATH
+    }) {
         develop_tools_manifest::locate_in(|path| {
             Ok(entries.iter().any(|entry| entry.path == path))
         })?
@@ -206,6 +210,8 @@ pub fn run(repo: &Repo, mut mode: Mode) -> Result<Outcome, String> {
                 .map_err(|error| format!("{}: {error}", entry.path))?;
             let declared = develop_tools_manifest::declaration(&value)
                 .map_err(|error| format!("{}: {error}", entry.path))?;
+            input.profile = Profile::from_name(declared.docs_profile.as_deref())
+                .map_err(|error| format!("{}: {error}", entry.path))?;
             input.changelog_stamp = declared.changelog_stamp;
             input.changelog_language = declared.changelog_language();
         }
@@ -231,7 +237,9 @@ pub fn run(repo: &Repo, mut mode: Mode) -> Result<Outcome, String> {
     let prefixes: BTreeSet<&str> = input
         .snapshot
         .markdown()
-        .filter(|(path, _)| *path == crate::constants::CHANGELOG_PATH)
+        .filter(|(path, _)| {
+            input.profile.includes(Rule::Changelog) && *path == crate::constants::CHANGELOG_PATH
+        })
         .filter_map(|(_, text)| text.ok())
         .flat_map(records::changelog_commit_links)
         .filter_map(|(_, link)| link.ok().map(|link| link.sha))
@@ -287,7 +295,9 @@ pub fn evaluate(input: &Input) -> Outcome {
         }
     }
 
-    findings.extend(check_script_references(input));
+    if input.profile.script_references() {
+        findings.extend(check_script_references(input));
+    }
 
     for limit in byte_limits_for(repo) {
         let Some(bytes) = input.sizes.get(limit.path) else {
@@ -312,12 +322,112 @@ pub fn evaluate(input: &Input) -> Outcome {
     ];
     for finding in rules.iter().flat_map(|rule| rule(input)) {
         let relevant = touched(&finding.path) || finding.related.iter().any(|p| touched(p));
-        if relevant {
+        if relevant && input.profile.includes(finding.rule) {
             findings.push(Finding::Rule(finding));
         }
     }
-    Outcome { findings, checked }
+    let warnings = resident_annotation_warnings(input);
+    Outcome {
+        findings,
+        checked,
+        warnings,
+    }
 }
+
+/// 起動計測と同じ profile 表と import 行の抽出を使い、index 内の import をたどる。
+/// HOME や未 staged の本文は参照しない。解決は index と links のまま。
+fn resident_annotation_warnings(input: &Input) -> Vec<String> {
+    use develop_core::resident_docs::{RULES, import_target};
+    let documents: BTreeMap<_, _> = input
+        .snapshot
+        .markdown()
+        .filter_map(|(path, text)| text.ok().map(|text| (path, text)))
+        .collect();
+    let mut resident = BTreeSet::new();
+    let mut imports = BTreeSet::new();
+    for rule in RULES {
+        for path in documents.keys().copied() {
+            let direct = rule
+                .chain_docs
+                .iter()
+                .any(|name| path == *name || path.ends_with(&format!("/{name}")))
+                || rule.local_docs.contains(&path);
+            let rule_file = rule.rule_dirs.iter().any(|dir| {
+                path.strip_prefix(dir)
+                    .is_some_and(|tail| tail.starts_with('/') && !tail[1..].contains('/'))
+            });
+            if direct || rule_file {
+                resident.insert(path.to_owned());
+            }
+            if direct && rule.expand_imports {
+                imports.insert(path.to_owned());
+            }
+        }
+    }
+    let mut visited = BTreeSet::new();
+    while let Some(path) = imports.pop_first() {
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        let Some(text) = documents.get(path.as_str()) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Some(target) = import_target(line) else {
+                continue;
+            };
+            if let links::Resolution::Local { path: imported, .. } = links::resolve(&path, target)
+                && documents.contains_key(imported.as_str())
+            {
+                resident.insert(imported.clone());
+                imports.insert(imported);
+            }
+        }
+    }
+    let mut warnings = Vec::new();
+    for path in resident {
+        // 記録への import があっても履歴の注記を警告しない。
+        if path == crate::constants::TODO_PATH
+            || path == crate::constants::CHANGELOG_PATH
+            || crate::constants::is_index_record_path(&path)
+            || path.starts_with(&format!("{}/", crate::constants::ADR_DIR))
+        {
+            continue;
+        }
+        if input
+            .changed
+            .as_ref()
+            .is_some_and(|changed| !touches(changed, &path))
+        {
+            continue;
+        }
+        if let Some(text) = documents.get(path.as_str()) {
+            for (line, text) in text.lines().enumerate() {
+                if RESIDENT_ANNOTATION.find_iter(text).any(|note| {
+                    !(note.as_str().starts_with('(') && text[..note.start()].ends_with(']'))
+                        && RESIDENT_NOTE_CONTENT.is_match(note.as_str())
+                }) {
+                    warnings.push(format!("{path}:{}: [resident-annotation] 常駐文書の決定日・決定者の注記は記録文書へ移してください", line + 1));
+                }
+            }
+        }
+    }
+    warnings
+}
+
+static RESIDENT_ANNOTATION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[（(][^（）()\r\n]*[）)]").unwrap());
+
+static RESIDENT_NOTE_CONTENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?:^|[^0-9])(?:",
+        r"[0-9]{4}[-/](?:0?[1-9]|1[0-2])[-/](?:0?[1-9]|[12][0-9]|3[01])|",
+        r"[0-9]{4}年(?:0?[1-9]|1[0-2])月(?:0?[1-9]|[12][0-9]|3[01])日|",
+        r"(?:0[1-9]|1[0-2])[-/](?:0[1-9]|[12][0-9]|3[01])",
+        r")(?:[^0-9]|$)|(?:owner|藤井)[ \t]*決定"
+    ))
+    .unwrap()
+});
 
 fn is_package_path(path: &str) -> bool {
     path == "package.json"

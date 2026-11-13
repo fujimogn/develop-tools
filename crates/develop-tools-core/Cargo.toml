@@ -7,6 +7,9 @@ description = "develop tools が共有する最小の土台 (git 起動の衛生
 license.workspace = true
 publish = false
 
+[features]
+test-support = []
+
 [dependencies]
 libc = { workspace = true }
 # managed_block が区画の本文を marker の hash と照合する
@@ -14,6 +17,9 @@ sha2 = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# integration test は同じ source を読む。lib の依存は test crate へ継がない。
+libc = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

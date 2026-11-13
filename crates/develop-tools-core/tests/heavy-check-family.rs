@@ -49,19 +49,7 @@ impl Runner {
             unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
             0
         );
-        let mut command = Command::new(
-            std::env::var_os("HEAVY_CHECK_TEST_HARNESS")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    std::env::current_exe()
-                        .unwrap()
-                        .parent()
-                        .unwrap()
-                        .parent()
-                        .unwrap()
-                        .join("examples/heavy-check-harness")
-                }),
-        );
+        let mut command = Command::new(support::harness_executable());
         command
             .args([
                 std::ffi::OsStr::new("--family"),
@@ -447,13 +435,7 @@ fn worker_stops_when_supervisor_dies_before_start_handshake() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let root = Fixture::new();
     let home = support::directory(&root.path().join("account"));
-    let executable = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples/heavy-check-harness");
+    let executable = support::harness_executable();
     let (receiver, sender) = slot_channel().unwrap();
     let mut command = Command::new(executable);
     command

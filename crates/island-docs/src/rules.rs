@@ -86,3 +86,29 @@ impl fmt::Display for RuleFinding {
         write!(f, "[{}] {}", self.rule.label(), self.message)
     }
 }
+
+/// 規則の組の唯一の定義。repo は名前だけを宣言し、規則を個別に外さない。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    #[default]
+    All,
+    PublicIndependent,
+}
+
+impl Profile {
+    pub fn from_name(name: Option<&str>) -> Result<Self, String> {
+        match name {
+            None => Ok(Self::All),
+            Some("public-independent") => Ok(Self::PublicIndependent),
+            Some(name) => Err(format!("未知の docsProfile: {name}")),
+        }
+    }
+
+    pub fn includes(self, rule: Rule) -> bool {
+        self == Self::All || rule == Rule::Index
+    }
+
+    pub fn script_references(self) -> bool {
+        self == Self::All
+    }
+}

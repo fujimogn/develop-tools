@@ -1,6 +1,12 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+// cargo は package 自身の integration test に非 default の feature を付けない。
+// default にすると依存先の通常 build へ公開される。source は `src/test_support.rs` の 1 つ。
+#[path = "../../src/test_support.rs"]
+mod test_support;
 
 use develop_tools_core::heavy_check::state::{Account, AccountSource, StateError};
 
@@ -40,20 +46,41 @@ pub fn fixture() -> tempfile::TempDir {
     dir
 }
 
+/// `heavy-check-harness` の path。`HEAVY_CHECK_TEST_HARNESS` があればそれ、無ければ cargo の
+/// JSON が報告した executable の写し。test 実行ファイルの 2 つ上を profile directory と推さない。
+#[allow(dead_code)]
+pub fn harness_executable() -> PathBuf {
+    if let Some(path) = std::env::var_os("HEAVY_CHECK_TEST_HARNESS") {
+        return PathBuf::from(path);
+    }
+    static PLACED: OnceLock<PathBuf> = OnceLock::new();
+    PLACED.get_or_init(build_harness_executable).clone()
+}
+
+fn build_harness_executable() -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("heavy-check-harness");
+    test_support::build_placed_executables(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        &dir,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "develop-tools-core",
+            "--example",
+            "heavy-check-harness",
+        ],
+        |name| name == "heavy-check-harness",
+    )
+    .remove("heavy-check-harness")
+    .expect("cargo が heavy-check-harness の executable を報告しなかった")
+}
+
 /// Tests use the built example even when no runner environment is provided.
 #[allow(dead_code)]
 pub fn harness_command() -> std::process::Command {
     use std::os::unix::process::CommandExt;
-    let path = std::env::var_os("HEAVY_CHECK_TEST_HARNESS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::current_exe()
-                .unwrap()
-                .parent()
-                .and_then(Path::parent)
-                .expect("test executable in target/<profile>/deps")
-                .join("examples/heavy-check-harness")
-        });
+    let path = harness_executable();
     assert!(
         path.is_file(),
         "build heavy-check-harness example first: {}",

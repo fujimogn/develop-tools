@@ -6,6 +6,96 @@ use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_develop-docs-check");
 
+#[test]
+fn resident_annotation_is_a_warning_in_the_staged_snapshot() {
+    let dir = island_repo(None);
+    write(
+        dir.path(),
+        "AGENTS.md",
+        "# agents\n規約（owner 決定 2026-11-13）\n",
+    );
+    git(dir.path(), &["add", "."]);
+    write(
+        dir.path(),
+        "AGENTS.md",
+        "# agents\n注記を消した未 staged 編集\n",
+    );
+    let out = run(dir.path(), &["--staged"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("warning: AGENTS.md:2: [resident-annotation]"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn resident_imports_and_rules_warn_but_records_and_unstaged_notes_do_not() {
+    let dir = island_repo(None);
+    write(
+        dir.path(),
+        "CLAUDE.md",
+        "# claude\n@.claude/lessons/general.md\n@TODO.md\n@docs/reviews/record.md\n@docs/adr/0001-test.md\n@CHANGELOG.md\n",
+    );
+    write(
+        dir.path(),
+        ".claude/lessons/general.md",
+        "# lessons\n藤井決定（11-09）\n@../../CLAUDE.md\n",
+    );
+    write(
+        dir.path(),
+        ".claude/rules/tests.md",
+        "# tests\n規約 (owner 決定 2026-11-13)\n",
+    );
+    write(
+        dir.path(),
+        ".claude/lessons/general-reference.md",
+        "# reference\n履歴（2026-11-13）\n",
+    );
+    write(
+        dir.path(),
+        "TODO.md",
+        "# TODO\n\n## 進行中\n\n- [ ] **項目**。藤井決定（11-09）。\n",
+    );
+    write(
+        dir.path(),
+        "docs/reviews/record.md",
+        "# Record\n（owner 決定 2026-11-13）\n",
+    );
+    write(
+        dir.path(),
+        "docs/adr/README.md",
+        "# ADR\n- [test](0001-test.md)\n",
+    );
+    write(
+        dir.path(),
+        "docs/adr/0001-test.md",
+        "---\nstatus: accepted\ndate: 2026-11-13\n---\n\n# ADR-0001: Test\n\nChosen option: A\n\n- Good: A\n- Bad: B\n- Neutral: C\n\n（owner 決定 2026-11-13）\n",
+    );
+    git(dir.path(), &["add", "."]);
+    write(
+        dir.path(),
+        "AGENTS.md",
+        "# agents\n（owner 決定 2026-11-13）\n",
+    );
+    let out = run(dir.path(), &["--staged"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let warnings: Vec<_> = stderr(&out)
+        .lines()
+        .filter(|line| line.contains("warning:"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(
+        warnings[0].contains(".claude/lessons/general.md:2:"),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings[1].contains(".claude/rules/tests.md:2:"),
+        "{warnings:?}"
+    );
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let mut command = Command::new("git");
     develop_core::strip_git_env(&mut command);
@@ -2198,4 +2288,165 @@ fn tracked_version_items_use_release_date_instead_of_month() {
             );
         }
     }
+}
+
+#[test]
+fn resident_links_and_approval_procedures_are_not_decision_notes() {
+    let dir = island_repo(None);
+    write(
+        dir.path(),
+        "AGENTS.md",
+        "# agents\n[手順](docs/reviews/2026-11-13-reference.md)\n承認フロー（読み取り → 藤井承認 → 実行）\n",
+    );
+    write(
+        dir.path(),
+        "docs/reviews/2026-11-13-reference.md",
+        "# reference\n",
+    );
+    git(dir.path(), &["add", "."]);
+    let out = run(dir.path(), &["--staged"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("[resident-annotation]"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn resident_numeric_ranges_are_not_dates_and_fullwidth_notes_after_links_warn() {
+    let dir = island_repo(None);
+    write(
+        dir.path(),
+        "AGENTS.md",
+        "# agents\n対象（HTTP 400/500）\n目安（100-200 行）\n接続（port 80/443）\n[^1]（2026-11-09）\n決定（決定11-09）\n",
+    );
+    git(dir.path(), &["add", "."]);
+    let out = run(dir.path(), &["--staged"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let warnings: Vec<_> = stderr(&out)
+        .lines()
+        .filter(|line| line.contains("[resident-annotation]"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(warnings[0].contains("AGENTS.md:5:"), "{warnings:?}");
+    assert!(warnings[1].contains("AGENTS.md:6:"), "{warnings:?}");
+}
+
+/// 公開 CLI の同じ index が、選択した組と未宣言で異なる規則を適用する。
+#[test]
+fn docs_profile_selects_public_independent_and_defaults_to_all_rules() {
+    let dir = repo(None);
+    write(dir.path(), "README.md", "# public\n");
+    write(dir.path(), "TODO.md", "# TODO\n\n## Now\n\n- [ ] **x**\n");
+    write(
+        dir.path(),
+        "CHANGELOG.md",
+        "# Changelog\n\n## Unreleased\n\n- example\n",
+    );
+    write(dir.path(), "docs/README.md", "# docs\n");
+    git(dir.path(), &["add", "."]);
+    let default = run(dir.path(), &["--tracked"]);
+    for rule in ["changelog", "todo-layout", "required-file"] {
+        assert!(
+            stderr(&default).contains(&format!("[{rule}]")),
+            "{}",
+            stderr(&default)
+        );
+    }
+    write(
+        dir.path(),
+        ".config/develop-tools.json",
+        r#"{"docsProfile":"public-independent"}"#,
+    );
+    git(dir.path(), &["add", "."]);
+    let public = run(dir.path(), &["--tracked"]);
+    assert_eq!(public.status.code(), Some(0), "{}", stderr(&public));
+    // 未 staged の選択解除は index の選択に影響しない。
+    write(dir.path(), ".config/develop-tools.json", "{}");
+    let public = run(dir.path(), &["--tracked"]);
+    assert_eq!(public.status.code(), Some(0), "{}", stderr(&public));
+}
+
+#[test]
+fn public_docs_profile_keeps_links_index_capacity_and_resident_warnings() {
+    let dir = repo(None);
+    write(
+        dir.path(),
+        ".config/develop-tools.json",
+        r#"{"docsProfile":"public-independent"}"#,
+    );
+    write(dir.path(), "README.md", "# public\n[missing](missing.md)\n");
+    write(dir.path(), "docs/README.md", "# docs\n");
+    write(dir.path(), "docs/orphan.md", "not an H1\n");
+    write(
+        dir.path(),
+        "AGENTS.md",
+        &format!(
+            "# agents\n規約（owner 決定 2026-11-13）\n{}",
+            "x".repeat(12001)
+        ),
+    );
+    git(dir.path(), &["add", "."]);
+    let out = run(dir.path(), &["--tracked"]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    for expected in ["missing.md", "[index]", "容量上限", "[resident-annotation]"] {
+        assert!(err.contains(expected), "{expected}: {err}");
+    }
+    for excluded in ["[required-file]", "[h1]", "[changelog]", "[todo-layout]"] {
+        assert!(!err.contains(excluded), "{excluded}: {err}");
+    }
+}
+
+#[test]
+fn docs_profile_rejects_unknown_empty_and_non_string_declarations_without_changelog() {
+    let dir = repo(None);
+    for value in [r#""unknown""#, r#""""#, "false", "null", "[]", "{}"] {
+        write(
+            dir.path(),
+            ".config/develop-tools.json",
+            &format!(r#"{{"docsProfile":{value}}}"#),
+        );
+        git(dir.path(), &["add", "."]);
+        let out = run(dir.path(), &["--tracked"]);
+        assert_eq!(out.status.code(), Some(2), "{value}: {}", stderr(&out));
+        assert!(stderr(&out).contains("docsProfile"), "{}", stderr(&out));
+    }
+}
+
+#[test]
+fn docs_profile_selection_follows_the_range_head_and_staged_index() {
+    let dir = repo(None);
+    write(dir.path(), "README.md", "# public\n");
+    write(dir.path(), "TODO.md", "# TODO\n\n## Now\n\n- [ ] **x**\n");
+    write(
+        dir.path(),
+        ".config/develop-tools.json",
+        r#"{"docsProfile":"public-independent"}"#,
+    );
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "public"]);
+    write(dir.path(), ".config/develop-tools.json", "{}");
+    write(dir.path(), "README.md", "# changed\n");
+    write(dir.path(), "TODO.md", "# TODO\n\n## Next\n\n- [ ] **y**\n");
+    git(dir.path(), &["add", "."]);
+    let staged = run(dir.path(), &["--staged"]);
+    assert_eq!(staged.status.code(), Some(1), "{}", stderr(&staged));
+    assert!(stderr(&staged).contains("[todo-layout]"));
+    git(dir.path(), &["commit", "-qm", "default"]);
+    let oid = |name: &str| {
+        let mut command = Command::new("git");
+        develop_core::strip_git_env(&mut command);
+        let out = command
+            .args(["rev-parse", name])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let out = run(dir.path(), &["--range", &oid("HEAD"), &oid("HEAD~1")]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
 }

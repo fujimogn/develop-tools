@@ -23,9 +23,24 @@ pub mod heavy_check;
 pub mod managed_block;
 #[cfg(test)]
 mod managed_block_tests;
+pub mod resident_docs;
+/// cargo の JSON から成果物の path を引く。feature `test-support` のときだけ公開する。
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 /// Release のみが進める branch。日常統合先は repo の版固定 file の `integrationBranch` から読む。
 pub const RELEASE_BRANCH: &str = "main";
+
+/// 旧い既定の branch。配布の書き込みは Release と同じく拒む。この文字列はここだけ。
+pub const LEGACY_DEFAULT_BRANCH: &str = "master";
+
+/// ci-develop の spec が push に置く branch。manifest に `integrationBranch` が無いときに使う。
+pub const CI_DEVELOP_BRANCH: &str = "develop";
+
+/// 配布先にしてはならない branch か。
+pub fn is_protected_branch(branch: &str) -> bool {
+    branch == RELEASE_BRANCH || branch == LEGACY_DEFAULT_BRANCH
+}
 
 pub mod freshness {
     //! 手元の binary と repo が固定した版の比較。

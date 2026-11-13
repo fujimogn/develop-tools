@@ -123,6 +123,7 @@ pub struct RustCi {
     pub workspaces: Vec<String>,
     pub test_runner: String,
     pub cache_toolchain: bool,
+    pub fetch_history: bool,
     /// 区画の Rust job の最後に `run:` へそのまま置く 1 行の command。
     pub extra_steps: Vec<String>,
 }
@@ -188,6 +189,8 @@ pub enum NotesAudience {
 /// [`known_shape`] が見るので、ここでは読まない。道具を配る側の repo の形でも読める。
 #[derive(Debug)]
 pub struct Declaration {
+    /// 文書検査の組の名前。定義と名前の解決は island-docs が持つ。
+    pub docs_profile: Option<String>,
     pub integration_branch: Option<String>,
     /// 宣言が無ければ空。既定の OS を補わない。
     pub platforms: Vec<Platform>,
@@ -286,7 +289,13 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
             let rust = stack(
                 rust,
                 "ci.rust",
-                &["workspaces", "extraSteps", "testRunner", "cacheToolchain"],
+                &[
+                    "workspaces",
+                    "extraSteps",
+                    "testRunner",
+                    "cacheToolchain",
+                    "fetchHistory",
+                ],
             )?;
             let test_runner = match rust.get("testRunner") {
                 None => "cargo",
@@ -300,10 +309,16 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
                 Some(Value::Bool(value)) => *value,
                 Some(_) => return Err("ci.rust.cacheToolchain は真偽値でなければなりません".into()),
             };
+            let fetch_history = match rust.get("fetchHistory") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return Err("ci.rust.fetchHistory は真偽値でなければなりません".into()),
+            };
             Some(RustCi {
                 workspaces: directories(rust, "ci.rust", "workspaces")?,
                 test_runner: test_runner.to_owned(),
                 cache_toolchain,
+                fetch_history,
                 extra_steps: extra_steps(rust)?,
             })
         }
@@ -505,6 +520,7 @@ fn release_notes(release: &Value) -> Result<Option<ReleaseNotes>, String> {
 pub fn declaration(value: &Value) -> Result<Declaration, String> {
     let object = value.as_object().ok_or("JSON object が必要です")?;
     let integration_branch = optional_string(object, "integrationBranch")?;
+    let docs_profile = optional_string(object, "docsProfile")?;
     let adr_contract = adr_contract(value)?;
     let ci = ci_declaration(value)?;
     let release = match object.get("release") {
@@ -590,6 +606,7 @@ pub fn declaration(value: &Value) -> Result<Declaration, String> {
         },
     };
     Ok(Declaration {
+        docs_profile,
         integration_branch,
         platforms,
         platform_check,
@@ -619,6 +636,7 @@ fn known_keys(value: &Value) -> bool {
             "version"
                 | "sha256"
                 | "integrationBranch"
+                | "docsProfile"
                 | "release"
                 | "platforms"
                 | "platformCheck"
@@ -627,7 +645,8 @@ fn known_keys(value: &Value) -> bool {
                 | "adrSanitizedNumbers"
                 | "ci"
         )
-    }) || adr_contract(value).is_err()
+    }) || optional_string(object, "docsProfile").is_err()
+        || adr_contract(value).is_err()
         || ci_declaration(value).is_err()
         || object
             .get("integrationBranch")
@@ -798,6 +817,25 @@ mod tests {
             std::fs::write(path, "{}").unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn docs_profile_name_is_preserved_and_shape_checked_without_defining_rules() {
+        let value = json!({"docsProfile": "public-independent"});
+        assert!(known_unpinned_shape(&value));
+        assert_eq!(
+            declaration(&value).unwrap().docs_profile.as_deref(),
+            Some("public-independent")
+        );
+        let rewritten = rewrite(Some(&value), Pin::Unpinned, None).unwrap();
+        let rewritten: Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(rewritten["docsProfile"], "public-independent");
+        assert!(declaration(&json!({})).unwrap().docs_profile.is_none());
+        for invalid in [json!(""), json!(null), json!(false), json!([]), json!({})] {
+            let value = json!({"docsProfile": invalid});
+            assert!(declaration(&value).is_err());
+            assert!(!known_unpinned_shape(&value));
+        }
     }
 
     #[test]
@@ -1118,6 +1156,7 @@ mod tests {
                     workspaces: vec!["tools".into(), "packages/cli".into()],
                     test_runner: "cargo".into(),
                     cache_toolchain: false,
+                    fetch_history: false,
                     extra_steps: vec!["cargo xtask record-root".into()],
                 }),
                 bun: Some(BunCi {
@@ -1187,6 +1226,25 @@ mod tests {
             )
             .unwrap_err();
             assert!(error.contains("ci.rust.cacheToolchain"), "{error}");
+        }
+    }
+
+    #[test]
+    fn rust_history_is_boolean_and_defaults_to_false() {
+        for enabled in [None, Some(false), Some(true)] {
+            let mut value = json!({"ci": {"rust": {"workspaces": ["tools"]}}});
+            if let Some(enabled) = enabled {
+                value["ci"]["rust"]["fetchHistory"] = json!(enabled);
+            }
+            let rust = ci_declaration(&value).unwrap().unwrap().rust.unwrap();
+            assert_eq!(rust.fetch_history, enabled.unwrap_or(false));
+        }
+        for invalid in [json!(null), json!("true"), json!(0)] {
+            let error = ci_declaration(&json!({"ci": {"rust": {
+                "workspaces": ["tools"], "fetchHistory": invalid
+            }}}))
+            .unwrap_err();
+            assert!(error.contains("ci.rust.fetchHistory"), "{error}");
         }
     }
 

@@ -15,6 +15,8 @@ pub struct StampedTitle<'a> {
     pub title: &'a str,
     pub date: &'a str,
     pub stamp: Stamp<'a>,
+    /// リンク刻印に書かれた完全な tag 名。短い刻印には無い。
+    pub release_tag: Option<&'a str>,
     pub release_url: Option<&'a str>,
     pub supplement: Option<&'a str>,
     pub summary: &'a str,
@@ -23,17 +25,21 @@ pub struct StampedTitle<'a> {
 }
 
 fn version(raw: &str) -> Option<&str> {
-    let mut parts = raw.split('.');
-    for _ in 0..3 {
-        let part = parts.next()?;
-        if part.is_empty()
-            || (part.len() > 1 && part.starts_with('0'))
-            || !part.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return None;
-        }
-    }
-    parts.next().is_none().then_some(raw)
+    raw.parse::<crate::release_tag::Version>().ok().map(|_| raw)
+}
+
+/// 完全な release tag から、厳密な版数字の部分を返す。
+///
+/// prefix は共有 `TagPrefix` の規則で検証し、数字だけの tag や前ゼロを許可しない。
+pub fn parse_release_tag(tag: &str) -> Option<&str> {
+    let index = tag.char_indices().rev().find_map(|(index, character)| {
+        (!character.is_ascii_digit() && character != '.').then_some(index + character.len_utf8())
+    })?;
+    let (prefix, version) = tag.split_at(index);
+    (!prefix.is_empty()
+        && crate::release_tag::TagPrefix::new(prefix).is_ok()
+        && version.parse::<crate::release_tag::Version>().is_ok())
+    .then_some(version)
 }
 
 fn github_release_url(url: &str, tag: &str) -> bool {
@@ -178,23 +184,28 @@ pub fn parse_with_language(line: &str, language: NotesLanguage) -> Option<Stampe
         Some(_) => return None,
         None => (marked, None),
     };
-    let (stamp, release_url) = if marker == "⏳" {
-        (Stamp::Unreleased, None)
-    } else if let Some(link) = marker.strip_prefix("[v") {
-        let (raw, tail) = link.split_once("](")?;
-        let raw = version(raw)?;
+    let (stamp, release_tag, release_url) = if marker == "⏳" {
+        (Stamp::Unreleased, None, None)
+    } else if let Some(link) = marker.strip_prefix('[') {
+        let (tag, tail) = link.split_once("](")?;
+        let raw = parse_release_tag(tag)?;
         let url = tail.strip_suffix(')')?;
-        if !github_release_url(url, &format!("v{raw}")) {
+        if !github_release_url(url, tag) {
             return None;
         }
-        (Stamp::Released(raw), Some(url))
+        (Stamp::Released(raw), Some(tag), Some(url))
     } else {
-        (Stamp::Released(version(marker.strip_prefix('v')?)?), None)
+        (
+            Stamp::Released(version(marker.strip_prefix('v')?)?),
+            None,
+            None,
+        )
     };
     Some(StampedTitle {
         title: metadata.title,
         date: metadata.date,
         stamp,
+        release_tag,
         release_url,
         supplement,
         summary: metadata.summary,
@@ -333,14 +344,29 @@ mod tests {
             Stamp::Released("1.2.3")
         );
     }
+
+    #[test]
+    fn public_parser_accepts_non_v_release_links() {
+        let line = "- **題（2026-11-05/[release-1.2.3](https://github.com/owner/repo/releases/tag/release-1.2.3)）**: 要約";
+        let item = parse(line).expect("prefix link");
+        assert_eq!(item.stamp, Stamp::Released("1.2.3"));
+        assert_eq!(item.release_tag, Some("release-1.2.3"));
+        assert_eq!(
+            item.release_url,
+            Some("https://github.com/owner/repo/releases/tag/release-1.2.3")
+        );
+    }
     #[test]
     fn rejects_invalid_or_legacy_stamps() {
         for item in [
             "- **題（2026-11-05）**: 要約",
             "- **題** 2026-11-05 ⏳: 要約",
             "- **題（2026-11-05/[v1.2.3](https://github.com/owner/repo/releases/tag/v1.2.4)）**: 要約",
+            "- **題（2026-11-05/[release-1.2.3](https://github.com/owner/repo/releases/tag/release-1.2.4)）**: 要約",
             "- **題（2026-11-05/[v1.2.3](http://github.com/owner/repo/releases/tag/v1.2.3)）**: 要約",
             "- **題（2026-11-05/v1.02.3）**: 要約",
+            "- **題（2026-11-05/release-1.2.3）**: 要約",
+            "- **題（2026-11-05/[release.1.2.3](https://github.com/owner/repo/releases/tag/release.1.2.3)）**: 要約",
             "  - **題（2026-11-05/⏳）**: 要約",
         ] {
             assert!(parse(item).is_none(), "{item}");

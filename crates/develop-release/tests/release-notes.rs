@@ -10,7 +10,16 @@ use std::process::Command;
 
 fn git(root: &Path, args: &[&str]) -> String {
     let output = develop_tools_core::git(root)
-        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgSign=false"])
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "tag.gpgSign=false",
+        ])
         .args(args)
         .output()
         .unwrap();
@@ -1109,6 +1118,214 @@ fn fixed_manifest(root: &Path, path: &str, notes: &str) {
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(&file, format!(r#"{{"release":{{"notes":{notes}}}}}"#)).unwrap();
     git(root, &["add", path]);
+}
+
+#[test]
+fn notes_follow_each_tag_rule_across_a_prefix_transition() {
+    use develop_release::release_notes::FixedNotes;
+    let dir = fixture();
+    let root = dir.path();
+    let path = ".config/develop-tools.json";
+    std::fs::create_dir_all(root.join(".config")).unwrap();
+    // Historical classification must not validate unrelated, retired fields.
+    std::fs::write(
+        root.join(path),
+        r#"{"release":{"tagPrefix":"v"},"ci":{"retired":true},"adr":0}"#,
+    )
+    .unwrap();
+    git(root, &["add", path]);
+    commit(root, "# Changelog\n\n## 2026-11\n- **以前**\n", "old rule");
+    annotate(root, "v0.1.0");
+    std::fs::write(
+        root.join(path),
+        r#"{"release":{"tagPrefix":"release-","notes":{"mode":"changelog-additions"}}}"#,
+    )
+    .unwrap();
+    git(root, &["add", path]);
+    commit(
+        root,
+        "# Changelog\n\n## 2026-11\n- **以前**\n- **今回**\n",
+        "new rule",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    let planned = "release-0.2.0";
+    let result = extract_release(root, &end, planned, None).unwrap();
+    assert_eq!(result.previous, "v0.1.0");
+    assert_eq!(result.items, ["- **今回**"]);
+    assert!(result.render().contains("compare/v0.1.0...release-0.2.0"));
+    let fixed = FixedNotes::resolve(root, "v0.1.0", &end, planned, None).unwrap();
+    assert_eq!(fixed.extract().unwrap(), result);
+    assert!(
+        !develop_tools_core::git(root)
+            .args(["show-ref", "--verify", "--quiet", "refs/tags/release-0.2.0"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    annotate(root, planned);
+    assert!(notes(root, planned).status.success());
+    assert!(extract_release(root, &end, "other-0.2.0", None).is_err());
+    assert!(FixedNotes::resolve(root, "v0.1.0", &end, "v0.2.0", None).is_err());
+}
+
+#[test]
+fn previous_prefix_uses_its_own_commit_without_skipping_the_nearest_tag() {
+    let dir = fixture();
+    let root = dir.path();
+    let path = ".config/develop-tools.json";
+    std::fs::create_dir_all(root.join(".config")).unwrap();
+    std::fs::write(
+        root.join(path),
+        r#"{"release":{"tagPrefix":"release-"},"ci":{"retired":true},"adr":0}"#,
+    )
+    .unwrap();
+    git(root, &["add", path]);
+    commit(
+        root,
+        "# Changelog\n\n## 2026-11\n- **以前**\n",
+        "previous prefix",
+    );
+    annotate(root, "release-0.1.0");
+    std::fs::write(root.join(path), r#"{"release":{"tagPrefix":"next-"}}"#).unwrap();
+    git(root, &["add", path]);
+    commit(
+        root,
+        "# Changelog\n\n## 2026-11\n- **以前**\n- **今回**\n",
+        "next prefix",
+    );
+    let extract = extract_release(root, "HEAD", "next-0.2.0", None).unwrap();
+    assert_eq!(extract.previous, "release-0.1.0");
+    assert!(
+        extract
+            .render()
+            .contains("compare/release-0.1.0...next-0.2.0")
+    );
+    annotate(root, "v0.1.9");
+    commit(
+        root,
+        "# Changelog\n\n## 2026-11\n- **別名 tag の後**\n",
+        "after wrong-prefix tag",
+    );
+    let error = extract_release(root, "HEAD", "next-0.3.0", None).unwrap_err();
+    assert!(
+        error.contains("前 tag") && error.contains("v0.1.9"),
+        "{error}"
+    );
+    annotate(root, "unrelated");
+    commit(
+        root,
+        "# Changelog\n\n## 2026-11\n- **その後**\n",
+        "after unrelated",
+    );
+    let error = extract_release(root, "HEAD", "next-0.3.0", None).unwrap_err();
+    assert!(
+        error.contains("前 tag") && error.contains("unrelated"),
+        "{error}"
+    );
+}
+
+#[test]
+fn first_prefix_section_accepts_only_the_exact_planned_release_link() {
+    for stamped in [false, true] {
+        let dir = fixture();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".config")).unwrap();
+        std::fs::write(root.join(".config/develop-tools.json"), serde_json::json!({"release":{"tagPrefix":"release-","changelogStamp":stamped,"notes":{"mode":"changelog-section"}}}).to_string()).unwrap();
+        git(root, &["add", ".config/develop-tools.json"]);
+        let planned = "release-0.1.0";
+        let line = "- **初回（2026-11-17/[release-0.1.0](https://github.com/example/project/releases/tag/release-0.1.0)）**: 本文";
+        let section = format!("# Changelog\n\n## 0.1.0 (2026-11-17)\n\n{line}\n");
+        commit(root, &section, "first prefix section");
+        let declared = declared_notes(root).unwrap().unwrap();
+        assert!(prepare_notes(root, declared, planned).is_ok());
+        assert!(git(root, &["tag", "--list"]).is_empty());
+        for wrong in [
+            line.replace("release-0.1.0", "other-0.1.0"),
+            line.replace("[release-0.1.0]", "[other-0.1.0]"),
+        ] {
+            commit(root, &section.replace(line, &wrong), "wrong prefix link");
+            let error = prepare_notes(root, declared, planned).unwrap_err();
+            assert!(error.contains("changelog_stamp_invalid"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn prefix_additions_filter_old_links_but_keep_current_links_and_short_stamps() {
+    let dir = fixture();
+    let root = dir.path();
+    let baseline = "## 2026-09\n- **以前の項目（2026-09-01/v0.1.0）**: 履歴\n";
+    commit(
+        root,
+        &format!("# Changelog\n\n{baseline}"),
+        "valid stamped baseline",
+    );
+    git(root, &["tag", "v0.1.0"]);
+    std::fs::create_dir_all(root.join(".config")).unwrap();
+    std::fs::write(
+        root.join(".config/develop-tools.json"),
+        r#"{"release":{"tagPrefix":"release-","changelogStamp":true}}"#,
+    )
+    .unwrap();
+    git(root, &["add", ".config/develop-tools.json"]);
+    let old = "- **旧版（2026-11-17/[v0.1.0](https://github.com/example/project/releases/tag/v0.1.0)）**: 履歴";
+    let current = "- **今回（2026-11-17/[release-0.2.0](https://github.com/example/project/releases/tag/release-0.2.0)）**: 今回";
+    let short = "- **短形（2026-11-17/v0.2.0）**: 互換";
+    let text = format!("# Changelog\n\n## 2026-11\n{old}\n{current}\n{short}\n\n{baseline}");
+    commit(root, &text, "mixed prefix stamps");
+    let result = extract_release(root, "HEAD", "release-0.2.0", None).unwrap();
+    assert_eq!(result.items, [current, short]);
+    assert_eq!(
+        std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+        text
+    );
+    commit(
+        root,
+        &text.replace("release-0.2.0", "other-0.2.0"),
+        "wrong same-version prefix",
+    );
+    let error = extract_release(root, "HEAD", "release-0.2.0", None).unwrap_err();
+    assert!(error.contains("changelog_stamp_invalid"), "{error}");
+}
+
+#[test]
+fn monthly_first_release_keeps_the_planned_prefix_in_its_generated_link() {
+    use develop_release::release_notes::{AiRuntime, prepare_notes_with_first_release_base};
+    let dir = fixture();
+    let root = dir.path();
+    commit(root, "# Changelog\n", "empty changelog base");
+    let base = git(root, &["rev-parse", "HEAD"]);
+    std::fs::create_dir_all(root.join(".config")).unwrap();
+    std::fs::write(root.join(".config/develop-tools.json"), r#"{"release":{"tagPrefix":"release-","changelogStamp":true,"notes":{"mode":"changelog-additions"}}}"#).unwrap();
+    git(root, &["add", ".config/develop-tools.json"]);
+    let text = "# Changelog\n\n## 2026-11\n- **初回（2026-11-17/⏳）**: 本文\n";
+    commit(root, text, "first pending item");
+    let declared = declared_notes(root).unwrap().unwrap();
+    let prepared =
+        prepare_notes_with_first_release_base(root, declared, "release-0.1.0", Some(&base))
+            .unwrap();
+    commit(root, &format!("{text}\n"), "version fixture");
+    let transport = LinkTransport {
+        value: serde_json::json!({}),
+        input: Default::default(),
+    };
+    let runtime = AiRuntime {
+        home: root.join("unused-home"),
+        op_program: root.join("unused-op"),
+        op_service_account_token: None,
+        transport: &transport,
+    };
+    let body = prepared
+        .body(root, "HEAD", true, &root.join("unused-settings"), &runtime)
+        .unwrap();
+    assert!(
+        body.text.contains(
+            "[release-0.1.0](https://github.com/example/project/releases/tag/release-0.1.0)"
+        ),
+        "{}",
+        body.text
+    );
+    assert!(transport.input.borrow().is_none());
 }
 
 fn fixed_fixture() -> (tempfile::TempDir, String) {
@@ -2482,5 +2699,628 @@ fn release_body_accepts_86_kib_and_stops_over_256_kib_without_transport() {
                 assert_eq!(body.text, extract.render());
             }
         }
+    }
+}
+
+#[test]
+fn attribution_is_removed_from_the_sent_copy_in_both_extract_modes() {
+    use develop_release::release_notes::{AiRuntime, BodySource, NotesPlan, release_body};
+    let env = tempfile::tempdir().unwrap();
+    let settings = env.path().join("settings.json");
+    std::fs::write(
+        &settings,
+        serde_json::json!({
+            "anthropic_api_key_ref":"op://fixture/key/value",
+            "forbidden_terms":[], "internal_names":[],
+            "release_notes_attribution_actors":["主体A"],
+            "usage_ledger":env.path().join("usage.jsonl")
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let op = attribution_fake_op().to_owned();
+    for section in [None, Some("- 機能を追加（主体A決定）\n".to_owned())] {
+        let extract = ReleaseExtract {
+            previous: "v0.1.0".to_owned(),
+            tag: "v0.2.0".to_owned(),
+            repo: "example/project".to_owned(),
+            items: vec!["- 機能を追加（主体A決定）".to_owned()],
+            commit_links: vec![None],
+            section,
+            language: NotesLanguage::Ja,
+        };
+        let original = extract.clone();
+        let transport = LinkTransport {
+            value: output("改善しました。", &[("機能を追加", &[1])]),
+            input: Default::default(),
+        };
+        let runtime = AiRuntime {
+            home: env.path().join("home"),
+            op_program: op.clone(),
+            op_service_account_token: Some("fixture".to_owned()),
+            transport: &transport,
+        };
+        let body = release_body(
+            &extract,
+            NotesPlan::Ai {
+                audience: Audience::Private,
+            },
+            false,
+            &settings,
+            &runtime,
+        );
+        assert!(matches!(body.source, BodySource::Ai { .. }));
+        let request = transport.input.borrow();
+        let sent = request.as_ref().unwrap()["messages"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            sent.ends_with("[1] - 機能を追加\n"),
+            "帰属句が送信材料から除かれていない"
+        );
+        assert_eq!(extract, original);
+    }
+}
+
+fn attribution_extract(items: &[&str], section: bool) -> ReleaseExtract {
+    ReleaseExtract {
+        previous: "v0.1.0".to_owned(),
+        tag: "v0.2.0".to_owned(),
+        repo: "example/project".to_owned(),
+        items: items.iter().map(|item| (*item).to_owned()).collect(),
+        commit_links: vec![None; items.len()],
+        section: section.then(|| items.join("\n")),
+        language: NotesLanguage::Ja,
+    }
+}
+
+fn attribution_fixture_body(
+    extract: &ReleaseExtract,
+    actors: Option<serde_json::Value>,
+    reply: serde_json::Value,
+    audience: Audience,
+    no_ai: bool,
+) -> (
+    develop_release::release_notes::ReleaseBody,
+    Option<serde_json::Value>,
+) {
+    use develop_release::release_notes::{AiRuntime, NotesPlan, release_body};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let mut config = serde_json::json!({
+        "anthropic_api_key_ref":"op://test/key/value",
+        "forbidden_terms":["fixture-forbidden-term"],
+        "internal_names":["FixtureInternal"],
+        "usage_ledger":dir.path().join("usage.jsonl")
+    });
+    if let Some(actors) = actors {
+        config["release_notes_attribution_actors"] = actors;
+    }
+    std::fs::write(&path, config.to_string()).unwrap();
+    let op = attribution_fake_op().to_owned();
+    let transport = LinkTransport {
+        value: reply,
+        input: Default::default(),
+    };
+    let runtime = AiRuntime {
+        home: dir.path().join("home"),
+        op_program: op,
+        op_service_account_token: Some("fixture".to_owned()),
+        transport: &transport,
+    };
+    let body = release_body(extract, NotesPlan::Ai { audience }, no_ai, &path, &runtime);
+    (body, transport.input.into_inner())
+}
+
+#[test]
+fn attribution_preserves_conditions_and_protected_markdown_in_both_extract_modes() {
+    use develop_release::release_notes::BodySource;
+    let cases = [
+        ("- 機能（主体Aの依頼、条件付き）", "- 機能（条件付き）"),
+        ("- 上限8（条件付き, 主体A決定）", "- 上限8（条件付き）"),
+        (
+            "- **題（2026-11-17/[v1.2.3](https://github.com/example/project/releases/tag/v1.2.3)、主体A決定、`change名`）**: 本文",
+            "- **題（`change名`）**: 本文",
+        ),
+        ("- 題（主体A決定、`a,b`）", "- 題（`a,b`）"),
+        ("- 機能(主体A依頼)", "- 機能"),
+        (
+            "- 条件（主体A決定、主体B依頼、8件以下）",
+            "- 条件（8件以下）",
+        ),
+        (
+            "- 条件（8件以下、主体A決定、主体Bの依頼）",
+            "- 条件（8件以下）",
+        ),
+        (
+            "- 条件（前、主体A決定、中、主体B依頼、後）",
+            "- 条件（前、中、後）",
+        ),
+        (
+            "- 題（x（主体A決定）、主体A決定）",
+            "- 題（x（主体A決定）、主体A決定）",
+        ),
+        ("- 題（`a < b`、主体A依頼）", "- 題（`a < b`）"),
+        ("- a < b [x] （主体A決定）", "- a < b [x] "),
+        ("- `（主体A決定）` と（主体A依頼）", "- `（主体A決定）` と"),
+        (
+            "- [（主体A依頼）](./local) と（主体A決定）",
+            "- （主体A依頼） と",
+        ),
+        (
+            "- <span title='（主体A決定）'>条件</span>（主体A依頼）",
+            "- <span title='（主体A決定）'>条件</span>",
+        ),
+        ("- \\（主体A決定）と（主体A依頼）", "- \\（主体A決定）と"),
+        ("- `未閉鎖（主体A決定）", "- `未閉鎖（主体A決定）"),
+        ("- 条件（主体A依頼、、8件）", "- 条件（主体A依頼、、8件）"),
+        ("- 条件（主体A決定)", "- 条件（主体A決定)"),
+        ("- （主体A依頼）", "- （主体A依頼）"),
+        ("- **（主体A決定）**", "- **（主体A決定）**"),
+        (
+            "- 主体A決定と（別の主体依頼）",
+            "- 主体A決定と（別の主体依頼）",
+        ),
+        (
+            "- 条件（主体A 決定、主体Aからの依頼、主体A指示）",
+            "- 条件（主体A 決定、主体Aからの依頼、主体A指示）",
+        ),
+        (
+            "- ```text\n（主体A決定）\n```\n帰属（主体A依頼）",
+            "- ```text\n（主体A決定）\n```\n帰属",
+        ),
+    ];
+    for (item, expected) in cases {
+        for section in [false, true] {
+            let section_item = "- **題（主体A決定、`change名`）**: 本文";
+            let item = if section && item.starts_with("- **題（2026-") {
+                section_item
+            } else {
+                item
+            };
+            let extract = attribution_extract(&[item], section);
+            let (body, request) = attribution_fixture_body(
+                &extract,
+                Some(serde_json::json!(["主体A", "主体B"])),
+                output("改善しました。", &[("条件を維持", &[1])]),
+                Audience::Private,
+                false,
+            );
+            assert!(matches!(body.source, BodySource::Ai { .. }));
+            let request = request.unwrap();
+            let sent = request["messages"][0]["content"].as_str().unwrap();
+            assert!(
+                sent.ends_with(&format!("[1] {}\n", expected.trim_end())),
+                "帰属句の除去と条件/保護領域の保持が一致しない case={item:?} section={section}"
+            );
+        }
+    }
+}
+
+#[test]
+fn attribution_keeps_html_content_opaque_and_leaves_malformed_spans_alone() {
+    for (item, expected) in [
+        (
+            "- <span>（主体A依頼）</span> 変更（主体A決定）",
+            "- <span>（主体A依頼）</span> 変更",
+        ),
+        (
+            "- <span><span>（主体A決定）</span></span> 変更（主体A依頼）",
+            "- <span><span>（主体A決定）</span></span> 変更",
+        ),
+        (
+            "- <!--（主体A決定）-->変更（主体A依頼）",
+            "- <!--（主体A決定）-->変更",
+        ),
+        (
+            "- <span title='未閉鎖>変更（主体A依頼）",
+            "- <span title='未閉鎖>変更（主体A依頼）",
+        ),
+        (
+            "- [link](unterminated（主体A決定）",
+            "- [link](unterminated（主体A決定）",
+        ),
+    ] {
+        let extract = attribution_extract(&[item], false);
+        let (_, request) = attribution_fixture_body(
+            &extract,
+            Some(serde_json::json!(["主体A"])),
+            output("改善しました。", &[("変更", &[1])]),
+            Audience::Private,
+            false,
+        );
+        let request = request.unwrap();
+        assert!(
+            request["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("[1] {expected}\n")),
+            "HTML/不正な領域を変更した"
+        );
+    }
+}
+
+#[test]
+fn attribution_keeps_numbered_links_original_fallback_and_existing_guards() {
+    use develop_release::release_notes::BodySource;
+    let (dir, _, links) = linked_extract();
+    let root = dir.path();
+    let original = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap();
+    commit(
+        root,
+        &original
+            .replace("一つ目", "一つ目（主体A決定）")
+            .replace("三つ目", "三つ目（主体Aの依頼）"),
+        "attribution fixture",
+    );
+    git(
+        root,
+        &[
+            "tag",
+            "-a",
+            "historic-attribution",
+            "-m",
+            "帰属（主体A決定）",
+        ],
+    );
+    let before_changelog = std::fs::read(root.join("CHANGELOG.md")).unwrap();
+    let before_tag = git(root, &["cat-file", "tag", "historic-attribution"]);
+    let additions = extract_release(root, "HEAD", "v0.2.0", None).unwrap();
+    assert_eq!(additions.items.len(), 5);
+    for section in [false, true] {
+        let mut extract = additions.clone();
+        extract.section = section.then(|| extract.items.join("\n"));
+        let original = extract.clone();
+        let actors = Some(serde_json::json!(["主体A"]));
+        let (body, request) = attribution_fixture_body(
+            &extract,
+            actors.clone(),
+            output("改善しました。", &[("結合", &[5, 4, 3, 2, 1])]),
+            Audience::Private,
+            false,
+        );
+        assert!(matches!(body.source, BodySource::Ai { .. }));
+        assert!(
+            body.text
+                .contains(&format!("- 結合 {} {}\n", links[0], links[1]))
+        );
+        let request = request.unwrap();
+        let sent = request["messages"][0]["content"].as_str().unwrap();
+        assert!(!sent.contains("主体A"));
+        for number in 1..=5 {
+            assert!(sent.contains(&format!("[{number}] ")));
+        }
+        for (audience, text, reason) in [
+            (Audience::Private, "fixture-forbidden-term", "term"),
+            (Audience::Public, "fixture-forbidden-term", "term"),
+            (Audience::Public, "FixtureInternal", "internal_name"),
+        ] {
+            let (fallback, request) = attribution_fixture_body(
+                &extract,
+                actors.clone(),
+                output("改善しました。", &[(text, &[1, 2, 3, 4, 5])]),
+                audience,
+                false,
+            );
+            assert_eq!(
+                fallback.source,
+                BodySource::Fallback(format!("output_rejected:items.0.text.{reason}"))
+            );
+            assert_eq!(fallback.text, extract.render());
+            let request = request.unwrap();
+            assert!(
+                !request["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("主体A")
+            );
+        }
+        let (body, request) = attribution_fixture_body(
+            &extract,
+            actors,
+            output("改善しました。", &[("結合", &[1, 2, 3, 4, 5])]),
+            Audience::Private,
+            true,
+        );
+        assert_eq!(body.source, BodySource::NoAi);
+        assert_eq!(body.text, extract.render());
+        assert!(request.is_none());
+        assert_eq!(extract, original);
+    }
+    assert_eq!(
+        std::fs::read(root.join("CHANGELOG.md")).unwrap(),
+        before_changelog
+    );
+    assert_eq!(
+        git(root, &["cat-file", "tag", "historic-attribution"]),
+        before_tag
+    );
+}
+
+#[test]
+fn attribution_invalid_settings_priority_is_release_specific_and_pre_send() {
+    use develop_release::release_notes::{AiRuntime, BodySource, NotesPlan, release_body};
+    for (empty, audience, actors, has_dictionary, reason) in [
+        (
+            false,
+            Audience::Public,
+            serde_json::Value::Null,
+            false,
+            "dictionary_missing",
+        ),
+        (
+            true,
+            Audience::Private,
+            serde_json::Value::Null,
+            true,
+            "input_rejected",
+        ),
+        (
+            false,
+            Audience::Private,
+            serde_json::Value::Null,
+            true,
+            "config_invalid",
+        ),
+        (
+            false,
+            Audience::Private,
+            serde_json::json!([""]),
+            true,
+            "config_invalid",
+        ),
+        (
+            false,
+            Audience::Private,
+            serde_json::json!(["主体A"]),
+            true,
+            "usage_unrecorded",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut config = serde_json::json!({"anthropic_api_key_ref":"op://fixture/key/value","release_notes_attribution_actors":actors});
+        if has_dictionary {
+            config["forbidden_terms"] = serde_json::json!([]);
+            config["internal_names"] = serde_json::json!([]);
+        }
+        std::fs::write(&path, config.to_string()).unwrap();
+        let extract = attribution_extract(
+            if empty {
+                &[]
+            } else {
+                &["- 機能（主体A決定）"]
+            },
+            false,
+        );
+        let transport = LinkTransport {
+            value: output("改善しました。", &[("変更", &[1])]),
+            input: Default::default(),
+        };
+        let runtime = AiRuntime {
+            home: dir.path().join("home"),
+            op_program: dir.path().join("must-not-run"),
+            op_service_account_token: None,
+            transport: &transport,
+        };
+        let body = release_body(&extract, NotesPlan::Ai { audience }, false, &path, &runtime);
+        assert_eq!(body.source, BodySource::Fallback(reason.to_owned()));
+        assert_eq!(body.text, extract.render());
+        assert!(transport.input.borrow().is_none());
+        let no_ai = release_body(&extract, NotesPlan::Ai { audience }, true, &path, &runtime);
+        assert_eq!(no_ai.source, BodySource::NoAi);
+    }
+    for actors in [None, Some(serde_json::json!([]))] {
+        let extract = attribution_extract(&["- 機能（主体A決定）"], false);
+        let (_, request) = attribution_fixture_body(
+            &extract,
+            actors,
+            output("改善しました。", &[("変更", &[1])]),
+            Audience::Private,
+            false,
+        );
+        assert!(
+            request.unwrap()["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with("[1] - 機能（主体A決定）\n")
+        );
+    }
+}
+
+/// Explicit local acceptance only: never contacts the configured provider or prints values.
+#[test]
+#[ignore = "requires an explicit private config path; uses only a fake transport"]
+fn attribution_local_acceptance_without_api_or_value_output() {
+    let path = std::env::var_os("DEVELOP_RELEASE_ATTRIBUTION_SETTINGS")
+        .expect("explicit private config path required");
+    let settings =
+        island_llm::settings::load(Path::new(&path)).expect("private config unavailable");
+    let actors = settings
+        .release_notes_attribution_actors()
+        .expect("attribution config invalid");
+    let actor = actors.first().expect("attribution must be enabled");
+    let item = format!("- 機能を追加（{actor}決定）");
+    let extract = attribution_extract(&[&item], false);
+    let (_, request) = attribution_fixture_body(
+        &extract,
+        Some(serde_json::json!(actors)),
+        output("改善しました。", &[("機能を追加", &[1])]),
+        Audience::Private,
+        false,
+    );
+    let request = request.expect("fixture transport did not run");
+    assert!(
+        request["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("[1] - 機能を追加\n"),
+        "local attribution acceptance failed"
+    );
+}
+
+#[test]
+fn attribution_release_and_fixed_render_keep_original_files_tags_and_fallback_log() {
+    use develop_release::release_notes::{
+        AiRuntime, BodySource, DeclaredNotes, FixedNotes, NotesPlan,
+    };
+    use develop_tools_core::develop_tools_manifest::NotesSource;
+    let dir = fixture();
+    let root = dir.path();
+    annotate(root, "v0.1.0");
+    fixed_manifest(
+        root,
+        ".config/develop-tools.json",
+        r#"{"mode":"ai","fallback":"changelog-additions","language":"ja","audience":"private"}"#,
+    );
+    commit(
+        root,
+        "# Changelog\n\n## 2026-11\n- **機能（2026-11-17/⏳、主体A依頼、`change名`）**: 条件付き\n\n## 2026-09\n- **以前の項目**\n",
+        "attribution fixture",
+    );
+    let end = git(root, &["rev-parse", "HEAD"]);
+    let before_file = std::fs::read(root.join("CHANGELOG.md")).unwrap();
+    let before_tag = git(root, &["cat-file", "tag", "v0.1.0"]);
+    let env = tempfile::tempdir().unwrap();
+    let path = env.path().join("settings.json");
+    std::fs::write(&path,serde_json::json!({"anthropic_api_key_ref":"op://fixture/key/value","forbidden_terms":["fixture-forbidden-term"],"internal_names":[],"release_notes_attribution_actors":["主体A"],"usage_ledger":env.path().join("usage.jsonl")}).to_string()).unwrap();
+    let plan = NotesPlan::Ai {
+        audience: Audience::Private,
+    };
+    let prepared = prepare_notes(
+        root,
+        DeclaredNotes {
+            plan,
+            source: NotesSource::ChangelogAdditions,
+            language: NotesLanguage::Ja,
+        },
+        "v0.2.0",
+    )
+    .unwrap();
+    let fixed = FixedNotes::resolve(root, "v0.1.0", &end, "v0.2.0", None).unwrap();
+    for accepted in [true, false] {
+        let transport = LinkTransport {
+            value: output(
+                "改善しました。",
+                &[(
+                    if accepted {
+                        "条件付きの機能"
+                    } else {
+                        "fixture-forbidden-term"
+                    },
+                    &[1],
+                )],
+            ),
+            input: Default::default(),
+        };
+        let runtime = AiRuntime {
+            home: env.path().join("home"),
+            op_program: attribution_fake_op().to_owned(),
+            op_service_account_token: Some("fixture".to_owned()),
+            transport: &transport,
+        };
+        let release = prepared.body(root, &end, false, &path, &runtime).unwrap();
+        let rendered = fixed.render(false, &path, &runtime).unwrap();
+        assert_eq!(release, rendered.body);
+        if accepted {
+            assert!(matches!(release.source, BodySource::Ai { .. }));
+        } else {
+            assert_eq!(
+                release.source,
+                BodySource::Fallback("output_rejected:items.0.text.term".to_owned())
+            );
+            assert_eq!(release.text, fixed.extract().unwrap().render());
+        }
+        let request = transport.input.borrow();
+        let sent = request.as_ref().unwrap()["messages"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(!sent.contains("主体A"));
+        assert!(sent.contains("[1] - **機能（`change名`）**: 条件付き"));
+    }
+    let ledger = std::fs::read_to_string(root.join(".git/release-notes-fallback.jsonl")).unwrap();
+    let rows: Vec<serde_json::Value> = ledger
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row.as_object().unwrap().len(), 3);
+        assert_eq!(row["reason_code"], "output_rejected:items.0.text.term");
+    }
+    assert!(!ledger.contains("主体A"));
+    assert_eq!(
+        std::fs::read(root.join("CHANGELOG.md")).unwrap(),
+        before_file
+    );
+    assert_eq!(git(root, &["cat-file", "tag", "v0.1.0"]), before_tag);
+}
+
+fn attribution_fake_op() -> &'static Path {
+    use std::os::unix::fs::PermissionsExt;
+    static OP: std::sync::OnceLock<(tempfile::TempDir, std::path::PathBuf)> =
+        std::sync::OnceLock::new();
+    OP.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-op");
+        std::fs::write(&path, "#!/bin/sh\nprintf 'fixture-key'\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (dir, path)
+    })
+    .1
+    .as_path()
+}
+
+#[test]
+fn attribution_does_not_confuse_literal_url_apostrophes_with_link_titles() {
+    let extract = attribution_extract(
+        &["- [表示（主体A依頼）](https://example.com/it's) 後（主体A決定）"],
+        false,
+    );
+    let (_, request) = attribution_fixture_body(
+        &extract,
+        Some(serde_json::json!(["主体A"])),
+        output("改善しました。", &[("変更", &[1])]),
+        Audience::Private,
+        false,
+    );
+    assert!(
+        request.unwrap()["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("[1] - 表示（主体A依頼） 後\n")
+    );
+}
+
+#[test]
+fn attribution_keeps_html_declarations_and_processing_instructions_opaque() {
+    for (item, expected) in [
+        (
+            "- <![CDATA[（主体A依頼）]]> 後（主体A決定）",
+            "- <![CDATA[（主体A依頼）]]> 後",
+        ),
+        (
+            "- <?target data='（主体A依頼）'?> 後（主体A決定）",
+            "- <?target data='（主体A依頼）'?> 後",
+        ),
+        (
+            "- <!DOCTYPE html PUBLIC '（主体A依頼）'> 後（主体A決定）",
+            "- <!DOCTYPE html PUBLIC '（主体A依頼）'> 後",
+        ),
+    ] {
+        let extract = attribution_extract(&[item], false);
+        let (_, request) = attribution_fixture_body(
+            &extract,
+            Some(serde_json::json!(["主体A"])),
+            output("改善しました。", &[("変更", &[1])]),
+            Audience::Private,
+            false,
+        );
+        assert!(
+            request.unwrap()["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("[1] {expected}\n"))
+        );
     }
 }

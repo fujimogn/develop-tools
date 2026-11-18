@@ -23,6 +23,8 @@ pub mod heavy_check;
 pub mod managed_block;
 #[cfg(test)]
 mod managed_block_tests;
+pub mod process;
+pub mod release_tag;
 pub mod resident_docs;
 /// cargo の JSON から成果物の path を引く。feature `test-support` のときだけ公開する。
 #[cfg(feature = "test-support")]
@@ -117,14 +119,16 @@ pub fn release_integration_branch(repo_root: &Path) -> Result<Option<String>, St
     let branch = declared
         .integration_branch
         .unwrap_or_else(|| RELEASE_BRANCH.to_owned());
-    let valid = git(repo_root)
+    let output = git(repo_root)
         .args(["check-ref-format", "--branch", &branch])
         .output()
-        .map_err(|error| format!("integrationBranch 検証失敗: {error}"))?
-        .status
-        .success();
-    if !valid {
-        return Err(format!("{}: 不正な integrationBranch", pin.display()));
+        .map_err(|error| format!("integrationBranch 検証失敗: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{}: 不正な integrationBranch; {}",
+            pin.display(),
+            process::ChildFailure::from_output(&output)
+        ));
     }
     Ok(Some(branch))
 }

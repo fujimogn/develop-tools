@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 /// 版固定 file の置き場。旧い [`LEGACY_PATH`] が残っていれば止める。
 pub const PATH: &str = ".config/develop-tools.json";
-/// 退役した置き場。読み込まず、旧配置と重複の検出に使う。
+/// 退役した置き場。現在の作業木では拒否し、過去 tag の commit の読取だけで許可する。
 pub const LEGACY_PATH: &str = ".develop-tools.json";
 /// 新旧の両方があるときの失敗の先頭の語。
 pub const DUPLICATED: &str = "manifest_duplicated";
@@ -32,13 +32,28 @@ pub fn locate(root: &Path) -> Result<Option<&'static str>, String> {
 /// index や commit の tree など、1 つの参照元の中で版固定 file を探す。
 /// `exists` は repo 相対の path がその参照元にあるかを答える。
 pub fn locate_in(
+    exists: impl FnMut(&str) -> Result<bool, String>,
+) -> Result<Option<&'static str>, String> {
+    locate_with_legacy(exists, false)
+}
+
+/// 過去 tag の読み元内で宣言を探す。旧配置だけなら読み、新旧両方は拒否する。
+pub fn locate_tag_in(
+    exists: impl FnMut(&str) -> Result<bool, String>,
+) -> Result<Option<&'static str>, String> {
+    locate_with_legacy(exists, true)
+}
+
+fn locate_with_legacy(
     mut exists: impl FnMut(&str) -> Result<bool, String>,
+    allow_legacy: bool,
 ) -> Result<Option<&'static str>, String> {
     match (exists(PATH)?, exists(LEGACY_PATH)?) {
         (true, true) => Err(format!(
             "{DUPLICATED}: {PATH} と {LEGACY_PATH} の両方があります（{PATH} の 1 つにしてください）"
         )),
         (true, false) => Ok(Some(PATH)),
+        (false, true) if allow_legacy => Ok(Some(LEGACY_PATH)),
         (false, true) => Err(format!(
             "manifest_legacy: {LEGACY_PATH} は旧い置き場です（{PATH} へ移してください）"
         )),
@@ -114,6 +129,8 @@ pub struct PlatformCheck {
 #[derive(Debug, PartialEq, Eq)]
 pub struct CiDeclaration {
     pub record_only_skip: bool,
+    /// Skip docs-only pushes; the repository must check docs locally before shipping.
+    pub skip_docs_only_push: bool,
     pub rust: Option<RustCi>,
     pub bun: Option<BunCi>,
 }
@@ -189,6 +206,8 @@ pub enum NotesAudience {
 /// [`known_shape`] が見るので、ここでは読まない。道具を配る側の repo の形でも読める。
 #[derive(Debug)]
 pub struct Declaration {
+    /// 省略時だけ旧規則を使う、検証済みの Release tag prefix。
+    pub tag_prefix: crate::release_tag::TagPrefix,
     /// 文書検査の組の名前。定義と名前の解決は island-docs が持つ。
     pub docs_profile: Option<String>,
     pub integration_branch: Option<String>,
@@ -279,7 +298,11 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
     let Some(ci) = object.get("ci") else {
         return Ok(None);
     };
-    let ci = stack(ci, "ci", &["rust", "bun", "recordOnlySkip"])?;
+    let ci = stack(
+        ci,
+        "ci",
+        &["rust", "bun", "recordOnlySkip", "skipDocsOnlyPush"],
+    )?;
     if !ci.contains_key("rust") && !ci.contains_key("bun") {
         return Err("ci は rust か bun の片方か両方を持たなければなりません".into());
     }
@@ -339,13 +362,19 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
             })
         }
     };
-    let record_only_skip = match ci.get("recordOnlySkip") {
-        None => false,
-        Some(Value::Bool(flag)) => *flag,
-        Some(_) => return Err("ci.recordOnlySkip は真偽値でなければなりません".into()),
+    let flag = |name: &str| match ci.get(name) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(format!("ci.{name} は真偽値でなければなりません")),
     };
+    let record_only_skip = flag("recordOnlySkip")?;
+    let skip_docs_only_push = flag("skipDocsOnlyPush")?;
+    if record_only_skip && skip_docs_only_push {
+        return Err("ci.skipDocsOnlyPush と ci.recordOnlySkip は同時にtrueにできません".into());
+    }
     Ok(Some(CiDeclaration {
         record_only_skip,
+        skip_docs_only_push,
         rust,
         bun,
     }))
@@ -517,6 +546,20 @@ fn release_notes(release: &Value) -> Result<Option<ReleaseNotes>, String> {
     Ok(Some(ReleaseNotes { mode, language }))
 }
 
+/// tag の分類に必要な欄だけを読む。歴史上の ci/adr/notes 等を現行 schema で検証しない。
+pub fn release_tag_prefix(value: &Value) -> Result<crate::release_tag::TagPrefix, String> {
+    let object = value.as_object().ok_or("JSON object が必要です")?;
+    let release = object.get("release");
+    if release.is_some_and(|value| !value.is_object()) {
+        return Err("不正な release".to_owned());
+    }
+    match release.and_then(|release| release.get("tagPrefix")) {
+        None => Ok(crate::release_tag::TagPrefix::default()),
+        Some(Value::String(prefix)) => crate::release_tag::TagPrefix::new(prefix),
+        Some(_) => Err("不正な release.tagPrefix".to_owned()),
+    }
+}
+
 pub fn declaration(value: &Value) -> Result<Declaration, String> {
     let object = value.as_object().ok_or("JSON object が必要です")?;
     let integration_branch = optional_string(object, "integrationBranch")?;
@@ -528,6 +571,7 @@ pub fn declaration(value: &Value) -> Result<Declaration, String> {
         Some(release) if release.is_object() => Some(release.clone()),
         Some(_) => return Err("不正な release".into()),
     };
+    let tag_prefix = release_tag_prefix(value)?;
     let changelog_stamp = match release
         .as_ref()
         .and_then(|release| release.get("changelogStamp"))
@@ -606,6 +650,7 @@ pub fn declaration(value: &Value) -> Result<Declaration, String> {
         },
     };
     Ok(Declaration {
+        tag_prefix,
         docs_profile,
         integration_branch,
         platforms,
@@ -1152,6 +1197,7 @@ mod tests {
             declared.ci,
             Some(CiDeclaration {
                 record_only_skip: false,
+                skip_docs_only_push: false,
                 rust: Some(RustCi {
                     workspaces: vec!["tools".into(), "packages/cli".into()],
                     test_runner: "cargo".into(),
@@ -1190,6 +1236,49 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(ci_install.bun.map(|bun| bun.ci_install), Some(true));
+    }
+
+    #[test]
+    fn docs_only_push_is_a_strict_opt_in_exclusive_with_record_only_skip() {
+        let mut manifest = json!({"ci":{"rust":{"workspaces":["."]},"skipDocsOnlyPush":true}});
+        assert!(
+            ci_declaration(&manifest)
+                .unwrap()
+                .unwrap()
+                .skip_docs_only_push
+        );
+        for flag in [None, Some(false), Some(true)] {
+            let mut value = json!({"ci":{"rust":{"workspaces":["."]}}});
+            if let Some(flag) = flag {
+                value["ci"]["skipDocsOnlyPush"] = json!(flag);
+            }
+            assert_eq!(
+                ci_declaration(&value).unwrap().unwrap().skip_docs_only_push,
+                flag.unwrap_or(false)
+            );
+        }
+        assert!(ci_declaration(&json!({"ci":{"skipDocsOnlyPush":true}})).is_err());
+        assert!(
+            ci_declaration(
+                &json!({"ci":{"rust":{"workspaces":["."]},"skipDocsOnlyPush":false,"unknown":true}})
+            )
+            .is_err()
+        );
+        for invalid in [json!(null), json!("true"), json!(1), json!([]), json!({})] {
+            manifest["ci"]["skipDocsOnlyPush"] = invalid;
+            let error = ci_declaration(&manifest).unwrap_err();
+            assert!(
+                error.contains("ci.skipDocsOnlyPush") && error.contains("真偽値"),
+                "{error}"
+            );
+        }
+        manifest["ci"]["skipDocsOnlyPush"] = json!(true);
+        manifest["ci"]["recordOnlySkip"] = json!(true);
+        let error = ci_declaration(&manifest).unwrap_err();
+        assert!(
+            error.contains("ci.skipDocsOnlyPush") && error.contains("ci.recordOnlySkip"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1372,6 +1461,70 @@ mod tests {
         assert_eq!(bytes, to_bytes(&own).unwrap());
         let broken = json!({"ci": {"bun": {"dirs": "."}}});
         assert!(rewrite(Some(&broken), Pin::Unpinned, None).is_err());
+    }
+
+    #[test]
+    fn release_tag_prefix_rejects_invalid_declarations() {
+        for prefix in [
+            json!(""),
+            json!(null),
+            json!(7),
+            json!(true),
+            json!([]),
+            json!("release/"),
+            json!("1release-"),
+            json!("-release-"),
+            json!(".release-"),
+            json!("re..lease-"),
+            json!("re/lease-"),
+            json!("release "),
+            json!("rélease-"),
+            json!("release.."),
+            json!("release1"),
+            json!("release."),
+        ] {
+            let value = json!({"release": {"tagPrefix": prefix}});
+            let error = declaration(&value).expect_err("invalid tagPrefix must fail");
+            assert!(error.contains("release.tagPrefix"), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn declared_release_tag_rule_round_trips_strict_versions() {
+        use crate::release_tag::Version;
+        let version = Version {
+            major: 1,
+            minor: 2,
+            patch: 3,
+        };
+        for (release, expected) in [
+            (json!({}), "v1.2.3"),
+            (json!({"tagPrefix":"v"}), "v1.2.3"),
+            (json!({"tagPrefix":"release-"}), "release-1.2.3"),
+        ] {
+            let rule = declaration(&json!({"release":release})).unwrap().tag_prefix;
+            assert_eq!(rule.format(version), expected);
+            assert_eq!(rule.parse(expected), Some(version));
+            for malformed in [
+                "+1.2.3",
+                "01.2.3",
+                "1.02.3",
+                "1.2.03",
+                "1.2",
+                "1.2.3.4",
+                "1.2.3-rc1",
+                "1.2.3+build",
+                "18446744073709551616.2.3",
+            ] {
+                let tag = expected.replace("1.2.3", malformed);
+                assert_eq!(rule.parse(&tag), None, "{tag}");
+            }
+            assert_eq!(rule.parse("unrelated-1.2.3"), None);
+        }
+        assert_eq!(
+            declaration(&json!({})).unwrap().tag_prefix.format(version),
+            "v1.2.3"
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! tag 間の CHANGELOG 月別項目から GitHub Release 本文を作る。
 
+mod attribution;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,9 +39,10 @@ fn git_raw(root: &Path, args: &[&str]) -> Result<String, String> {
         .map_err(|err| format!("git の出力が UTF-8 ではありません: {err}"))
 }
 
-fn release_tag(tag: &str) -> bool {
-    tag.strip_prefix('v')
-        .is_some_and(|version| version.parse::<crate::Version>().is_ok())
+fn release_version_at(root: &Path, commit: &str, tag: &str) -> Result<crate::Version, String> {
+    crate::version_files::TagSource::at(root, commit)?
+        .parse_tag(tag)
+        .ok_or_else(|| format!("release tag が commit {commit} の規則と一致しません: {tag}"))
 }
 
 fn valid_repo(repo: &str) -> bool {
@@ -178,7 +181,9 @@ fn legacy_title_stamp(
 fn released_for_other_tag(item: &str, tag: &str, language: NotesLanguage) -> Result<bool, String> {
     use develop_tools_core::changelog_title::{self, Stamp};
 
-    let compact = changelog_title::parse_with_language(item, language)
+    let parsed = changelog_title::parse_with_language(item, language);
+    let compact = parsed
+        .as_ref()
         .map(|parsed| parsed.stamp)
         .or_else(|| changelog_title::parse_legacy_compact(item).map(|(_, stamp)| stamp));
     let legacy = legacy_title_stamp(item);
@@ -186,7 +191,14 @@ fn released_for_other_tag(item: &str, tag: &str, language: NotesLanguage) -> Res
         return Err("changelog_stamp_ambiguous: 題に短い刻印と旧刻印が併記されています".to_owned());
     }
     let stamp = compact.or_else(|| legacy.map(|(stamp, _)| stamp));
-    Ok(matches!(stamp, Some(Stamp::Released(version)) if format!("v{version}") != tag))
+    let target = changelog_title::parse_release_tag(tag);
+    if let Some(parsed) = parsed
+        && parsed.release_tag.is_some_and(|actual| actual != tag)
+        && matches!(parsed.stamp, Stamp::Released(version) if Some(version) == target)
+    {
+        return Err("changelog_stamp_invalid: 同じ版の link が予定 tag と一致しません".to_owned());
+    }
+    Ok(matches!(stamp, Some(Stamp::Released(version)) if Some(version) != target))
 }
 
 /// Each side needs its own heading and fence state: deleted Markdown must not
@@ -506,9 +518,17 @@ pub fn release_base(root: &Path, parent: &str) -> Result<ReleaseBase, String> {
 fn resolve_base(root: &Path, parent: &str, repo_arg: Option<&str>) -> Result<ReleaseBase, String> {
     let repo = resolve_repo(root, repo_arg)?;
     let previous = git(root, &["describe", "--tags", "--abbrev=0", parent])?;
-    if !release_tag(&previous) {
-        return Err(format!("前 tag を安全に決定できません: {previous}"));
-    }
+    let commit = git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("refs/tags/{previous}^{{commit}}"),
+        ],
+    )?;
+    release_version_at(root, &commit, &previous)
+        .map_err(|error| format!("前 tag を安全に決定できません: {previous}: {error}"))?;
     Ok(ReleaseBase { previous, repo })
 }
 
@@ -637,17 +657,13 @@ pub fn extract_release(
     tag: &str,
     repo_arg: Option<&str>,
 ) -> Result<ReleaseExtract, String> {
-    if !release_tag(tag) {
-        return Err(format!(
-            "release tag は v<semver> で指定してください: {tag}"
-        ));
-    }
     let repo_root = git(root, &["rev-parse", "--show-toplevel"])?;
     let root = Path::new(&repo_root);
     let end = git(
         root,
         &["rev-parse", "--verify", &format!("{end}^{{commit}}")],
     )?;
+    release_version_at(root, &end, tag)?;
     let base = resolve_base(root, &format!("{end}^"), repo_arg)?;
     let (stamped, language) = stamp_settings_at(root, &end)?;
     if stamped {
@@ -1288,20 +1304,19 @@ pub fn prepare_notes_with_first_release_base(
                     .to_owned(),
             );
         }
-        let version = tag
-            .strip_prefix('v')
-            .ok_or("first_release_base_invalid: tag は v<semver> が必要です")?
-            .parse()?;
-        if crate::stamp_changelog_with_language(&changelog, version, &repo, declared.language).1
+        let prefix = crate::preflight::read_declaration(root)?.tag_prefix;
+        let version = prefix
+            .parse(tag)
+            .ok_or("first_release_base_invalid: tag が宣言した規則と一致しません")?;
+        if crate::stamp_changelog_with_prefix(&changelog, version, &repo, Some(declared), &prefix)?
+            .1
             != pending.len()
         {
             return Err("first_release_base_invalid: 刻印対象と月次項目が一致しません".to_owned());
         }
         let stamped: Vec<String> = pending
             .iter()
-            .map(|item| {
-                crate::stamp_changelog_with_language(item, version, &repo, declared.language).0
-            })
+            .map(|item| crate::stamp_changelog_with_tag(item, tag, &repo, declared.language).0)
             .collect();
         let heading = match declared.language {
             NotesLanguage::Ja => format!("変更範囲: 初回 Release（基点 {from}）"),
@@ -1342,13 +1357,17 @@ pub fn prepare_notes_with_first_release_base(
         // A改の項目はHEADでは月直下にある。版commit後に初めてlink検証が失敗しないよう、
         // 同じ移動・刻印をメモリ上で行い、予定の小節を固定HEADの履歴で照合する。
         let section = if declared.source == NotesSource::ChangelogSection && declares_stamp(root)? {
-            let version = tag.strip_prefix('v').unwrap_or(tag).parse()?;
+            let prefix = crate::preflight::read_declaration(root)?.tag_prefix;
+            let version = prefix
+                .parse(tag)
+                .ok_or("予定 tag が宣言した規則と一致しません")?;
             let changelog = git_raw(root, &["show", &format!("{head}:CHANGELOG.md")])?;
-            let (stamped, _) = crate::stamp_changelog_for_notes(
+            let (stamped, _) = crate::stamp_changelog_with_prefix(
                 &changelog,
                 version,
                 &remote_repo(root)?,
                 Some(declared),
+                &prefix,
             )?;
             extract_changelog_section(&stamped, &version.to_string())
                 .map_err(|error| format!("release.notes の予定版小節を作れません（{error}）"))?
@@ -1515,7 +1534,7 @@ fn validate_section_stamps(
         {
             // 本文中の印は対象にせず、共通 parser が拒否した題の印だけを失敗にする。
             let title = &rest[..close];
-            if title.contains(changelog_title::UNRELEASED_STAMP) || title.contains("/[v") {
+            if title.contains(changelog_title::UNRELEASED_STAMP) || title.contains("/[") {
                 return Err(invalid());
             }
         }
@@ -1530,7 +1549,7 @@ fn validate_section_stamps(
     };
     for parsed in stamps {
         if let Stamp::Released(version) = parsed.stamp
-            && Some(version) != tag.strip_prefix('v')
+            && Some(version) != changelog_title::parse_release_tag(tag)
         {
             return Err(invalid());
         }
@@ -1550,9 +1569,9 @@ fn section_at(
     language: NotesLanguage,
 ) -> Result<ChangelogSection, String> {
     let path = format!("{commit}:CHANGELOG.md");
-    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let version = release_version_at(root, commit, tag)?.to_string();
     let section = match git(root, &["cat-file", "-e", &path]) {
-        Ok(_) => extract_changelog_section(&git_raw(root, &["show", &path])?, version),
+        Ok(_) => extract_changelog_section(&git_raw(root, &["show", &path])?, &version),
         Err(_) => Err(SectionError::NoChangelog),
     };
     let section = section
@@ -1718,14 +1737,29 @@ fn ai_body(
     if extract.items.is_empty() {
         return Err(Failure::InputRejected.code().to_owned());
     }
+    let actors = settings
+        .release_notes_attribution_actors()
+        .map_err(|error| error.code(audience).to_owned())?;
     let scrubbed: Vec<String> = extract
         .items
         .iter()
         .map(|item| {
-            if extract.section.is_some() {
-                scrub_normalized_for_ai(item)
+            let scrub = |text: &str| {
+                if extract.section.is_some() {
+                    scrub_normalized_for_ai(text)
+                } else {
+                    scrub_for_ai_with_language(text, extract.language)
+                }
+            };
+            let edited = attribution::strip(item, &actors);
+            let candidate = scrub(&edited);
+            if candidate
+                .chars()
+                .all(|c| c.is_whitespace() || matches!(c, '-' | '*' | '_'))
+            {
+                scrub(item)
             } else {
-                scrub_for_ai_with_language(item, extract.language)
+                candidate
             }
         })
         .collect();
@@ -1889,8 +1923,8 @@ impl FixedNotes {
     ) -> Result<Self, String> {
         let repo_root = git(root, &["rev-parse", "--show-toplevel"])?;
         let root = Path::new(&repo_root);
-        if !release_tag(from) || !release_tag(tag) || from == tag {
-            return Err("from と tag は異なる v<semver> が必要です".to_owned());
+        if from == tag {
+            return Err("from と tag は異なる Release tag が必要です".to_owned());
         }
         let oid_length = match git(root, &["rev-parse", "--show-object-format"])?.as_str() {
             "sha1" => 40,
@@ -1926,6 +1960,8 @@ impl FixedNotes {
         }
         git(root, &["merge-base", "--is-ancestor", &from_oid, &to_oid])
             .map_err(|_| "from は to の祖先である必要があります".to_owned())?;
+        release_version_at(root, &from_oid, from)?;
+        release_version_at(root, &to_oid, tag)?;
         let repo = resolve_repo(root, repo)?;
         let paths = git(
             root,

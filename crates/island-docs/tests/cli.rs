@@ -1863,6 +1863,24 @@ fn tracked_accepts_version_subsections_and_summaries_in_both_languages() {
 }
 
 #[test]
+fn tracked_accepts_mixed_release_tag_prefix_links() {
+    let dir = island_repo(Some("https://github.com/example/island.git"));
+    write(
+        dir.path(),
+        ".config/develop-tools.json",
+        r#"{"release":{"changelogStamp":true,"notes":{"mode":"changelog-section","language":"ja"}}}"#,
+    );
+    write(
+        dir.path(),
+        "CHANGELOG.md",
+        "# Changelog\n> 古い分は git 履歴に任せる。\n\n## 2026-11\n\n### 1.2.3 (2026-11-09)\n\nSummary.\n\n- **旧リンク（2026-11-09/[v1.2.3](https://github.com/example/island/releases/tag/v1.2.3)）**: 旧版。\n- **新リンク（2026-11-09/[release-1.2.3](https://github.com/example/island/releases/tag/release-1.2.3)）**: 新版。\n- **短い刻印（2026-11-09/v1.2.3）**: 履歴。\n",
+    );
+    git(dir.path(), &["add", "."]);
+    let out = run(dir.path(), &["--tracked"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+}
+
+#[test]
 fn tracked_rejects_version_subsection_month_and_stamp_mismatches() {
     for (heading, marker, expected) in [
         ("### 1.2.3 (2026-10-09)", "v1.2.3", "版小節の日付"),

@@ -382,8 +382,15 @@ fn check_version(root: &Path) -> Output {
 }
 
 fn check_pushed(root: &Path, stdin: &str) -> Output {
+    check_pushed_with(
+        root,
+        stdin,
+        Command::new(env!("CARGO_BIN_EXE_check-release-version")),
+    )
+}
+
+fn check_pushed_with(root: &Path, stdin: &str, mut command: Command) -> Output {
     use std::io::Write;
-    let mut command = Command::new(env!("CARGO_BIN_EXE_check-release-version"));
     develop_tools_core::strip_git_env(&mut command);
     let mut child = command
         .arg("--pre-push")
@@ -1655,6 +1662,66 @@ fn assert_released_v124(root: &Path, output: &Output) {
 const UNRELEASED_CHANGELOG: &str = "# CHANGELOG\n\n## 2026-10\n\n- **刻印を足した（2026-10-20/⏳）**: 本文。\n- **前の版で出した（2026-10-19/v1.2.3）**: 本文。\n";
 
 #[test]
+fn declared_prefix_names_the_release_commit_lightweight_tag_and_stamp() {
+    let fixture = changelog_fixture(true, Some(UNRELEASED_CHANGELOG));
+    let root = fixture.path();
+    let manifest = root.join(".config/develop-tools.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    config["release"]["tagPrefix"] = serde_json::json!("release-");
+    std::fs::write(&manifest, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "declare prefix"]);
+
+    let output = release(root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let released = git(root, &["rev-parse", "HEAD"]);
+    assert_eq!(git(root, &["tag", "--points-at", "HEAD"]), "release-1.2.4");
+    assert_eq!(git(root, &["cat-file", "-t", "release-1.2.4"]), "commit");
+    assert_eq!(git(root, &["rev-parse", "main"]), released);
+    assert_eq!(git(root, &["log", "-1", "--format=%s"]), "🔖 release-1.2.4");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("を release-1.2.4 の版 commit 用に更新")
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap(),
+        UNRELEASED_CHANGELOG.replace(
+            "/⏳",
+            "/[release-1.2.4](https://github.com/owner/repo/releases/tag/release-1.2.4)"
+        )
+    );
+    assert_eq!(released_files(root), ["CHANGELOG.md", "package.json"]);
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn invalid_tag_prefix_preserves_version_files_and_refs() {
+    let fixture = changelog_fixture(true, Some(UNRELEASED_CHANGELOG));
+    let root = fixture.path();
+    let manifest = root.join(".config/develop-tools.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    config["release"]["tagPrefix"] = serde_json::json!("release1");
+    std::fs::write(&manifest, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "invalid declaration"]);
+    let refs = git(root, &["show-ref"]);
+    let package = std::fs::read(root.join("package.json")).unwrap();
+    let changelog = std::fs::read(root.join("CHANGELOG.md")).unwrap();
+    let output = release(root);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("release.tagPrefix"));
+    assert_eq!(git(root, &["show-ref"]), refs);
+    assert_eq!(std::fs::read(root.join("package.json")).unwrap(), package);
+    assert_eq!(std::fs::read(root.join("CHANGELOG.md")).unwrap(), changelog);
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
 fn declared_repo_stamps_dated_unreleased_titles_in_the_version_commit() {
     let dir = changelog_fixture(true, Some(UNRELEASED_CHANGELOG));
     let root = dir.path();
@@ -2725,6 +2792,34 @@ fn changelog_mode_release_annotates_without_inference() {
     );
 }
 
+#[test]
+fn declared_prefix_uses_the_existing_annotated_release_branch() {
+    let fixture = notes_fixture(Some(r#"{"mode":"changelog-additions"}"#), Some(NOTES_ITEM));
+    let root = fixture.path();
+    let manifest = root.join(".config/develop-tools.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    config["release"]["tagPrefix"] = serde_json::json!("release-");
+    std::fs::write(&manifest, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", "declare prefix"]);
+    let (output, _home) = release_with(root, &["patch"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(git(root, &["cat-file", "-t", "release-1.2.4"]), "tag");
+    assert_eq!(
+        git(root, &["rev-parse", "release-1.2.4^{commit}"]),
+        git(root, &["rev-parse", "main"])
+    );
+    let body = tag_contents(root, "release-1.2.4");
+    assert!(body.contains("予定を一覧で選べるようにした"), "{body}");
+    assert!(body.contains("v1.2.3...release-1.2.4"), "{body}");
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
 /// 宣言の無い repo は今どおり軽量 tag。
 #[test]
 fn undeclared_release_keeps_a_lightweight_tag() {
@@ -3661,4 +3756,964 @@ fn section_ai_input_does_not_parse_a_normalized_supplement_as_a_second_stamp() {
             format!("{}[1] {expected}\n", purpose.instruction)
         );
     }
+}
+
+const SUBSET_ENTRIES: &str = r#"{"path":"core/Cargo.toml","kind":"cargo-workspace"},{"path":"core/Cargo.lock","kind":"cargo-lock"},{"path":"trainer/Cargo.lock","kind":"cargo-lock-subset","manifest":"trainer/Cargo.toml"}"#;
+
+fn subset_fixture() -> Fixture {
+    let dir = tempfile::Builder::new()
+        .prefix("develop-meta-subset-")
+        .tempdir()
+        .unwrap();
+    let root = dir.path().join("repo");
+    for path in ["core/a", "core/b", "core/c", "trainer"] {
+        std::fs::create_dir_all(root.join(path)).unwrap();
+    }
+    std::fs::write(root.join("core/Cargo.toml"), "[workspace]\nmembers=[\"a\",\"b\",\"c\"]\n[workspace.package]\nversion=\"0.1.0\" # keep workspace\n").unwrap();
+    for (path, name, deps) in [
+        ("a", "engine", "[dependencies]\nboard={path=\"../b\"}\n"),
+        ("b", "board", ""),
+        ("c", "unused", ""),
+    ] {
+        std::fs::write(
+            root.join(format!("core/{path}/Cargo.toml")),
+            format!("[package]\nname=\"{name}\"\nversion.workspace=true\n{deps}"),
+        )
+        .unwrap();
+    }
+    std::fs::write(root.join("trainer/Cargo.toml"), "[workspace]\n[package]\nname=\"trainer\"\nversion=\"9.0.0\"\n[dependencies]\nengine={path=\"../core/a\"}\n").unwrap();
+    std::fs::write(root.join("core/Cargo.lock"), "# core lock\nversion=3\n\n[[package]]\nname=\"engine\"\nversion=\"0.1.0\" # keep engine\n\n[[package]]\nname=\"board\"\nversion=\"0.1.0\"\n\n[[package]]\nname=\"unused\"\nversion=\"0.1.0\"\n").unwrap();
+    std::fs::write(root.join("trainer/Cargo.lock"), "# trainer lock\nversion=3\n\n[[package]]\nname=\"trainer\"\nversion=\"9.0.0\"\ndependencies=[\"engine\",\"serde\"]\n\n[[package]]\nname=\"engine\"\nversion=\"0.1.0\" # keep engine\ndependencies=[\"board\"]\n\n[[package]]\nname=\"board\"\nversion=\"0.1.0\"\n\n[[package]]\nname=\"serde\"\nversion=\"1.0.0\"\nsource=\"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum=\"keep-external\"\n").unwrap();
+    declaration(&root, Some("develop"), SUBSET_ENTRIES);
+    git_fixture(dir, root)
+}
+
+#[test]
+fn subset_declaration_loads_two_of_three_workspace_packages() {
+    let fixture = subset_fixture();
+    let versions = develop_release::version_files::VersionFiles::load(fixture.path())
+        .unwrap_or_else(|error| panic!("declared subset must load: {error}"));
+    assert_eq!(versions.current().to_string(), "0.1.0");
+    assert_eq!(git(fixture.path(), &["status", "--porcelain"]), "");
+}
+
+fn subset_load_error(root: &Path) -> String {
+    let paths = git(root, &["ls-files"]);
+    let snapshot = || {
+        paths
+            .lines()
+            .map(|path| (path.to_owned(), std::fs::read(root.join(path)).ok()))
+            .collect::<Vec<_>>()
+    };
+    let before = snapshot();
+    let refs = git(root, &["show-ref"]);
+    let error = develop_release::version_files::VersionFiles::load(root)
+        .err()
+        .expect("invalid subset must fail");
+    assert_eq!(snapshot(), before, "load must leave file bytes unchanged");
+    assert_eq!(
+        git(root, &["show-ref"]),
+        refs,
+        "load must leave refs unchanged"
+    );
+    error
+}
+
+#[test]
+fn subset_versioned_lock_reference_is_rejected_before_writing() {
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    let lock = root.join("trainer/Cargo.lock");
+    let text = std::fs::read_to_string(&lock)
+        .unwrap()
+        .replace("\"engine\",\"serde\"", "\"engine 0.1.0\",\"serde\"");
+    // A registry package with the same name makes the qualified reference necessary.
+    std::fs::write(&lock, format!("{text}\n[[package]]\nname=\"engine\"\nversion=\"2.0.0\"\nsource=\"registry+https://github.com/rust-lang/crates.io-index\"\n")).unwrap();
+    let error = subset_load_error(root);
+    assert!(error.contains("subset_dependency_unsupported"), "{error}");
+}
+
+fn duplicate_subset_package(lock: &str) {
+    let fixture = subset_fixture();
+    let path = fixture.path().join(lock);
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        path,
+        format!("{text}\n[[package]]\nname=\"board\"\nversion=\"0.1.0\"\n"),
+    )
+    .unwrap();
+    let error = subset_load_error(fixture.path());
+    assert!(error.contains("重複"), "{error}");
+}
+
+#[test]
+fn subset_duplicate_source_less_entry_is_rejected() {
+    duplicate_subset_package("trainer/Cargo.lock");
+}
+
+#[test]
+fn subset_main_lock_duplicate_source_less_entry_is_rejected() {
+    duplicate_subset_package("core/Cargo.lock");
+}
+
+#[test]
+fn subset_rejects_a_main_package_outside_the_static_closure() {
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    let lock = root.join("trainer/Cargo.lock");
+    let text = std::fs::read_to_string(&lock).unwrap();
+    std::fs::write(
+        lock,
+        format!("{text}\n[[package]]\nname=\"unused\"\nversion=\"0.1.0\"\n"),
+    )
+    .unwrap();
+    let error = subset_load_error(root);
+    assert!(error.contains("subset_unexpected_package"), "{error}");
+}
+
+#[test]
+fn subset_schema_and_workspace_positions_are_validated() {
+    for (entry, reason) in [
+        (
+            r#"{"path":"trainer/Cargo.lock","kind":"cargo-lock-subset"}"#,
+            "manifest",
+        ),
+        (
+            r#"{"path":"trainer/Cargo.lock","kind":"cargo-lock-subset","manifest":null}"#,
+            "string",
+        ),
+        (
+            r#"{"path":"trainer/Cargo.lock","kind":"cargo-lock-subset","manifest":42}"#,
+            "string",
+        ),
+        (
+            r#"{"path":"trainer/Cargo.lock","kind":"cargo-lock-subset","manifest":""}"#,
+            "subset_manifest_invalid",
+        ),
+        (
+            r#"{"path":"trainer/Cargo.lock","kind":"cargo-lock-subset","manifest":"core/Cargo.toml"}"#,
+            "位置",
+        ),
+        (
+            r#"{"path":"trainer/Cargo.lock","kind":"cargo-lock-subset","manifest":"../trainer/Cargo.toml"}"#,
+            "subset_manifest_invalid",
+        ),
+        (
+            r#"{"path":"/trainer/Cargo.lock","kind":"cargo-lock-subset","manifest":"/trainer/Cargo.toml"}"#,
+            "subset_manifest_invalid",
+        ),
+        (
+            r#"{"path":"trainer/Cargo.lock","kind":"cargo-lock-subset","manifest":"trainer/Cargo.toml","extra":true}"#,
+            "unknown field",
+        ),
+        (
+            r#"{"path":"core/Cargo.lock","kind":"cargo-lock","manifest":"core/Cargo.toml"}"#,
+            "manifest",
+        ),
+    ] {
+        let fixture = subset_fixture();
+        let entries = format!(
+            r#"{{"path":"core/Cargo.toml","kind":"cargo-workspace"}},{{"path":"core/Cargo.lock","kind":"cargo-lock"}},{entry}"#
+        );
+        declaration(fixture.path(), Some("develop"), &entries);
+        let error = subset_load_error(fixture.path());
+        assert!(error.contains(reason), "{entry}: {error}");
+    }
+}
+
+#[test]
+fn subset_missing_files_entries_and_versions_fail_without_repairs() {
+    for missing in [
+        "trainer/Cargo.lock",
+        "trainer/Cargo.toml",
+        "core/Cargo.lock",
+        "core/Cargo.toml",
+    ] {
+        let fixture = subset_fixture();
+        std::fs::remove_file(fixture.path().join(missing)).unwrap();
+        let error = subset_load_error(fixture.path());
+        assert!(error.contains(missing), "{error}");
+    }
+    for lock in ["core/Cargo.lock", "trainer/Cargo.lock"] {
+        for replacement in ["", "[[package]]\nname=\"board\"\nversion=\"0.0.9\"\n"] {
+            let fixture = subset_fixture();
+            let path = fixture.path().join(lock);
+            let text = std::fs::read_to_string(&path).unwrap().replace(
+                "[[package]]\nname=\"board\"\nversion=\"0.1.0\"\n",
+                replacement,
+            );
+            std::fs::write(&path, text).unwrap();
+            let error = subset_load_error(fixture.path());
+            assert!(error.contains(lock), "{error}");
+        }
+    }
+    let fixture = subset_fixture();
+    declaration(
+        fixture.path(),
+        Some("develop"),
+        r#"{"path":"core/Cargo.toml","kind":"cargo-workspace"},{"path":"trainer/Cargo.lock","kind":"cargo-lock-subset","manifest":"trainer/Cargo.toml"}"#,
+    );
+    assert!(subset_load_error(fixture.path()).contains("subset_main_lock_missing"));
+    let fixture = subset_fixture();
+    std::fs::write(
+        fixture.path().join("trainer/Cargo.toml"),
+        "[package]\nname=\"trainer\"\nversion=\"9.0.0\"\n",
+    )
+    .unwrap();
+    assert!(subset_load_error(fixture.path()).contains("subset_workspace_invalid"));
+    let fixture = subset_fixture();
+    std::fs::write(
+        fixture.path().join("trainer/Cargo.toml"),
+        "[workspace]\n[package]\nname=\"trainer\"\nversion=\"9.0.0\"\n",
+    )
+    .unwrap();
+    assert!(subset_load_error(fixture.path()).contains("subset_empty"));
+}
+
+#[test]
+fn subset_static_closure_follows_root_dev_and_build_but_not_dependency_dev() {
+    for root_table in ["dependencies", "build-dependencies", "dev-dependencies"] {
+        let fixture = subset_fixture();
+        let root = fixture.path();
+        let trainer = std::fs::read_to_string(root.join("trainer/Cargo.toml"))
+            .unwrap()
+            .replace("[dependencies]", &format!("[{root_table}]"));
+        std::fs::write(root.join("trainer/Cargo.toml"), trainer).unwrap();
+        std::fs::write(root.join("core/a/Cargo.toml"), "[package]\nname=\"engine\"\nversion.workspace=true\n[build-dependencies]\nboard={path=\"../b\"}\n[dev-dependencies]\nunused={path=\"../c\"}\n").unwrap();
+        std::fs::write(root.join("core/b/Cargo.toml"), "[package]\nname=\"board\"\nversion.workspace=true\n[dependencies]\nengine={path=\"../a\"}\n[dev-dependencies]\nignored.workspace=true\n").unwrap();
+        assert_eq!(
+            develop_release::version_files::VersionFiles::load(root)
+                .unwrap()
+                .current()
+                .to_string(),
+            "0.1.0"
+        );
+    }
+}
+
+#[test]
+fn subset_dependency_path_cannot_escape_the_repo_or_cross_a_symlink() {
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    let trainer = std::fs::read_to_string(root.join("trainer/Cargo.toml")).unwrap();
+    std::fs::write(
+        root.join("trainer/Cargo.toml"),
+        trainer.replace("../core/a", "../../escape"),
+    )
+    .unwrap();
+    assert!(subset_load_error(root).contains("repo の外"));
+    std::os::unix::fs::symlink(root.join("core/a"), root.join("alias")).unwrap();
+    std::fs::write(
+        root.join("trainer/Cargo.toml"),
+        trainer.replace("../core/a", "../alias"),
+    )
+    .unwrap();
+    assert!(subset_load_error(root).contains("symlink"));
+}
+
+#[test]
+fn subset_conditioned_path_is_not_silently_treated_as_unconditional() {
+    let fixture = subset_fixture();
+    let path = fixture.path().join("trainer/Cargo.toml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("path=\"../core/a\"", "path=\"../core/a\",optional=true");
+    std::fs::write(path, text).unwrap();
+    let error = subset_load_error(fixture.path());
+    assert!(error.contains("subset_dependency_unsupported"), "{error}");
+}
+
+#[test]
+fn subset_release_commits_both_locks_and_preserves_unrelated_bytes() {
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    git(root, &["switch", "-q", "develop"]);
+    let before = git(root, &["rev-parse", "HEAD"]);
+    let original = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
+    let main_manifest = original("core/Cargo.toml");
+    let main_lock = original("core/Cargo.lock");
+    let trainer_manifest = original("trainer/Cargo.toml");
+    let subset_lock = original("trainer/Cargo.lock");
+    let output = release(root);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let changed = released_files(root);
+    assert_eq!(
+        changed,
+        ["core/Cargo.lock", "core/Cargo.toml", "trainer/Cargo.lock"]
+    );
+    for (path, expected) in [
+        (
+            "core/Cargo.toml",
+            main_manifest.replace("version=\"0.1.0\"", "version=\"0.1.1\""),
+        ),
+        (
+            "core/Cargo.lock",
+            main_lock.replace("version=\"0.1.0\"", "version=\"0.1.1\""),
+        ),
+        (
+            "trainer/Cargo.lock",
+            subset_lock.replace("version=\"0.1.0\"", "version=\"0.1.1\""),
+        ),
+        ("trainer/Cargo.toml", trainer_manifest),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(root.join(path)).unwrap(),
+            expected,
+            "{path}"
+        );
+        // Git's show strips trailing newlines through this helper, so compare the same boundary.
+        assert_eq!(
+            git(root, &["show", &format!("HEAD:{path}")]),
+            expected.trim(),
+            "{path}"
+        );
+    }
+    assert_eq!(git(root, &["rev-parse", "HEAD^"]), before);
+    assert_eq!(
+        git(root, &["rev-parse", "main"]),
+        git(root, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(git(root, &["tag", "--points-at", "HEAD"]), "v0.1.1");
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+    assert_eq!(
+        develop_release::version_files::VersionFiles::load(root)
+            .unwrap()
+            .current()
+            .to_string(),
+        "0.1.1"
+    );
+}
+
+#[test]
+fn subset_main_lock_cannot_be_a_symlink_to_another_file() {
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    let lock = root.join("core/Cargo.lock");
+    let outside = root.parent().unwrap().join("outside.lock");
+    std::fs::rename(&lock, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &lock).unwrap();
+    let before = std::fs::read(&outside).unwrap();
+    let error = subset_load_error(root);
+    assert!(error.contains("symlink"), "{error}");
+    assert_eq!(std::fs::read(outside).unwrap(), before);
+}
+
+#[test]
+fn subset_commit_and_pushed_tag_check_their_own_static_closure_without_cargo() {
+    use develop_release::version_files::{TagSource, VersionFiles};
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    let commit = git(root, &["rev-parse", "HEAD"]);
+    git(root, &["tag", "v0.1.0"]);
+    // The worktree has a different but internally consistent subset.
+    let manifest = std::fs::read_to_string(root.join("trainer/Cargo.toml")).unwrap();
+    std::fs::write(
+        root.join("trainer/Cargo.toml"),
+        manifest
+            .replace("../core/a", "../core/c")
+            .replace("engine={", "unused={"),
+    )
+    .unwrap();
+    std::fs::write(root.join("trainer/Cargo.lock"), "version=3\n[[package]]\nname=\"trainer\"\nversion=\"9.0.0\"\n[[package]]\nname=\"unused\"\nversion=\"0.1.0\"\n").unwrap();
+    git(root, &["add", "trainer"]);
+    git(root, &["commit", "-qm", "different valid HEAD subset"]);
+    let versions = VersionFiles::load_at(root, &commit)
+        .unwrap_or_else(|error| panic!("commit subset must be checked: {error}"));
+    assert_eq!(versions.current().to_string(), "0.1.0");
+    assert_eq!(
+        TagSource::at(root, &commit)
+            .unwrap()
+            .versions()
+            .unwrap()
+            .current(),
+        versions.current()
+    );
+    let git_only = tempfile::Builder::new()
+        .prefix("develop-meta-git-only-")
+        .tempdir()
+        .unwrap();
+    let git_bin = Command::new("/bin/sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    assert!(git_bin.status.success());
+    std::os::unix::fs::symlink(
+        String::from_utf8(git_bin.stdout).unwrap().trim(),
+        git_only.path().join("git"),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_check-release-version"));
+    command.env("PATH", git_only.path());
+    let output = check_pushed_with(root, &tag_line("v0.1.0", &commit), command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("push v0.1.0"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("飛ばし"));
+}
+
+fn subset_release_rejects_entry(board: &str) {
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    git(root, &["switch", "-q", "develop"]);
+    let path = root.join("trainer/Cargo.lock");
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("[[package]]\nname=\"board\"\nversion=\"0.1.0\"\n", board);
+    std::fs::write(&path, text).unwrap();
+    git(root, &["add", "trainer/Cargo.lock"]);
+    git(root, &["commit", "-qm", "invalid subset"]);
+    let paths = git(root, &["ls-files"]);
+    let snapshot = || {
+        paths
+            .lines()
+            .map(|path| std::fs::read(root.join(path)).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let before = snapshot();
+    let refs = git(root, &["show-ref"]);
+    let output = release(root);
+    assert!(
+        !output.status.success(),
+        "invalid subset must stop the release"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("trainer/Cargo.lock"), "{stderr}");
+    assert_eq!(snapshot(), before);
+    assert_eq!(git(root, &["show-ref"]), refs);
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn subset_release_rejects_missing_expected_package() {
+    subset_release_rejects_entry("");
+}
+
+#[test]
+fn subset_release_rejects_duplicate_expected_package() {
+    subset_release_rejects_entry(
+        "[[package]]\nname=\"board\"\nversion=\"0.1.0\"\n\n[[package]]\nname=\"board\"\nversion=\"0.1.0\"\n",
+    );
+}
+
+#[test]
+fn subset_release_rejects_old_expected_package() {
+    subset_release_rejects_entry("[[package]]\nname=\"board\"\nversion=\"0.0.9\"\n");
+}
+
+#[test]
+fn subset_declaration_cannot_alias_the_same_lock_with_dot_components() {
+    let fixture = subset_fixture();
+    declaration(
+        fixture.path(),
+        Some("develop"),
+        &format!(
+            r#"{SUBSET_ENTRIES},{{"path":"trainer/./Cargo.lock","kind":"cargo-lock-subset","manifest":"trainer/Cargo.toml"}}"#
+        ),
+    );
+    let error = subset_load_error(fixture.path());
+    assert!(error.contains("path"), "{error}");
+}
+
+#[test]
+fn subset_workspace_root_with_missing_package_name_returns_a_diagnostic() {
+    let fixture = subset_fixture();
+    let path = fixture.path().join("core/Cargo.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(path, format!("{text}\n[package]\nversion.workspace=true\n")).unwrap();
+    let error = subset_load_error(fixture.path());
+    assert!(
+        error.contains("core/Cargo.toml") && error.contains("package.name"),
+        "{error}"
+    );
+}
+
+#[test]
+fn subset_commit_rejects_non_regular_blobs_even_when_their_bytes_are_valid() {
+    use develop_release::version_files::VersionFiles;
+    for path in [
+        ".config/develop-tools.json",
+        "core/Cargo.toml",
+        "core/a/Cargo.toml",
+        "trainer/Cargo.toml",
+        "core/Cargo.lock",
+        "trainer/Cargo.lock",
+    ] {
+        let fixture = subset_fixture();
+        let root = fixture.path();
+        let blob = git(root, &["hash-object", "-w", path]);
+        // A symlink-mode blob can contain valid JSON/TOML bytes; parsing is not a mode check.
+        git(
+            root,
+            &["update-index", "--cacheinfo", "120000", &blob, path],
+        );
+        git(root, &["commit", "-qm", "symlink-mode data"]);
+        let bad = git(root, &["rev-parse", "HEAD"]);
+        let error = VersionFiles::load_at(root, &bad)
+            .err()
+            .expect("symlink-mode data must be rejected");
+        assert!(
+            error.contains("source_path_invalid") && error.contains(path) && error.contains(&bad),
+            "{path}: {error}"
+        );
+        assert!(error.contains("確認"), "next action missing: {error}");
+        let output = check_pushed(root, &tag_line("v0.1.0", &bad));
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("source_path_invalid") && error.contains(path) && error.contains(&bad),
+            "{path}: {error}"
+        );
+    }
+}
+
+#[test]
+fn subset_sent_commit_mismatch_is_not_repaired_by_a_valid_later_head() {
+    use develop_release::version_files::VersionFiles;
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    let path = root.join("trainer/Cargo.lock");
+    let valid = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        valid.replace(
+            "name=\"board\"\nversion=\"0.1.0\"",
+            "name=\"board\"\nversion=\"0.0.9\"",
+        ),
+    )
+    .unwrap();
+    git(root, &["add", "trainer/Cargo.lock"]);
+    git(root, &["commit", "-qm", "old subset entry"]);
+    let bad = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(&path, valid).unwrap();
+    git(root, &["commit", "-qam", "valid later HEAD"]);
+    let error = VersionFiles::load_at(root, &bad)
+        .err()
+        .expect("bad commit must be rejected");
+    assert!(error.contains("trainer/Cargo.lock"), "{error}");
+    assert!(
+        error.contains("subset_validation_failed")
+            && error.contains(&bad)
+            && error.contains("確認"),
+        "diagnostic must include code, source and next action: {error}"
+    );
+    let output = check_pushed(root, &tag_line("v0.1.0", &bad));
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains(&bad) && error.contains("trainer/Cargo.lock"),
+        "{error}"
+    );
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn subset_pre_push_reads_each_workspace_member_blob_once() {
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    let commit = git(root, &["rev-parse", "HEAD"]);
+    let tools = tempfile::Builder::new()
+        .prefix("develop-meta-source-reads-")
+        .tempdir()
+        .unwrap();
+    let log = tools.path().join("reads.log");
+    let git_bin = Command::new("/bin/sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    assert!(git_bin.status.success());
+    let real_git = String::from_utf8(git_bin.stdout).unwrap();
+    let wrapper = tools.path().join("git");
+    std::fs::write(&wrapper, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SUBSET_READ_LOG\"\nexec \"$SUBSET_REAL_GIT\" \"$@\"\n").unwrap();
+    std::fs::set_permissions(wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_check-release-version"));
+    command
+        .env("PATH", tools.path())
+        .env("SUBSET_READ_LOG", &log)
+        .env("SUBSET_REAL_GIT", real_git.trim());
+    let output = check_pushed_with(root, &tag_line("v0.1.0", &commit), command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = std::fs::read_to_string(log).unwrap();
+    for member in [
+        "core/a/Cargo.toml",
+        "core/b/Cargo.toml",
+        "core/c/Cargo.toml",
+    ] {
+        let read = format!("cat-file blob {commit}:{member}");
+        assert_eq!(
+            log.lines().filter(|line| *line == read).count(),
+            1,
+            "member read must be shared: {read}\n{log}"
+        );
+    }
+}
+
+#[test]
+fn subset_commit_path_escape_is_not_rescued_by_the_worktree() {
+    use develop_release::version_files::VersionFiles;
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    let path = root.join("trainer/Cargo.toml");
+    let valid = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, valid.replace("../core/a", "../../escape")).unwrap();
+    git(root, &["add", "trainer/Cargo.toml"]);
+    git(root, &["commit", "-qm", "path escapes repo"]);
+    let bad = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(&path, valid).unwrap();
+    let error = VersionFiles::load_at(root, &bad)
+        .err()
+        .expect("escaping commit must be rejected");
+    assert!(
+        error.contains("subset_validation_failed")
+            && error.contains(&bad)
+            && error.contains("repo の外")
+            && error.contains("確認"),
+        "{error}"
+    );
+    let output = check_pushed(root, &tag_line("v0.1.0", &bad));
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains(&bad) && error.contains("repo の外"),
+        "{error}"
+    );
+    assert!(!error.contains("飛ばし"));
+}
+
+#[test]
+fn subset_worktree_does_not_skip_a_dangling_source_config() {
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    std::fs::create_dir(root.join(".cargo")).unwrap();
+    std::os::unix::fs::symlink("missing-config", root.join(".cargo/config")).unwrap();
+    let error = subset_load_error(root);
+    assert!(
+        error.contains("source_path_invalid")
+            && error.contains("symlink")
+            && error.contains("確認"),
+        "{error}"
+    );
+}
+
+#[test]
+fn subset_parent_components_cannot_hide_a_symlink_in_either_source() {
+    use develop_release::version_files::VersionFiles;
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    std::os::unix::fs::symlink("core", root.join("alias")).unwrap();
+    let path = root.join("trainer/Cargo.toml");
+    let valid = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, valid.replace("../core/a", "../alias/../core/a")).unwrap();
+    let error = subset_load_error(root);
+    assert!(
+        error.contains("source_path_invalid") && error.contains("alias"),
+        "{error}"
+    );
+    git(root, &["add", "alias", "trainer/Cargo.toml"]);
+    git(
+        root,
+        &["commit", "-qm", "symlink hidden by parent component"],
+    );
+    let bad = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(path, valid).unwrap();
+    let error = VersionFiles::load_at(root, &bad)
+        .err()
+        .expect("commit symlink must not be erased");
+    assert!(
+        error.contains("source_path_invalid") && error.contains("alias") && error.contains(&bad),
+        "{error}"
+    );
+}
+
+#[test]
+fn subset_cargo_parent_symlink_is_rejected_in_worktree_commit_and_pre_push() {
+    use develop_release::version_files::VersionFiles;
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    std::fs::create_dir(root.join("conf")).unwrap();
+    std::fs::write(
+        root.join("conf/config.toml"),
+        "[source.crates-io]\nreplace-with=\"shadow\"\n[source.shadow]\ndirectory=\"vendor\"\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("conf", root.join(".cargo")).unwrap();
+    let error = subset_load_error(root);
+    assert!(
+        error.contains("source_path_invalid") && error.contains(".cargo"),
+        "{error}"
+    );
+    git(root, &["add", ".cargo", "conf"]);
+    git(root, &["commit", "-qm", "symlink cargo parent"]);
+    let bad = git(root, &["rev-parse", "HEAD"]);
+    let error = VersionFiles::load_at(root, &bad)
+        .err()
+        .expect("commit cargo parent symlink must be rejected");
+    assert!(
+        error.contains("source_path_invalid") && error.contains(".cargo") && error.contains(&bad),
+        "{error}"
+    );
+    std::fs::remove_file(root.join(".cargo")).unwrap();
+    std::fs::create_dir(root.join(".cargo")).unwrap();
+    let output = check_pushed(root, &tag_line("v0.1.0", &bad));
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("source_path_invalid")
+            && error.contains(".cargo")
+            && error.contains(&bad)
+            && error.contains("確認"),
+        "{error}"
+    );
+}
+
+#[test]
+fn plain_pre_push_keeps_the_pre_34_git_process_budget_and_output() {
+    let fixture = plain_workspace_fixture();
+    let root = fixture.path();
+    git(root, &["tag", "v0.1.0"]);
+    let commit = git(root, &["rev-parse", "HEAD"]);
+    let tools = tempfile::Builder::new()
+        .prefix("develop-meta-plain-git-budget-")
+        .tempdir()
+        .unwrap();
+    let log = tools.path().join("git.log");
+    let real_git = Command::new("/bin/sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    assert!(real_git.status.success());
+    let wrapper = tools.path().join("git");
+    std::fs::write(&wrapper, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$RELEASE_GIT_LOG\"\nexec \"$RELEASE_REAL_GIT\" \"$@\"\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_check-release-version"));
+    command
+        .env("PATH", tools.path())
+        .env("RELEASE_GIT_LOG", &log)
+        .env(
+            "RELEASE_REAL_GIT",
+            String::from_utf8(real_git.stdout).unwrap().trim(),
+        );
+    let output = check_pushed_with(root, &tag_line("v0.1.0", &commit), command);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"check-release-version: OK (v0.1.0)\ncheck-release-version: OK (push v0.1.0)\n"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = std::fs::read_to_string(log).unwrap();
+    assert!(
+        calls.lines().count() <= 14,
+        "plain pre-push exceeds the pre-3.4 budget: {}\n{calls}",
+        calls.lines().count()
+    );
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), commit);
+}
+
+fn plain_workspace_fixture() -> Fixture {
+    let fixture = subset_fixture();
+    let root = fixture.path();
+    std::fs::write(root.join(".config/develop-tools.json"), r#"{"release":{"versionFiles":[{"path":"core/Cargo.toml","kind":"cargo-workspace"},{"path":"core/Cargo.lock","kind":"cargo-lock"}]}}"#).unwrap();
+    git(root, &["commit", "-qam", "plain declaration"]);
+    fixture
+}
+
+#[test]
+fn plain_commit_retains_non_regular_blob_rejection_when_prefetching() {
+    use develop_release::version_files::VersionFiles;
+    for path in [
+        ".config/develop-tools.json",
+        "core/Cargo.toml",
+        "core/Cargo.lock",
+        "core/a/Cargo.toml",
+    ] {
+        let fixture = plain_workspace_fixture();
+        let root = fixture.path();
+        let blob = git(root, &["hash-object", "-w", path]);
+        git(
+            root,
+            &["update-index", "--cacheinfo", "120000", &blob, path],
+        );
+        git(root, &["commit", "-qm", "plain symlink-mode data"]);
+        let bad = git(root, &["rev-parse", "HEAD"]);
+        let error = VersionFiles::load_at(root, &bad)
+            .err()
+            .expect("plain mode check must remain");
+        assert!(
+            error.contains("source_path_invalid") && error.contains(path) && error.contains(&bad),
+            "{error}"
+        );
+        let output = check_pushed(root, &tag_line("v0.1.0", &bad));
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("source_path_invalid") && error.contains(path) && error.contains(&bad),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn plain_commit_lock_is_not_replaced_with_a_repaired_head_during_prefetch() {
+    use develop_release::version_files::VersionFiles;
+    let fixture = plain_workspace_fixture();
+    let root = fixture.path();
+    let path = root.join("core/Cargo.lock");
+    let valid = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        valid.replace(
+            "name=\"board\"\nversion=\"0.1.0\"",
+            "name=\"board\"\nversion=\"0.0.9\"",
+        ),
+    )
+    .unwrap();
+    git(root, &["commit", "-qam", "bad plain lock"]);
+    let bad = git(root, &["rev-parse", "HEAD"]);
+    git(root, &["tag", "v0.1.0"]);
+    std::fs::write(&path, valid).unwrap();
+    git(root, &["commit", "-qam", "repaired later HEAD"]);
+    let error = VersionFiles::load_at(root, &bad)
+        .err()
+        .expect("bad sent lock must remain bad");
+    assert!(
+        error.contains("core/Cargo.lock") && error.contains("0.0.9"),
+        "{error}"
+    );
+    let output = check_pushed(root, &tag_line("v0.1.0", &bad));
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains(&bad) && error.contains("core/Cargo.lock"),
+        "{error}"
+    );
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn invalid_sent_path_is_rejected_before_any_version_blob_probe() {
+    let fixture = plain_workspace_fixture();
+    let root = fixture.path();
+    let manifest = root.join(".config/develop-tools.json");
+    let valid = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        valid.replace("core/Cargo.toml", "core/../core/Cargo.toml"),
+    )
+    .unwrap();
+    git(root, &["commit", "-qam", "invalid sent path"]);
+    let bad = git(root, &["rev-parse", "HEAD"]);
+    std::fs::write(&manifest, valid).unwrap();
+    git(root, &["commit", "-qam", "valid later HEAD"]);
+    let tools = tempfile::Builder::new()
+        .prefix("develop-meta-invalid-path-probe-")
+        .tempdir()
+        .unwrap();
+    let log = tools.path().join("git.log");
+    let real_git = Command::new("/bin/sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    assert!(real_git.status.success());
+    let wrapper = tools.path().join("git");
+    std::fs::write(&wrapper, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$RELEASE_GIT_LOG\"\nexec \"$RELEASE_REAL_GIT\" \"$@\"\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_check-release-version"));
+    command
+        .env("PATH", tools.path())
+        .env("RELEASE_GIT_LOG", &log)
+        .env(
+            "RELEASE_REAL_GIT",
+            String::from_utf8(real_git.stdout).unwrap().trim(),
+        );
+    let output = check_pushed_with(root, &tag_line("v0.1.0", &bad), command);
+    assert_eq!(output.status.code(), Some(1));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains(&bad) && error.contains("不正な版 file path: core/../core/Cargo.toml"),
+        "{error}"
+    );
+    let calls = std::fs::read_to_string(log).unwrap();
+    assert!(
+        !calls
+            .lines()
+            .any(|line| line.contains("-- core") || line.contains("cat-file --batch")),
+        "invalid version path must be rejected before its read-only probes:\n{calls}"
+    );
+    assert_eq!(git(root, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn pushed_tag_rejects_a_non_tree_config_parent_in_its_commit() {
+    let mut accepted = Vec::new();
+    for (kind, mode) in [
+        ("symlink", "120000"),
+        ("blob", "100644"),
+        ("gitlink", "160000"),
+    ] {
+        let fixture = child_repo_fixture();
+        let root = fixture.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace.package]\nversion=\"1.2.3\"\n",
+        )
+        .unwrap();
+        git(root, &["add", "Cargo.toml"]);
+        // Keep a valid worktree declaration: only the sent commit has the bad parent.
+        git(root, &["rm", "--cached", "-r", ".config"]);
+        let object = if kind == "gitlink" {
+            git(root, &["rev-parse", "HEAD"])
+        } else {
+            git(root, &["hash-object", "-w", "package.json"])
+        };
+        git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("{mode},{object},.config"),
+            ],
+        );
+        git(root, &["commit", "-qm", "non-tree declaration parent"]);
+        let commit = git(root, &["rev-parse", "HEAD"]);
+        assert!(git(root, &["ls-tree", &commit, "--", ".config"]).starts_with(mode));
+        git(root, &["tag", "v1.2.3"]);
+        let output = check_pushed(root, &tag_line("v1.2.3", &commit));
+        if output.status.success() {
+            accepted.push(kind);
+            continue;
+        }
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("source_path_invalid")
+                && error.contains(".config")
+                && error.contains(&commit)
+                && error.contains("確認"),
+            "{kind}: {error}"
+        );
+    }
+    assert!(
+        accepted.is_empty(),
+        "non-tree .config was accepted: {accepted:?}"
+    );
 }

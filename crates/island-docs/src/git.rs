@@ -258,7 +258,10 @@ impl Repo {
         match out.status.code() {
             Some(0) => Ok(commit),
             Some(1) => Err("commit link が検査対象 commit の祖先ではありません".to_owned()),
-            _ => Err("commit link の祖先を確認できません".to_owned()),
+            _ => Err(format!(
+                "commit link の祖先を確認できません; {}",
+                develop_core::process::ChildFailure::from_output(&out)
+            )),
         }
     }
 
@@ -294,7 +297,10 @@ impl Repo {
             .expect("writer thread")
             .map_err(|error| format!("git cat-file へ書けません: {error}"))?;
         if !status.success() {
-            return Err("git cat-file --batch が失敗しました".to_owned());
+            return Err(format!(
+                "git cat-file --batch が失敗しました; {}",
+                develop_core::process::ChildFailure::from_status(status, None)
+            ));
         }
         parse_batch(&raw, oids)
     }

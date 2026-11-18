@@ -130,6 +130,70 @@ fn replays_introduction_and_chooses_first_containing_tag() {
 }
 
 #[test]
+fn migration_uses_shared_prefix_tags_and_preserves_mixed_history() {
+    let f = Fixture::new();
+    let old =
+        "- **A（2026-11-01/[v1.0.0](https://github.com/fixture/demo/releases/tag/v1.0.0)）**: 最初";
+    f.changelog(&format!("## 2026-11\n{old}\n"));
+    f.commit("old release");
+    git(f.root(), &["tag", "v1.0.0"]);
+    fs::write(
+        f.root().join(".config/develop-tools.json"),
+        br#"{"release":{"versionFiles":["VERSION"],"tagPrefix":"release-"}}"#,
+    )
+    .unwrap();
+    f.changelog(&format!(
+        "## 2026-11\n{old}\n- **B（2026-11-02）**: 新規\n- **短形（2026-11-02/v2.0.0）**: 履歴\n"
+    ));
+    f.commit("new release");
+    git(f.root(), &["tag", "release-2.0.0"]);
+    let before = fs::read(f.root().join("CHANGELOG.md")).unwrap();
+    let (out, plan) = f.check(
+        r#"[{"tagName":"v1.0.0","isDraft":false},{"tagName":"release-2.0.0","isDraft":false}]"#,
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(plan["items"][1]["stamp"], "release-2.0.0");
+    assert_eq!(
+        plan["items"][1]["releaseUrl"],
+        "https://github.com/fixture/demo/releases/tag/release-2.0.0"
+    );
+    assert_eq!(plan["invalid"], 0);
+    assert_eq!(plan["holds"], 0);
+    assert_eq!(fs::read(f.root().join("CHANGELOG.md")).unwrap(), before);
+}
+
+#[test]
+fn migration_rejects_a_prefix_version_supplement_that_conflicts_with_history() {
+    let f = Fixture::new();
+    fs::write(
+        f.root().join(".config/develop-tools.json"),
+        br#"{"release":{"versionFiles":["VERSION"],"tagPrefix":"release-"}}"#,
+    )
+    .unwrap();
+    f.changelog("## 2026-11\n- **A（2026-11-01、release-1.0.0）**: 本文\n");
+    f.commit("conflicting supplement");
+    git(f.root(), &["tag", "release-2.0.0"]);
+    let (out, plan) = f.check("[]", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(plan["holds"], 1);
+    assert!(
+        plan["items"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("supplement version release-1.0.0 conflicts with release-2.0.0")
+    );
+}
+
+#[test]
 fn nested_bold_in_existing_title_is_a_valid_migration_item() {
     let f = Fixture::new();
     f.changelog("## 2026-06\n- **設定を **短縮** した。（2026-06-13）**: 要約\n");

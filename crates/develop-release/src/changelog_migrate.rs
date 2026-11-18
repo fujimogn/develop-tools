@@ -349,36 +349,14 @@ fn historical_items(bytes: &[u8]) -> Result<(Vec<Item>, HashSet<String>)> {
 }
 
 fn versions_in_supplement(tail: &str) -> Vec<String> {
-    let bytes = tail.as_bytes();
-    let mut versions = Vec::new();
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte != b'v' || index > 0 && bytes[index - 1].is_ascii_alphanumeric() {
-            continue;
-        }
-        let rest = &tail[index..];
-        let end = rest
-            .char_indices()
-            .skip(1)
-            .find(|(_, character)| !character.is_ascii_digit() && *character != '.')
-            .map_or(rest.len(), |(offset, _)| offset);
-        let candidate = &rest[..end];
-        if version_tag(candidate) {
-            versions.push(candidate.to_owned());
-        }
-    }
-    versions
+    tail.split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '_' | '-'))
+        .filter(|candidate| version_tag(candidate))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn version_tag(value: &str) -> bool {
-    value.strip_prefix('v').is_some_and(|rest| {
-        let parts: Vec<_> = rest.split('.').collect();
-        parts.len() == 3
-            && parts.iter().all(|part| {
-                !part.is_empty()
-                    && (part.len() == 1 || !part.starts_with('0'))
-                    && part.bytes().all(|byte| byte.is_ascii_digit())
-            })
-    })
+    changelog_title::parse_release_tag(value).is_some()
 }
 
 fn validate_stamped(items: &[Item], identity: &str) -> Result<()> {

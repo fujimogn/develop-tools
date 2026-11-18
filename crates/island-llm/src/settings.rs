@@ -49,17 +49,58 @@ struct Raw {
     forbidden_terms: Option<Vec<String>>,
     internal_names: Option<Vec<String>>,
     usage_ledger: Option<PathBuf>,
+    #[serde(default, deserialize_with = "present_json")]
+    release_notes_attribution_actors: Option<serde_json::Value>,
 }
 
-#[derive(Debug)]
+// Preserve explicit null separately from an absent optional field.
+fn present_json<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
 pub struct Settings {
     key_ref: KeyRef,
     forbidden_terms: Option<Vec<String>>,
     internal_names: Option<Vec<String>>,
     usage_ledger: Option<PathBuf>,
+    release_notes_attribution_actors: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Settings").finish_non_exhaustive()
+    }
 }
 
 impl Settings {
+    /// Release 専用の入力編集用 literal。共通の設定読取では解釈しない。
+    pub fn release_notes_attribution_actors(&self) -> Result<Vec<String>, SettingsError> {
+        let Some(value) = &self.release_notes_attribution_actors else {
+            return Ok(Vec::new());
+        };
+        let values = value.as_array().ok_or(SettingsError::Invalid)?;
+        let mut actors = Vec::new();
+        for value in values {
+            let value = value.as_str().ok_or(SettingsError::Invalid)?;
+            if value
+                .chars()
+                .any(|ch| ch.is_control() || "（）()、,`\\*_[]!<>".contains(ch))
+            {
+                return Err(SettingsError::Invalid);
+            }
+            let actor = value.trim();
+            if actor.is_empty() {
+                return Err(SettingsError::Invalid);
+            }
+            if !actors.iter().any(|existing| existing == actor) {
+                actors.push(actor.to_owned());
+            }
+        }
+        Ok(actors)
+    }
+
     pub fn key_ref(&self) -> &KeyRef {
         &self.key_ref
     }
@@ -121,6 +162,7 @@ pub fn load(path: &Path) -> Result<Settings, SettingsError> {
         forbidden_terms: raw.forbidden_terms,
         internal_names: raw.internal_names,
         usage_ledger: raw.usage_ledger,
+        release_notes_attribution_actors: raw.release_notes_attribution_actors,
     })
 }
 

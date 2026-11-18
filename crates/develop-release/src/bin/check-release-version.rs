@@ -7,7 +7,8 @@ use std::io::Read;
 use std::path::Path;
 
 use develop_release::{
-    PushedTag, current_repo_root, pushed_release_tags, version_files::VersionFiles,
+    PushedTag, current_repo_root, pushed_release_tags,
+    version_files::{TagSource, VersionFiles},
 };
 use develop_tools_core::{RELEASE_BRANCH, cli_help::Help};
 
@@ -16,7 +17,7 @@ fn main() {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         let release = RELEASE_BRANCH;
         let detail = format!(
-            "宣言した全 file の版を常に照合します。release.versionFiles を宣言していない repo では作業木の照合を飛ばし、理由を stderr に 1 行出します（宣言が壊れているときは失敗します）。HEAD に v<semver> tag がある場合だけ tag と {release} への包含を確認します。--pre-push では Git pre-push の stdin を読み、送る refs/tags/v<semver> ごとに、その tag の commit の版 file と tag の一致、その commit の {release} への包含も確認します（削除の行と tag 以外の行は読み飛ばします）。repo の外では soft-skip します。"
+            "宣言した全 file の版を常に照合します。release.versionFiles を宣言していない repo では作業木の照合を飛ばし、理由を stderr に 1 行出します（宣言が壊れているときは失敗します）。HEAD に release.tagPrefix の規則に合う版 tag がある場合だけ tag と {release} への包含を確認します。--pre-push では Git pre-push の stdin を読み、送り先 refs/tags/ の名前を送信 object の commit の規則で判定し、対象の tag と同じ commit の版 file、その commit の {release} への包含を照合します（削除と tag 以外の行は先に読み飛ばします）。prefix 省略は旧規則を保ち、明示不正は拒否します。repo の外では soft-skip します。"
         );
         let exit = format!(
             "0 = release でない / 一致 / repo 外・版の宣言なしの soft-skip、1 = git の失敗、tag・版数の不一致、{release} 外の tag、または設定の読み取りエラー"
@@ -40,20 +41,21 @@ fn main() {
         Err(err) => fail(&err),
     };
     // 版を持たない repo は作業木の照合を飛ばす。送る tag の照合は宣言の有無にかかわらず行う。
-    if VersionFiles::undeclared(&root) {
+    let head_versions = if VersionFiles::undeclared(&root) {
         eprintln!(
             "check-release-version: release.versionFiles の宣言が無いため版の照合を飛ばします"
         );
+        None
     } else {
-        check_head(&root);
-    }
+        Some(check_head(&root))
+    };
     if pre_push {
         let mut input = String::new();
         if let Err(err) = std::io::stdin().read_to_string(&mut input) {
             fail(&format!("stdin を読めません: {err}"));
         }
         for pushed in pushed_release_tags(&input) {
-            check_pushed(&root, &pushed);
+            check_pushed(&root, &pushed, head_versions.as_ref());
         }
     }
 }
@@ -72,7 +74,7 @@ fn fail_tag(err: &str) -> ! {
 }
 
 /// 作業木の版 file を照合し、HEAD の tag があれば tag と main への包含も照合する。
-fn check_head(root: &Path) {
+fn check_head(root: &Path) -> VersionFiles {
     let out = match develop_tools_core::git(root)
         .args(["tag", "--points-at", "HEAD"])
         .output()
@@ -96,15 +98,17 @@ fn check_head(root: &Path) {
     match versions.check_tags(&tags) {
         Ok(None) => {}
         Ok(Some(version)) => {
-            require_in_main(root, "HEAD", &format!("v{version}"));
-            println!("check-release-version: OK (v{version})");
+            let tag = versions.tag(version);
+            require_in_main(root, "HEAD", &tag);
+            println!("check-release-version: OK ({tag})");
         }
         Err(err) => fail_tag(&err),
     }
+    versions
 }
 
 /// 送る tag の commit の版 file を読み、tag との一致と main への包含を照合する。
-fn check_pushed(root: &Path, pushed: &PushedTag) {
+fn check_pushed(root: &Path, pushed: &PushedTag, head_versions: Option<&VersionFiles>) {
     let out = match develop_tools_core::git(root)
         .args([
             "rev-parse",
@@ -118,13 +122,42 @@ fn check_pushed(root: &Path, pushed: &PushedTag) {
         Err(err) => fail(&format!("git rev-parse を起動できません: {err}")),
     };
     if !out.status.success() {
-        fail(&format!("{} の commit を解決できません", pushed.tag));
+        // commit の無い ref だけ、旧規則と検証済み作業木の規則で非版 tag を分類する。
+        let version_name = develop_tools_core::release_tag::TagPrefix::default()
+            .parse(&pushed.tag)
+            .is_some()
+            || head_versions.is_some_and(|versions| versions.parse_tag(&pushed.tag).is_some());
+        if !version_name {
+            let kind = develop_tools_core::git(root)
+                .args(["cat-file", "-t", &format!("{}^{{}}", pushed.object)])
+                .output()
+                .unwrap_or_else(|error| fail(&format!("git cat-file を起動できません: {error}")));
+            if kind.status.success()
+                && matches!(
+                    String::from_utf8_lossy(&kind.stdout).trim(),
+                    "blob" | "tree"
+                )
+            {
+                return;
+            }
+        }
+        fail(&format!(
+            "{} の commit を解決できません; {}",
+            pushed.tag,
+            develop_tools_core::process::ChildFailure::from_output(&out)
+        ));
     }
     let commit = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    let versions = VersionFiles::load_at(root, &commit)
-        .unwrap_or_else(|err| fail(&format!("{}: {err}", pushed.tag)));
+    let source = TagSource::at(root, &commit)
+        .unwrap_or_else(|err| fail(&format!("{} ({commit}): {err}", pushed.tag)));
+    if source.parse_tag(&pushed.tag).is_none() {
+        return;
+    }
+    let versions = source
+        .versions()
+        .unwrap_or_else(|err| fail(&format!("{} ({commit}): {err}", pushed.tag)));
     if let Err(err) = versions.check_tags(std::slice::from_ref(&pushed.tag)) {
-        fail_tag(&err);
+        fail_tag(&format!("{} ({commit}): {err}", pushed.tag));
     }
     require_in_main(root, &commit, &pushed.tag);
     println!("check-release-version: OK (push {})", pushed.tag);
@@ -139,9 +172,20 @@ fn require_in_main(root: &Path, commit: &str, tag: &str) {
             &format!("refs/heads/{RELEASE_BRANCH}"),
         ])
         .status();
-    if !matches!(in_main, Ok(status) if status.success()) {
-        fail(&format!(
-            "{tag} の commit は {RELEASE_BRANCH} に含まれていません"
-        ));
+    match in_main {
+        Ok(status) if status.success() => {}
+        Ok(status) if status.code() == Some(1) => {
+            fail(&format!(
+                "{tag} の commit は {RELEASE_BRANCH} に含まれていません"
+            ));
+        }
+        Ok(status) => fail(
+            &develop_tools_core::process::ChildFailure::from_status(
+                status,
+                Some("ancestor_check_failed"),
+            )
+            .to_string(),
+        ),
+        Err(error) => fail(&format!("merge-base を起動できません: {error}")),
     }
 }

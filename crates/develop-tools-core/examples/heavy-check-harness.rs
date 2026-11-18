@@ -861,12 +861,19 @@ fn pty_driver(home: &std::path::Path, mode: &str) -> Result<i32, Box<dyn std::er
     command.process_group(0);
     let fd = slave.as_raw_fd();
     let close_master = master.as_raw_fd();
+    let foreground = mode != "background";
     unsafe {
         command.pre_exec(move || {
             if libc::dup2(fd, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
             libc::close(close_master);
+            // process_group(0) has already established this child's group.
+            // Give it the terminal before exec can transfer it to its worker;
+            // doing this in the parent after spawn races that transfer.
+            if foreground && libc::tcsetpgrp(fd, libc::getpgrp()) < 0 {
+                return Err(io::Error::last_os_error());
+            }
             libc::signal(libc::SIGTTOU, libc::SIG_DFL);
             libc::signal(libc::SIGHUP, libc::SIG_DFL);
             Ok(())
@@ -882,7 +889,6 @@ fn pty_driver(home: &std::path::Path, mode: &str) -> Result<i32, Box<dyn std::er
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<(), Box<dyn std::error::Error>> {
-            assert_eq!(unsafe { libc::tcsetpgrp(fd, original) }, 0);
             std::fs::write(home.join("go"), b"go")?;
             let ready = String::from_utf8(wait_file(&home.join("payload-ready"))?)?;
             let groups: Vec<i32> = ready

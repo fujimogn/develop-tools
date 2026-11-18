@@ -229,9 +229,10 @@ fn setup_tagged(
     std::fs::create_dir_all(root.join(".config")).unwrap();
     std::fs::write(
         root.join(".config/develop-tools.json"),
-        format!("{{\"integrationBranch\":\"{integration}\"}}\n"),
+        format!("{{\"integrationBranch\":\"{integration}\",\"release\":{{\"versionFiles\":[{{\"path\":\"package.json\",\"kind\":\"package-json\"}}]}}}}\n"),
     )
     .unwrap();
+    std::fs::write(root.join("package.json"), "{\"version\":\"0.1.0\"}\n").unwrap();
     if matches!(workflow, Workflow::Tracked) {
         std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
         std::fs::write(root.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
@@ -247,7 +248,8 @@ fn setup_tagged(
         git(&root, &["checkout", "-q", "develop"]);
     }
     std::fs::write(root.join("release.txt"), "release\n").unwrap();
-    git(&root, &["add", "release.txt"]);
+    std::fs::write(root.join("package.json"), "{\"version\":\"0.1.1\"}\n").unwrap();
+    git(&root, &["add", "release.txt", "package.json"]);
     git(&root, &["commit", "-qm", "release"]);
     if integration != "main" {
         git(&root, &["branch", "-f", "main", "HEAD"]);
@@ -323,6 +325,240 @@ fn run_push(repo: &Repo, mode: &str, with_gh: bool, extra: &[&str]) -> Output {
         .env("GIT_WORK_TREE", "/nowhere")
         .output()
         .unwrap()
+}
+
+fn setup_prefixed(integration: &str, kind: TagKind) -> Repo {
+    let mut repo = setup_tagged(integration, Workflow::Tracked, ServerHook::None, kind);
+    let manifest = repo.root.join(".config/develop-tools.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+    value["release"]["tagPrefix"] = serde_json::json!("release-");
+    std::fs::write(manifest, value.to_string()).unwrap();
+    git(&repo.root, &["add", ".config/develop-tools.json"]);
+    git(&repo.root, &["commit", "-qm", "declared prefix"]);
+    repo.release_sha = git(&repo.root, &["rev-parse", "HEAD"]);
+    if integration != "main" {
+        git(&repo.root, &["branch", "-f", "main", "HEAD"]);
+    }
+    match kind {
+        TagKind::Lightweight => git(&repo.root, &["tag", "release-0.1.1"]),
+        TagKind::Annotated => git(&repo.root, &["tag", "-a", "-m", "本文", "release-0.1.1"]),
+    };
+    repo
+}
+
+#[test]
+fn current_main_requires_a_current_version_declaration_even_with_a_valid_worktree() {
+    for mode in ["absent", "legacy", "undeclared"] {
+        let repo = setup("main", Workflow::Tracked, ServerHook::None);
+        let manifest = repo.root.join(".config/develop-tools.json");
+        let declaration = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            repo.root.join("Cargo.toml"),
+            "[workspace.package]\nversion=\"0.1.1\"\n",
+        )
+        .unwrap();
+        match mode {
+            "absent" => std::fs::remove_file(&manifest).unwrap(),
+            "legacy" => {
+                std::fs::rename(&manifest, repo.root.join(".develop-tools.json")).unwrap();
+            }
+            "undeclared" => {
+                std::fs::write(&manifest, "{\"integrationBranch\":\"main\"}\n").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        git(&repo.root, &["add", "-A"]);
+        git(
+            &repo.root,
+            &["commit", "-qm", "main has no current declaration"],
+        );
+        // 作業木だけを有効にしても、main の commit の宣言欠落を救済してはいけない。
+        if mode == "legacy" {
+            std::fs::remove_file(repo.root.join(".develop-tools.json")).unwrap();
+        }
+        std::fs::write(&manifest, declaration).unwrap();
+        let output = run_push(&repo, "success", true, &["--tag-without-ci-check"]);
+        assert!(
+            !output.status.success(),
+            "{mode}: current main must not use historical compatibility"
+        );
+        assert!(
+            pushed_refs(&repo).is_empty(),
+            "{mode}: no push before refusal"
+        );
+        let reason = match mode {
+            "legacy" => "manifest_legacy",
+            "undeclared" => "release",
+            _ => ".config/develop-tools.json",
+        };
+        assert!(
+            text(&output.stderr).contains(reason),
+            "{mode}: {}",
+            text(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn current_main_keeps_historical_compatibility_for_ancestor_candidates_only() {
+    for legacy in [false, true] {
+        let repo = setup("main", Workflow::Tracked, ServerHook::None);
+        let manifest = repo.root.join(".config/develop-tools.json");
+        let declaration = std::fs::read_to_string(&manifest).unwrap();
+        std::fs::write(
+            repo.root.join("Cargo.toml"),
+            "[workspace.package]\nversion=\"0.1.1\"\n",
+        )
+        .unwrap();
+        if legacy {
+            std::fs::rename(&manifest, repo.root.join(".develop-tools.json")).unwrap();
+        } else {
+            std::fs::remove_file(&manifest).unwrap();
+        }
+        git(&repo.root, &["add", "-A"]);
+        git(&repo.root, &["commit", "-qm", "historical release"]);
+        let historical = git(&repo.root, &["rev-parse", "HEAD"]);
+        git(&repo.root, &["tag", "-d", "v0.1.1"]);
+        git(&repo.root, &["tag", "v0.1.1"]);
+        if legacy {
+            std::fs::remove_file(repo.root.join(".develop-tools.json")).unwrap();
+        }
+        std::fs::write(&manifest, declaration).unwrap();
+        git(&repo.root, &["add", "-A"]);
+        git(&repo.root, &["commit", "-qm", "current declaration"]);
+        let tip = git(&repo.root, &["rev-parse", "HEAD"]);
+        let output = run_push(&repo, "success", true, &["--tag-without-ci-check"]);
+        assert!(
+            output.status.success(),
+            "legacy={legacy}: {}",
+            text(&output.stderr)
+        );
+        assert_eq!(remote_sha(&repo.root, "refs/heads/main"), tip);
+        assert_eq!(remote_sha(&repo.root, "refs/tags/v0.1.1"), historical);
+    }
+}
+
+#[test]
+fn declared_prefix_main_only_push_uses_the_ancestor_tag_commit_ci() {
+    let repo = setup_prefixed("main", TagKind::Annotated);
+    let object = git(&repo.root, &["rev-parse", "refs/tags/release-0.1.1"]);
+    std::fs::write(repo.root.join("shipment.txt"), "after release\n").unwrap();
+    git(&repo.root, &["add", "shipment.txt"]);
+    git(&repo.root, &["commit", "-qm", "shipment"]);
+    let tip = git(&repo.root, &["rev-parse", "HEAD"]);
+    let output = run_push(&repo, "success", true, &[]);
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert_eq!(remote_sha(&repo.root, "refs/heads/main"), tip);
+    assert_eq!(remote_sha(&repo.root, "refs/tags/release-0.1.1"), object);
+    let log = log_text(&repo);
+    let ci = log
+        .lines()
+        .find(|line| line.starts_with("gh run list"))
+        .unwrap();
+    assert!(ci.contains(&repo.release_sha) && !ci.contains(&tip), "{ci}");
+}
+
+#[test]
+fn main_only_fallback_rechecks_the_candidate_commit_rule_and_number() {
+    for wrong_rule in [true, false] {
+        let repo = setup_prefixed("main", TagKind::Lightweight);
+        let (version, object, reason) = if wrong_rule {
+            ("0.1.0", &repo.previous_sha, "tagPrefix")
+        } else {
+            ("0.1.2", &repo.release_sha, "版")
+        };
+        git(&repo.root, &["tag", &format!("release-{version}"), object]);
+        std::fs::write(
+            repo.root.join("package.json"),
+            format!("{{\"version\":\"{version}\"}}\n"),
+        )
+        .unwrap();
+        git(&repo.root, &["add", "package.json"]);
+        git(
+            &repo.root,
+            &["commit", "-qm", "main version selects candidate"],
+        );
+        // CI 待機を省略しても、候補の照合はどの push よりも前に止める。
+        let output = run_push(&repo, "success", true, &["--tag-without-ci-check"]);
+        assert!(
+            !output.status.success(),
+            "candidate must be checked at its commit"
+        );
+        assert!(
+            text(&output.stderr).contains(reason),
+            "{}",
+            text(&output.stderr)
+        );
+        assert!(pushed_refs(&repo).is_empty());
+    }
+}
+
+#[test]
+fn declared_prefix_rejects_multiple_points_at_tags_before_pushing() {
+    let repo = setup_prefixed("develop", TagKind::Lightweight);
+    git(&repo.root, &["tag", "release-0.1.2"]);
+    let output = run_push(&repo, "success", true, &[]);
+    assert!(!output.status.success());
+    assert!(
+        text(&output.stderr).contains("複数"),
+        "{}",
+        text(&output.stderr)
+    );
+    assert!(pushed_refs(&repo).is_empty());
+}
+
+#[test]
+fn declared_prefix_rejects_a_candidate_outside_main() {
+    let repo = setup_prefixed("main", TagKind::Lightweight);
+    git(
+        &repo.root,
+        &["checkout", "-qb", "outside", &repo.release_sha],
+    );
+    std::fs::write(repo.root.join("package.json"), "{\"version\":\"0.1.2\"}\n").unwrap();
+    git(&repo.root, &["add", "package.json"]);
+    git(&repo.root, &["commit", "-qm", "outside main"]);
+    git(&repo.root, &["tag", "release-0.1.2"]);
+    git(&repo.root, &["checkout", "-q", "main"]);
+    std::fs::write(repo.root.join("package.json"), "{\"version\":\"0.1.2\"}\n").unwrap();
+    git(&repo.root, &["add", "package.json"]);
+    git(
+        &repo.root,
+        &["commit", "-qm", "main version selects outside candidate"],
+    );
+    let output = run_push(&repo, "success", true, &[]);
+    assert!(!output.status.success());
+    assert!(
+        text(&output.stderr).contains("main"),
+        "{}",
+        text(&output.stderr)
+    );
+    assert!(pushed_refs(&repo).is_empty());
+}
+
+#[test]
+fn declared_prefix_push_preserves_ci_order_and_the_exact_tag_object() {
+    for kind in [TagKind::Lightweight, TagKind::Annotated] {
+        let repo = setup_prefixed("develop", kind);
+        let object = git(&repo.root, &["rev-parse", "refs/tags/release-0.1.1"]);
+        let output = run_push(&repo, "success", true, &[]);
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        assert_eq!(
+            pushed_refs(&repo),
+            [
+                "refs/heads/develop",
+                "refs/heads/main",
+                "refs/tags/release-0.1.1"
+            ]
+        );
+        assert_eq!(remote_sha(&repo.root, "refs/tags/release-0.1.1"), object);
+        let log = log_text(&repo);
+        assert!(
+            log.find("gh run list").unwrap()
+                < log.find("git push origin refs/tags/release-0.1.1").unwrap(),
+            "{log}"
+        );
+    }
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -623,6 +859,7 @@ fn advance_main_after_release(repo: &Repo) -> String {
     )
     .unwrap();
     std::fs::write(repo.root.join("package.json"), "{\"version\":\"0.1.1\"}\n").unwrap();
+    std::fs::write(repo.root.join("shipment.txt"), "after release\n").unwrap();
     git(&repo.root, &["add", "."]);
     git(&repo.root, &["commit", "-qm", "shipment after release"]);
     let tip = git(&repo.root, &["rev-parse", "HEAD"]);
@@ -728,7 +965,7 @@ fn develop_push_still_requires_a_version_tag_at_main_tip() {
     .unwrap();
     let output = run_push(&repo, "success", true, &[]);
     assert!(!output.status.success());
-    assert!(text(&output.stderr).contains("main の SHA に v<semver> の tag がありません"));
+    assert!(text(&output.stderr).contains("main の SHA に宣言した prefix の版 tag がありません"));
     assert_eq!(remote_sha(&repo.root, "refs/tags/v0.1.1"), "");
     assert!(!log_text(&repo).contains("gh "));
 }
@@ -938,5 +1175,239 @@ fn release_push_rejects_a_remote_tag_that_points_at_another_sha() {
     assert_eq!(
         git(&repo.root, &["rev-parse", "refs/tags/v0.1.1"]),
         repo.release_sha
+    );
+}
+
+fn with_declared_subset(mut repo: Repo, integration: &str, version: &str) -> Repo {
+    let root = &repo.root;
+    std::fs::create_dir_all(root.join("ws/member")).unwrap();
+    std::fs::create_dir_all(root.join("side")).unwrap();
+    std::fs::write(
+        root.join("ws/Cargo.toml"),
+        "[workspace]\nmembers=[\"member\"]\n[workspace.package]\nversion=\"0.1.1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("ws/member/Cargo.toml"),
+        "[package]\nname=\"member\"\nversion.workspace=true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("ws/Cargo.lock"),
+        "version=3\n[[package]]\nname=\"member\"\nversion=\"0.1.1\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("side/Cargo.toml"), "[workspace]\n[package]\nname=\"side\"\nversion=\"9.0.0\"\n[dependencies]\nmember={path=\"../ws/member\"}\n").unwrap();
+    std::fs::write(root.join("side/Cargo.lock"), format!("version=3\n[[package]]\nname=\"side\"\nversion=\"9.0.0\"\n[[package]]\nname=\"member\"\nversion=\"{version}\"\n")).unwrap();
+    std::fs::write(root.join(".config/develop-tools.json"), format!(r#"{{"integrationBranch":"{integration}","release":{{"versionFiles":[{{"path":"package.json","kind":"package-json"}},{{"path":"ws/Cargo.toml","kind":"cargo-workspace"}},{{"path":"ws/Cargo.lock","kind":"cargo-lock"}},{{"path":"side/Cargo.lock","kind":"cargo-lock-subset","manifest":"side/Cargo.toml"}}]}}}}"#)).unwrap();
+    git(root, &["add", ".config/develop-tools.json", "ws", "side"]);
+    git(root, &["commit", "-qm", "declared subset"]);
+    git(root, &["update-ref", "refs/heads/main", "HEAD"]);
+    git(root, &["tag", "-d", "v0.1.1"]);
+    git(root, &["tag", "v0.1.1"]);
+    repo.release_sha = git(root, &["rev-parse", "HEAD"]);
+    repo
+}
+
+#[test]
+fn subset_release_push_checks_main_and_ancestor_tag_without_cargo() {
+    for integration in ["develop", "main"] {
+        let repo = with_declared_subset(
+            setup(integration, Workflow::UntrackedOnly, ServerHook::None),
+            integration,
+            "0.1.1",
+        );
+        let root = &repo.root;
+        if integration == "main" {
+            git(
+                root,
+                &["commit", "--allow-empty", "-qm", "main after tagged subset"],
+            );
+        }
+        let tip = git(root, &["rev-parse", "main"]);
+        // A broken worktree cannot override the valid commit selected for publication.
+        std::fs::write(root.join("side/Cargo.lock"), "not TOML").unwrap();
+        let output = run_push(&repo, "success", false, &[]);
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        assert_eq!(remote_sha(root, "refs/heads/main"), tip);
+        assert_eq!(remote_sha(root, "refs/tags/v0.1.1"), repo.release_sha);
+        assert!(!log_text(&repo).contains("gh "));
+    }
+}
+
+#[test]
+fn subset_release_push_rejects_commit_mismatch_before_any_push_even_if_worktree_is_fixed() {
+    let repo = with_declared_subset(
+        setup("develop", Workflow::UntrackedOnly, ServerHook::None),
+        "develop",
+        "0.0.9",
+    );
+    let root = &repo.root;
+    let lock = std::fs::read_to_string(root.join("side/Cargo.lock")).unwrap();
+    std::fs::write(root.join("side/Cargo.lock"), lock.replace("0.0.9", "0.1.1")).unwrap();
+    let output = run_push(&repo, "success", false, &[]);
+    assert!(!output.status.success());
+    let error = text(&output.stderr);
+    assert!(
+        error.contains("subset_validation_failed")
+            && error.contains(&repo.release_sha)
+            && error.contains("side/Cargo.lock"),
+        "{error}"
+    );
+    assert!(error.contains("確認"), "{error}");
+    assert_eq!(remote_sha(root, "refs/heads/main"), repo.previous_sha);
+    assert_eq!(remote_sha(root, "refs/heads/develop"), repo.previous_sha);
+    assert_eq!(remote_sha(root, "refs/tags/v0.1.1"), "");
+    assert!(!log_text(&repo).contains("git push"));
+    assert!(!log_text(&repo).contains("gh "));
+}
+
+#[test]
+fn subset_cargo_parent_symlink_stops_release_push_before_refs_move() {
+    let mut repo = with_declared_subset(
+        setup("develop", Workflow::UntrackedOnly, ServerHook::None),
+        "develop",
+        "0.1.1",
+    );
+    let root = &repo.root;
+    std::fs::create_dir(root.join("conf")).unwrap();
+    std::fs::write(
+        root.join("conf/config.toml"),
+        "[source.crates-io]\nreplace-with=\"shadow\"\n[source.shadow]\ndirectory=\"vendor\"\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("conf", root.join(".cargo")).unwrap();
+    git(root, &["add", ".cargo", "conf"]);
+    git(root, &["commit", "-qm", "symlink cargo parent"]);
+    git(root, &["update-ref", "refs/heads/main", "HEAD"]);
+    git(root, &["tag", "-d", "v0.1.1"]);
+    git(root, &["tag", "v0.1.1"]);
+    repo.release_sha = git(root, &["rev-parse", "HEAD"]);
+    std::fs::remove_file(root.join(".cargo")).unwrap();
+    std::fs::create_dir(root.join(".cargo")).unwrap();
+    let output = run_push(&repo, "success", false, &[]);
+    assert!(
+        !output.status.success(),
+        "commit cargo parent symlink must stop publication"
+    );
+    let error = text(&output.stderr);
+    assert!(
+        error.contains("source_path_invalid")
+            && error.contains(".cargo")
+            && error.contains(&repo.release_sha)
+            && error.contains("確認"),
+        "{error}"
+    );
+    assert_eq!(remote_sha(root, "refs/heads/main"), repo.previous_sha);
+    assert_eq!(remote_sha(root, "refs/heads/develop"), repo.previous_sha);
+    assert_eq!(remote_sha(root, "refs/tags/v0.1.1"), "");
+    assert!(!log_text(&repo).contains("git push"));
+}
+
+#[test]
+fn subset_nested_source_replacement_in_commit_stops_release_push_before_refs_move() {
+    let mut repo = with_declared_subset(
+        setup("develop", Workflow::UntrackedOnly, ServerHook::None),
+        "develop",
+        "0.1.1",
+    );
+    let root = &repo.root;
+    std::fs::create_dir(root.join("side/.cargo")).unwrap();
+    std::fs::write(
+        root.join("side/.cargo/config.toml"),
+        "[source.crates-io]\nreplace-with='shadow'\n[source.shadow]\ndirectory='vendor'\n",
+    )
+    .unwrap();
+    git(root, &["add", "side/.cargo"]);
+    git(root, &["commit", "-qm", "unsupported subset config"]);
+    git(root, &["update-ref", "refs/heads/main", "HEAD"]);
+    git(root, &["tag", "-d", "v0.1.1"]);
+    git(root, &["tag", "v0.1.1"]);
+    repo.release_sha = git(root, &["rev-parse", "HEAD"]);
+    // A supported worktree must not rescue the unsupported publication commit.
+    std::fs::write(root.join("side/.cargo/config.toml"), "").unwrap();
+    let output = run_push(&repo, "success", false, &[]);
+    assert!(!output.status.success());
+    let error = text(&output.stderr);
+    assert!(
+        error.contains("subset_dependency_unsupported")
+            && error.contains(&repo.release_sha)
+            && error.contains("side/.cargo/config.toml")
+            && error.contains("確認"),
+        "{error}"
+    );
+    assert_eq!(remote_sha(root, "refs/heads/main"), repo.previous_sha);
+    assert_eq!(remote_sha(root, "refs/heads/develop"), repo.previous_sha);
+    assert_eq!(remote_sha(root, "refs/tags/v0.1.1"), "");
+    assert!(!log_text(&repo).contains("git push"));
+}
+
+#[test]
+fn ancestor_tag_with_a_non_tree_config_parent_stops_release_push() {
+    let mut accepted = Vec::new();
+    for (kind, mode) in [
+        ("symlink", "120000"),
+        ("blob", "100644"),
+        ("gitlink", "160000"),
+    ] {
+        let mut repo = setup("main", Workflow::UntrackedOnly, ServerHook::None);
+        let root = &repo.root;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace.package]\nversion=\"0.1.1\"\n",
+        )
+        .unwrap();
+        git(root, &["add", "Cargo.toml"]);
+        git(root, &["rm", "--cached", "-r", ".config"]);
+        let object = if kind == "gitlink" {
+            git(root, &["rev-parse", "HEAD"])
+        } else {
+            git(root, &["hash-object", "-w", "package.json"])
+        };
+        git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("{mode},{object},.config"),
+            ],
+        );
+        git(
+            root,
+            &["commit", "-qm", "non-tree ancestor declaration parent"],
+        );
+        repo.release_sha = git(root, &["rev-parse", "HEAD"]);
+        assert!(git(root, &["ls-tree", &repo.release_sha, "--", ".config"]).starts_with(mode));
+        git(root, &["tag", "-d", "v0.1.1"]);
+        git(root, &["tag", "v0.1.1"]);
+        // Current main is valid; refusal must come from the ancestor candidate itself.
+        git(root, &["rm", "--cached", ".config"]);
+        git(root, &["add", ".config"]);
+        git(root, &["commit", "-qm", "restore current declaration"]);
+        let output = run_push(&repo, "success", false, &[]);
+        if output.status.success() {
+            accepted.push(kind);
+            continue;
+        }
+        let error = text(&output.stderr);
+        assert!(
+            error.contains("source_path_invalid")
+                && error.contains(".config")
+                && error.contains(&repo.release_sha)
+                && error.contains("確認"),
+            "{kind}: {error}"
+        );
+        assert_eq!(
+            remote_sha(root, "refs/heads/main"),
+            repo.previous_sha,
+            "{kind}"
+        );
+        assert_eq!(remote_sha(root, "refs/tags/v0.1.1"), "", "{kind}");
+        assert!(!log_text(&repo).contains("git push"), "{kind}");
+    }
+    assert!(
+        accepted.is_empty(),
+        "non-tree .config was published: {accepted:?}"
     );
 }

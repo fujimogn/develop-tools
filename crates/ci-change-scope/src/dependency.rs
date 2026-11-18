@@ -73,7 +73,10 @@ fn tracked(root: &Path) -> Result<BTreeSet<String>, String> {
     let output = crate::process::output_retrying_text_file_busy(&mut command)
         .map_err(|error| error.to_string())?;
     if !output.status.success() {
-        return Err("git ls-files failed".into());
+        return Err(format!(
+            "git ls-files failed; {}",
+            develop_tools_core::process::ChildFailure::from_output(&output)
+        ));
     }
     output
         .stdout
@@ -186,7 +189,13 @@ impl Tree<'_> {
         command.args(["show", &format!(":{path}")]);
         let index = crate::process::output_retrying_text_file_busy(&mut command)
             .map_err(|e| e.to_string())?;
-        if !index.status.success() || index.stdout != bytes {
+        if !index.status.success() {
+            return Err(format!(
+                "index_read_failed: {path}; {}",
+                develop_tools_core::process::ChildFailure::from_output(&index)
+            ));
+        }
+        if index.stdout != bytes {
             return Err(format!("index mismatch: {path}"));
         }
         String::from_utf8(bytes).map_err(|_| format!("non-UTF8: {path}"))

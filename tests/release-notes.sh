@@ -1,10 +1,42 @@
 #!/bin/sh
 set -eu
 
+# Re-enter the public test entrypoint with hostile startup configuration. Every
+# command on PATH is allowlisted; even a regression cannot reach a real gh.
+if [ "${RELEASE_NOTES_SANDBOX:-}" != 1 ]; then
+  sandbox=$(mktemp -d /tmp/develop-meta-gh-isolation-shell-XXXXXXXX)
+  printf 'release-notes sandbox: %s\n' "$sandbox"
+  # Remove only this fixture's known files; never recursively delete a directory.
+  trap 'rm -f -- "$sandbox"/bin/* "$sandbox/hostbin/gh" "$sandbox/host-home/.bashrc" "$sandbox/tripwire"; rmdir -- "$sandbox/bin" "$sandbox/hostbin" "$sandbox/host-home" "$sandbox"' 0
+  mkdir -p "$sandbox/bin" "$sandbox/hostbin" "$sandbox/host-home"
+  for tool in sh bash env awk sha256sum cp dirname mktemp mkdir chmod cat rm ln; do
+    ln -s "$(command -v "$tool")" "$sandbox/bin/$tool"
+  done
+  cat > "$sandbox/hostbin/gh" <<'EOF'
+#!/bin/sh
+printf 'host gh invoked\n' >> "$RELEASE_NOTES_TRIPWIRE"
+exit 97
+EOF
+  chmod +x "$sandbox/hostbin/gh"
+  printf 'PATH="%s/hostbin:$PATH"; export PATH\n' "$sandbox" > "$sandbox/host-home/.bashrc"
+  result=0
+  "$sandbox/bin/env" -i PATH="$sandbox/bin:$sandbox/hostbin" \
+    HOME="$sandbox/host-home" SSH_CLIENT='127.0.0.1 12345 22' \
+    BASH_ENV="$sandbox/host-home/.bashrc" RELEASE_NOTES_SANDBOX=1 \
+    RELEASE_NOTES_TRIPWIRE="$sandbox/tripwire" \
+    "$sandbox/bin/sh" "$0" || result=$?
+  if [ -e "$sandbox/tripwire" ]; then
+    echo 'isolation failed: host gh tripwire was invoked' >&2
+    exit 1
+  fi
+  exit "$result"
+fi
+
 script=$(CDPATH= cd -- "$(dirname -- "$0")/../scripts" && pwd)/release-notes.sh
 workflow=$(CDPATH= cd -- "$(dirname -- "$0")/../.github/workflows" && pwd)/release.yml
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-fixture=$(mktemp -d "${TMPDIR:-/tmp}/release-notes.XXXXXXXX")
+fixture=$(mktemp -d /tmp/develop-meta-gh-isolation-shell-XXXXXXXX)
+printf 'release-notes fixture: %s\n' "$fixture"
 trap 'cd /; rm -r -- "$fixture"' 0
 cd "$fixture"
 
@@ -25,12 +57,20 @@ run_block() {
 run_block gate > gate.sh
 run_block publish > publish.sh
 [ -s gate.sh ] && [ -s publish.sh ]
-mkdir -p bin scripts .github/workflows
+mkdir -p bin home scripts .github/workflows
+for tool in sh bash env awk sha256sum cp; do
+  ln -s "$(command -v "$tool")" "bin/$tool"
+done
 cp "$workflow" .github/workflows/release.yml
 cp "$script" scripts/release-notes.sh
 printf '#!/bin/sh\nexit 0\n' > scripts/check-release-tag.sh
 printf '#!/bin/sh\nexit 0\n' > bin/git
-printf '#!/bin/sh\nprintf "%%s\\n" "$*" > gh.args\ncp release-notes.md gh.notes\n' > bin/gh
+cat > bin/gh <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" > gh.args
+printf '%s\n' "$0" >> gh.calls
+cp release-notes.md gh.notes
+EOF
 chmod +x bin/git bin/gh
 matrix_targets=$(awk '/^[[:space:]]+matrix:/ { m = 1; next } m && /^[[:space:]]+runs-on:/ { exit } m && /^[[:space:]]+target:/ { print $2 }' "$workflow")
 for target in $matrix_targets; do
@@ -38,7 +78,8 @@ for target in $matrix_targets; do
   : > "develop-tools-v0.6.0-$target.tar.gz"
 done
 workflow_step() {
-  PATH="$fixture/bin:$PATH" RELEASE_TAG=$2 bash -e "$1"
+  "$fixture/bin/env" -i PATH="$fixture/bin" HOME="$fixture/home" \
+    RELEASE_TAG="$2" "$fixture/bin/bash" --noprofile --norc -e "$1"
 }
 
 cat > CHANGELOG.md <<'EOF'
@@ -92,13 +133,9 @@ if workflow_step publish.sh v0.7.0 2> publish.err || [ -e gh.args ]; then
 fi
 workflow_step gate.sh v0.6.0
 workflow_step publish.sh v0.6.0
-case $(cat gh.args) in
-  *'--notes-file release-notes.md'*) ;;
-  *) echo 'Release was not created from the notes file' >&2; exit 1 ;;
-esac
-case $(cat gh.args) in
-  *--generate-notes*) echo 'Release still uses generated notes' >&2; exit 1 ;;
-esac
+printf '%s\n' release create v0.6.0 develop-tools-v0.6.0-*.tar.gz SHA256SUMS --verify-tag --title v0.6.0 --notes-file release-notes.md > expected.args
+[ "$(cat gh.args)" = "$(cat expected.args)" ] || { echo 'unexpected gh argv' >&2; exit 1; }
+[ "$(cat gh.calls)" = "$fixture/bin/gh" ] || { echo 'unexpected gh resolution or call count' >&2; exit 1; }
 [ "$(cat gh.notes)" = "$expected" ] || { echo 'Release body is not the changelog section' >&2; exit 1; }
 refuse 0.6.0 'tag without v'
 

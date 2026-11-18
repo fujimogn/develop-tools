@@ -4,8 +4,8 @@
 //! skipped と neutral は成功にしない。design は成功の条件を「すべて成功」とだけ
 //! 書いており、この 2 つは取消とは分けて失敗として conclusion を報告する。
 
-use crate::Version;
 use crate::ci_runs::{self, ListError, RunFilter, WaitError};
+use crate::version_files::{TagSource, VersionFiles};
 use develop_tools_core::cli_help::Help;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -47,11 +47,25 @@ where
     let main_branch = develop_tools_core::RELEASE_BRANCH;
     let main_sha = rev_parse(root, &format!("refs/heads/{main_branch}"))?;
     let main_only = integration == main_branch;
-    let tag = find_tag(root, &main_sha, main_only)?;
+    let (tag, main_versions) = find_tag(root, &main_sha, main_only)?;
     let tag_sha = rev_parse(root, &format!("refs/tags/{tag}^{{commit}}"))?;
     if main_only {
         require_ancestor(root, &tag_sha, &main_sha)?;
     }
+    let versions = match main_versions {
+        Some(versions) if tag_sha == main_sha => versions,
+        Some(_) => return Err(format!("tag {tag} の commit が選択時から変わりました")),
+        None => {
+            let source = TagSource::at(root, &tag_sha)?;
+            if source.parse_tag(&tag).is_none() {
+                return Err(format!(
+                    "tag {tag} はその commit {tag_sha} の release.tagPrefix に一致しません"
+                ));
+            }
+            source.versions()?
+        }
+    };
+    versions.check_tags(std::slice::from_ref(&tag))?;
     let mut integration_ok = false;
 
     if integration != main_branch {
@@ -143,26 +157,26 @@ fn push_ref(root: &Path, namespace: &str, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn find_tag(root: &Path, sha: &str, main_only: bool) -> Result<String, String> {
+fn find_tag(
+    root: &Path,
+    sha: &str,
+    main_only: bool,
+) -> Result<(String, Option<VersionFiles>), String> {
+    // 現在の main には宣言必須・旧配置拒否を適用し、過去 tag 用の互換を持ち込まない。
+    let versions = VersionFiles::load_at(root, sha)?;
     let listed = git_stdout(root, &["tag", "--points-at", sha])?;
     let mut tags = Vec::new();
     for line in listed.lines() {
-        let Some(version) = line.strip_prefix('v') else {
-            continue;
-        };
-        if version.parse::<Version>().is_ok() {
+        if versions.parse_tag(line).is_some() {
             tags.push(line.to_owned());
         }
     }
     tags.sort();
     match tags.len() {
-        1 => Ok(tags.remove(0)),
-        0 if main_only => {
-            let version = crate::version_files::VersionFiles::load_at(root, sha)?.current();
-            Ok(format!("v{version}"))
-        }
+        1 => Ok((tags.remove(0), Some(versions))),
+        0 if main_only => Ok((versions.tag(versions.current()), None)),
         0 => Err(format!(
-            "{} の SHA に v<semver> の tag がありません",
+            "{} の SHA に宣言した prefix の版 tag がありません",
             develop_tools_core::RELEASE_BRANCH
         )),
         _ => Err(format!(

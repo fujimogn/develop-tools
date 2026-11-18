@@ -134,49 +134,7 @@ pub fn create_release_tarball(root: &Path, bin_dir: &Path, archive: &Path) -> Re
     Ok(())
 }
 
-/// `x.y.z` の 3 つ組。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Version {
-    pub major: u64,
-    pub minor: u64,
-    pub patch: u64,
-}
-
-impl std::fmt::Display for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
-    }
-}
-
-impl std::str::FromStr for Version {
-    type Err = String;
-
-    /// **前ゼロ・数字以外（`+1` のような符号を含む）・余分な節を弾く。** `0.1.00` や `0.1.2.3` を
-    /// 通すと、書き戻した文字列と tag 名が食い違って guard がすり抜ける。
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = raw.split('.').collect();
-        if parts.len() != 3 {
-            return Err(format!("semver ではありません: {raw}"));
-        }
-        let mut nums = [0u64; 3];
-        for (slot, part) in nums.iter_mut().zip(parts) {
-            if part.is_empty()
-                || !part.bytes().all(|byte| byte.is_ascii_digit())
-                || (part.len() > 1 && part.starts_with('0'))
-            {
-                return Err(format!("semver ではありません: {raw}"));
-            }
-            *slot = part
-                .parse()
-                .map_err(|_| format!("semver ではありません: {raw}"))?;
-        }
-        Ok(Version {
-            major: nums[0],
-            minor: nums[1],
-            patch: nums[2],
-        })
-    }
-}
+pub use develop_tools_core::release_tag::Version;
 
 /// pre-push で送る release tag 1 件。`tag` は送り先の名前、`object` は local sha（annotated tag なら tag object）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +144,8 @@ pub struct PushedTag {
 }
 
 /// Git pre-push の stdin（`<local ref> <local sha> <remote ref> <remote sha>`）から、
-/// 送り先が `refs/tags/v<semver>` の行だけを取り出す。**名前は remote ref で決める。**
+/// 送り先が tag の行を取り出す。版 tag の判定は送信 commit の規則で行う。
+/// **名前は remote ref で決める。**
 /// `v1.2.3:refs/tags/v9.9.9` や `HEAD:refs/tags/v9.9.9` で作られるのは送り先の tag なので、
 /// local ref で決めると別名の push で照合をすり抜ける。削除の行（local sha が全桁 0）と tag 以外の行は読み飛ばす。
 pub fn pushed_release_tags(input: &str) -> Vec<PushedTag> {
@@ -199,7 +158,6 @@ pub fn pushed_release_tags(input: &str) -> Vec<PushedTag> {
             if object.bytes().all(|b| b == b'0') {
                 return None;
             }
-            tag.strip_prefix('v')?.parse::<Version>().ok()?;
             Some(PushedTag {
                 tag: tag.to_owned(),
                 object: object.to_owned(),
@@ -290,6 +248,20 @@ pub fn stamp_changelog_with_language(
     repo: &str,
     language: develop_tools_core::develop_tools_manifest::NotesLanguage,
 ) -> (String, usize) {
+    stamp_changelog_with_tag(
+        text,
+        &develop_tools_core::release_tag::TagPrefix::default().format(version),
+        repo,
+        language,
+    )
+}
+
+fn stamp_changelog_with_tag(
+    text: &str,
+    tag: &str,
+    repo: &str,
+    language: develop_tools_core::develop_tools_manifest::NotesLanguage,
+) -> (String, usize) {
     use develop_tools_core::changelog_title::{self, Stamp};
 
     let mut count = 0;
@@ -305,7 +277,7 @@ pub fn stamp_changelog_with_language(
         if let Some(parsed) = parsed {
             out.push_str(&line[..parsed.stamp_range.start]);
             out.push_str(&format!(
-                "/[v{version}](https://github.com/{repo}/releases/tag/v{version})"
+                "/[{tag}](https://github.com/{repo}/releases/tag/{tag})"
             ));
             out.push_str(&line[parsed.stamp_range.end..]);
             count += 1;
@@ -316,12 +288,12 @@ pub fn stamp_changelog_with_language(
     (out, count)
 }
 
-/// 事前照合と実書込みで、同じ宣言から同じ移動・刻印の結果を作る。
-pub(crate) fn stamp_changelog_for_notes(
+pub(crate) fn stamp_changelog_with_prefix(
     text: &str,
     version: Version,
     repo: &str,
     notes: Option<release_notes::DeclaredNotes>,
+    prefix: &develop_tools_core::release_tag::TagPrefix,
 ) -> Result<(String, usize), String> {
     use develop_tools_core::develop_tools_manifest::{NotesLanguage, NotesSource};
     let language = notes.map_or(NotesLanguage::Ja, |notes| notes.language);
@@ -329,9 +301,9 @@ pub(crate) fn stamp_changelog_for_notes(
         .filter(|notes| notes.source == NotesSource::ChangelogSection)
         .map(|_| prepare_changelog_section(text, version, language))
         .transpose()?;
-    Ok(stamp_changelog_with_language(
+    Ok(stamp_changelog_with_tag(
         planned.as_deref().unwrap_or(text),
-        version,
+        &prefix.format(version),
         repo,
         language,
     ))
@@ -535,6 +507,28 @@ pub(crate) fn package_version_span(text: &str) -> Result<std::ops::Range<usize>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pushed_tag_candidates_keep_the_existing_stdin_shape_contract() {
+        let input = "\nmalformed\ntwo fields\nHEAD bad refs/heads/topic zero\n(delete) 000 refs/tags/release-9.9.9 zero\nHEAD aaa refs/tags/release-1.2.3 zero\nHEAD bbb refs/tags/archive zero extra\nHEAD ccc refs/tags/v1.2.3\n";
+        assert_eq!(
+            pushed_release_tags(input),
+            vec![
+                PushedTag {
+                    tag: "release-1.2.3".to_owned(),
+                    object: "aaa".to_owned()
+                },
+                PushedTag {
+                    tag: "archive".to_owned(),
+                    object: "bbb".to_owned()
+                },
+                PushedTag {
+                    tag: "v1.2.3".to_owned(),
+                    object: "ccc".to_owned()
+                },
+            ]
+        );
+    }
 
     /// `tools/Cargo.toml` があっても、宣言が無ければ版を読まない。
     #[test]

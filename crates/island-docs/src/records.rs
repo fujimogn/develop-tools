@@ -365,8 +365,8 @@ pub fn changelog_format_with_style(text: &str, style: ChangelogStyle) -> Vec<Fin
             ChangelogStyle::Stamped | ChangelogStyle::StampedEn => develop_core::changelog_title::parse_with_language(line, style.language())
                 .map(|item| item.date.to_owned())
                 .ok_or_else(|| match style {
-                    ChangelogStyle::StampedEn => "この repo は release.changelogStamp を宣言しているので - **Title (YYYY-MM-DD/⏳)**: Body か - **Title (YYYY-MM-DD/[vX.Y.Z](Release URL))**: Body にしてください",
-                    _ => "この repo は release.changelogStamp を宣言しているので - **題（YYYY-MM-DD/⏳）**: 要約 か - **題（YYYY-MM-DD/[vX.Y.Z](Release URL)）**: 要約 にしてください",
+                    ChangelogStyle::StampedEn => "この repo は release.changelogStamp を宣言しているので - **Title (YYYY-MM-DD/⏳)**: Body か - **Title (YYYY-MM-DD/[tagX.Y.Z](Release URL))**: Body にしてください",
+                    _ => "この repo は release.changelogStamp を宣言しているので - **題（YYYY-MM-DD/⏳）**: 要約 か - **題（YYYY-MM-DD/[tagX.Y.Z](Release URL)）**: 要約 にしてください",
                 }.to_owned()),
             ChangelogStyle::Compact => develop_core::changelog_title::parse_legacy_compact(line)
                 .map(|(date, _)| date.to_owned())

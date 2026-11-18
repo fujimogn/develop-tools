@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.20] - 2026-11-18
+
+### Added
+
+- Read the strict, opt-in `ci.skipDocsOnlyPush` boolean from `.config/develop-tools.json`. It defaults to false and cannot be enabled together with `ci.recordOnlySkip`.
+- Support `release.tagPrefix` and declared `release.versionFiles` across release creation and validation. A declared Cargo workspace supplies the version regardless of entry order; repositories without a workspace keep the existing version-file agreement rules. The default tag prefix remains `v`.
+- Support `cargo-lock-subset` entries with an explicit `manifest` for independently resolved Cargo lockfiles. Synchronize only the shared workspace packages, preserving independent packages and their versions. Reject unsupported or inconsistent dependency layouts before writing files, without re-resolving dependencies.
+
+### Changed
+
+- Use each previous tag's own release declaration when selecting the release-note base. Notes, changelog stamps and migration accept declared prefixes alongside historical version links, and reject mismatched display tags, URLs and planned tags.
+- Remove configured attribution clauses from the input copy sent to AI release-note generation. Preserve the original changelog, code, links and ambiguous text; an omitted actor list leaves the input unchanged.
+- Reduce redundant Git processes in pre-push version validation by batching reads of committed files. Ordinary validation does not invoke Cargo metadata, dependency resolution, a build or network access.
+- Update the locked `cc` dependency to 1.11.2.
+
+### Fixed
+
+- Validate a pushed release tag against the declaration and version files in the commit being sent. Reject malformed declaration parents and symlinked Cargo configuration paths instead of falling back to historical compatibility. `release push` requires the current declaration on the release branch.
+- Preserve safe child-process reason codes together with exit codes or signals in release-version, dependency and documentation checks.
+- Reap Git child processes when reading committed version files fails, and avoid probing Cargo files when no version-file declaration requires them.
+
 ## [0.6.19] - 2026-11-14
 
 ### Added

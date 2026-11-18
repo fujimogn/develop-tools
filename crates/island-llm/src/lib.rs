@@ -165,3 +165,104 @@ fn extract_text(response: &Value) -> Option<&str> {
         .get("text")?
         .as_str()
 }
+
+#[cfg(test)]
+mod attribution_settings_tests {
+    use super::settings::{self, SettingsError};
+    use serde_json::{Value, json};
+
+    fn fixture(actors: Option<Value>) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("llm.json");
+        let mut value = json!({
+            "anthropic_api_key_ref": "fake-private-sentinel",
+            "forbidden_terms": ["fake-private-sentinel"],
+            "internal_names": ["fake-private-sentinel"],
+            "usage_ledger": "/fake-private-sentinel/usage.jsonl"
+        });
+        if let Some(actors) = actors {
+            value["release_notes_attribution_actors"] = actors;
+        }
+        std::fs::write(&path, value.to_string()).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn missing_and_empty_actors_disable_editing() {
+        for actors in [None, Some(json!([]))] {
+            let (_dir, path) = fixture(actors);
+            assert_eq!(
+                settings::load(&path)
+                    .unwrap()
+                    .release_notes_attribution_actors(),
+                Ok(vec![])
+            );
+        }
+    }
+
+    #[test]
+    fn actors_trim_deduplicate_and_preserve_literal_identity() {
+        let (_dir, path) = fixture(Some(json!([
+            " 主体A　",
+            "主体A",
+            "Actor",
+            "actor",
+            "é",
+            "é"
+        ])));
+        assert_eq!(
+            settings::load(&path)
+                .unwrap()
+                .release_notes_attribution_actors()
+                .unwrap(),
+            ["主体A", "Actor", "actor", "é", "é"]
+        );
+    }
+
+    #[test]
+    fn invalid_actors_are_rejected_only_by_release_accessor() {
+        let mut invalid = vec![
+            json!(null),
+            json!(true),
+            json!(12),
+            json!({}),
+            json!("主体A"),
+            json!([null]),
+            json!([1]),
+            json!([""]),
+            json!(["　 "]),
+        ];
+        for ch in "\n\r\t\u{0}\u{7f}（）()、,`\\*_[]!<>".chars() {
+            invalid.push(json!([format!("主体{ch}A")]));
+            invalid.push(json!([format!("{ch}主体A")]));
+        }
+        for actors in invalid {
+            let (_dir, path) = fixture(Some(actors));
+            let loaded = settings::load(&path).unwrap();
+            assert!(loaded.usage_ledger().is_some());
+            assert!(loaded.dictionary().is_ok());
+            assert!(loaded.forbidden_terms().is_some());
+            assert_eq!(loaded.key_ref().as_str(), "fake-private-sentinel");
+            assert!(settings::usage_ledger(&path).unwrap().is_some());
+            assert!(settings::presence(&path).unwrap().key_ref);
+            assert_eq!(
+                loaded.release_notes_attribution_actors(),
+                Err(SettingsError::Invalid)
+            );
+        }
+    }
+
+    #[test]
+    fn settings_debug_and_errors_never_expose_private_values() {
+        let (_dir, path) = fixture(Some(json!("fake-private-sentinel")));
+        let loaded = settings::load(&path).unwrap();
+        assert!(!format!("{loaded:?}").contains("fake-private-sentinel"));
+        assert_eq!(
+            format!(
+                "{:?}",
+                loaded.release_notes_attribution_actors().unwrap_err()
+            ),
+            "Invalid"
+        );
+    }
+}

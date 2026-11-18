@@ -36,7 +36,7 @@ pub const RELEASE_BRANCH: &str = "main";
 /// 旧い既定の branch。配布の書き込みは Release と同じく拒む。この文字列はここだけ。
 pub const LEGACY_DEFAULT_BRANCH: &str = "master";
 
-/// ci-develop の spec が push に置く branch。manifest に `integrationBranch` が無いときに使う。
+/// develop 移行検査が案内する対象 branch。repo の統合先は宣言から解決する。
 pub const CI_DEVELOP_BRANCH: &str = "develop";
 
 /// 配布先にしてはならない branch か。

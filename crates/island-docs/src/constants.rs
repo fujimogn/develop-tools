@@ -839,7 +839,7 @@ mod tests {
         let primary = "docs/references/primary-sources/x.md";
         assert!(!is_link_source(Some("example/primary"), primary));
         assert!(is_link_source(Some("owner/other"), primary));
-        assert!(!is_link_source(None, "openspec/changes/archive/x/tasks.md"));
+        assert!(is_link_source(None, "openspec/changes/archive/x/tasks.md"));
         assert!(!is_link_source(None, "README.txt"));
     }
 

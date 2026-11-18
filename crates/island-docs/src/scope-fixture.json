@@ -12,7 +12,6 @@
     { "scope": "example/home", "path": "README.md", "maxBytes": 16000 }
   ],
   "linkSourceExclusions": [
-    { "scope": "all", "prefix": "openspec/changes/archive/" },
     { "scope": "all", "prefix": ".claude/skills/" },
     { "scope": "example/home", "prefix": "Documents/" },
     { "scope": "example/primary", "prefix": "docs/references/primary-sources/" },

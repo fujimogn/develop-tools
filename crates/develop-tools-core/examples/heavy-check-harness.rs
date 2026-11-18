@@ -2,12 +2,14 @@
 //! State probes and independent FIFO process fixtures; never a production CLI.
 use develop_tools_core::heavy_check::queue::Ticket;
 use develop_tools_core::heavy_check::state::{
-    self, Account, AccountSource, NativeFilesystem, OsAccount, StateError, StateLayout,
+    self, Account, AccountSource, FilesystemHooks, NativeFilesystem, OsAccount, State, StateError,
+    StateLayout,
 };
 use develop_tools_core::heavy_check::{Clock, MonotonicClock};
 use std::cell::Cell;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 struct FixtureAccount {
@@ -137,6 +139,8 @@ fn main() {
             || arg == "--inherited-body"
             || arg == "--fake-control"
             || arg == "--isolated-probe"
+            || arg == "--prepare-isolation-fixture"
+            || arg == "--isolation-fixture-probe"
             || arg == "--control-worker"
     }) {
         std::process::exit(inherited_main().unwrap_or_else(|error| {
@@ -521,7 +525,7 @@ fn wait_preserving_family(
 }
 
 fn inherited_main() -> Result<i32, Box<dyn std::error::Error>> {
-    use develop_tools_core::heavy_check::inherited::{InheritedSlot, SLOT_FD_ENV};
+    use develop_tools_core::heavy_check::inherited::InheritedSlot;
     use develop_tools_core::heavy_check::supervisor::{self, Family, SlotSender, Supervision};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
@@ -529,6 +533,16 @@ fn inherited_main() -> Result<i32, Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     let role = args.next().unwrap();
     let home = PathBuf::from(args.next().unwrap());
+    if role == "--prepare-isolation-fixture" || role == "--isolation-fixture-probe" {
+        let account = FixtureAccount { home };
+        let hooks = IsolationFixtureAncestors::new(&account.home)?;
+        let state = state::prepare(&account, &StateLayout::default(), &hooks)?;
+        return if role == "--isolation-fixture-probe" {
+            probe_isolated_slot(&state)
+        } else {
+            Ok(0)
+        };
+    }
     let executable = std::env::current_exe()?;
     if role == "--control-worker" {
         let sender = SlotSender::from_environment()?.ok_or("missing control identity")?;
@@ -605,16 +619,7 @@ fn inherited_main() -> Result<i32, Box<dyn std::error::Error>> {
         &NativeFilesystem,
     )?;
     if role == "--isolated-probe" {
-        if std::env::var_os(SLOT_FD_ENV).is_some() {
-            return Err("fixture retained real identity".into());
-        }
-        let result =
-            unsafe { libc::flock(state.slot().as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        return if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
-            Ok(0)
-        } else {
-            Err("outer real slot was unlocked".into())
-        };
+        return probe_isolated_slot(&state);
     }
     if role == "--inherited-worker" {
         let sender = SlotSender::from_environment()?.ok_or("missing control identity")?;
@@ -642,6 +647,56 @@ fn inherited_main() -> Result<i32, Box<dyn std::error::Error>> {
         .arg(group.to_string());
     inherited.configure_payload(&mut command);
     Ok(supervisor::spawn(&mut command)?.wait()?.code().unwrap_or(1))
+}
+
+struct IsolationFixtureAncestors<'a> {
+    home: &'a Path,
+    unmapped_owner: Option<u32>,
+}
+
+impl<'a> IsolationFixtureAncestors<'a> {
+    fn new(home: &'a Path) -> io::Result<Self> {
+        let unmapped_owner = if cfg!(target_os = "linux") {
+            let overflow_uid = std::fs::read_to_string("/proc/sys/kernel/overflowuid")?
+                .trim()
+                .parse::<u32>()
+                .map_err(io::Error::other)?;
+            (std::fs::metadata("/")?.uid() == overflow_uid).then_some(overflow_uid)
+        } else {
+            None
+        };
+        Ok(Self {
+            home,
+            unmapped_owner,
+        })
+    }
+}
+
+impl FilesystemHooks for IsolationFixtureAncestors<'_> {
+    fn owner(&self, path: &Path, actual: u32) -> u32 {
+        // CI tool view leaves host root's UID unmapped. This fixture tests
+        // lock inheritance, so model the host's ownership of its ancestors.
+        if Some(actual) == self.unmapped_owner && path != self.home && self.home.starts_with(path) {
+            0
+        } else {
+            actual
+        }
+    }
+}
+
+fn probe_isolated_slot(state: &State) -> Result<i32, Box<dyn std::error::Error>> {
+    use develop_tools_core::heavy_check::inherited::SLOT_FD_ENV;
+    use std::os::fd::AsRawFd;
+
+    if std::env::var_os(SLOT_FD_ENV).is_some() {
+        return Err("fixture retained real identity".into());
+    }
+    let result = unsafe { libc::flock(state.slot().as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+        Ok(0)
+    } else {
+        Err("outer real slot was unlocked".into())
+    }
 }
 
 // I5 fixture roles keep protocol bytes off the payload's standard streams.

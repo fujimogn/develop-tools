@@ -66,6 +66,10 @@ pub enum Finding {
         bytes: usize,
         max_bytes: usize,
     },
+    ResidentAnnotation {
+        path: String,
+        line: usize,
+    },
     Rule(RuleFinding),
 }
 
@@ -88,6 +92,10 @@ impl fmt::Display for Finding {
                 bytes,
                 max_bytes,
             } => write!(f, "{path}: 容量上限を超えています {bytes}B > {max_bytes}B"),
+            Self::ResidentAnnotation { path, line } => write!(
+                f,
+                "{path}:{line}: [resident-annotation] 常駐文書の決定日・決定者の注記は記録文書へ移してください"
+            ),
             Self::Rule(finding) => finding.fmt(f),
         }
     }
@@ -98,8 +106,6 @@ impl fmt::Display for Finding {
 pub struct Outcome {
     pub findings: Vec<Finding>,
     pub checked: usize,
-    /// 案内のみ。検査の失敗には数えない。
-    pub warnings: Vec<String>,
 }
 
 /// `entries`（index か commit tree）から scope 表の写しの entry を選ぶ。
@@ -326,17 +332,13 @@ pub fn evaluate(input: &Input) -> Outcome {
             findings.push(Finding::Rule(finding));
         }
     }
-    let warnings = resident_annotation_warnings(input);
-    Outcome {
-        findings,
-        checked,
-        warnings,
-    }
+    findings.extend(resident_annotation_findings(input));
+    Outcome { findings, checked }
 }
 
 /// 起動計測と同じ profile 表と import 行の抽出を使い、index 内の import をたどる。
 /// HOME や未 staged の本文は参照しない。解決は index と links のまま。
-fn resident_annotation_warnings(input: &Input) -> Vec<String> {
+fn resident_annotation_findings(input: &Input) -> Vec<Finding> {
     use develop_core::resident_docs::{RULES, import_target};
     let documents: BTreeMap<_, _> = input
         .snapshot
@@ -384,9 +386,9 @@ fn resident_annotation_warnings(input: &Input) -> Vec<String> {
             }
         }
     }
-    let mut warnings = Vec::new();
+    let mut findings = Vec::new();
     for path in resident {
-        // 記録への import があっても履歴の注記を警告しない。
+        // 記録への import があっても履歴の注記は検査しない。
         if path == crate::constants::TODO_PATH
             || path == crate::constants::CHANGELOG_PATH
             || crate::constants::is_index_record_path(&path)
@@ -407,12 +409,15 @@ fn resident_annotation_warnings(input: &Input) -> Vec<String> {
                     !(note.as_str().starts_with('(') && text[..note.start()].ends_with(']'))
                         && RESIDENT_NOTE_CONTENT.is_match(note.as_str())
                 }) {
-                    warnings.push(format!("{path}:{}: [resident-annotation] 常駐文書の決定日・決定者の注記は記録文書へ移してください", line + 1));
+                    findings.push(Finding::ResidentAnnotation {
+                        path: path.clone(),
+                        line: line + 1,
+                    });
                 }
             }
         }
     }
-    warnings
+    findings
 }
 
 static RESIDENT_ANNOTATION: LazyLock<Regex> =

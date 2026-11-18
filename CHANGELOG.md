@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.21] - 2026-11-18
+
+### Changed
+
+- Treat decision-date and decision-author annotations in resident documents as documentation errors. A matching line now fails a check even if it is the only finding. The documents scanned and the one-finding-per-line rule are unchanged.
+
+### Fixed
+
+- Check relative links in archived specifications as part of the standard documentation scope.
+
 ## [0.6.20] - 2026-11-18
 
 ### Added

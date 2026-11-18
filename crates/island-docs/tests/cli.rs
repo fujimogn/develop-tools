@@ -7,35 +7,109 @@ use std::process::{Command, Output};
 const BIN: &str = env!("CARGO_BIN_EXE_develop-docs-check");
 
 #[test]
-fn resident_annotation_is_a_warning_in_the_staged_snapshot() {
-    let dir = island_repo(None);
-    write(
-        dir.path(),
-        "AGENTS.md",
-        "# agents\n規約（owner 決定 2026-11-13）\n",
-    );
-    git(dir.path(), &["add", "."]);
-    write(
-        dir.path(),
-        "AGENTS.md",
-        "# agents\n注記を消した未 staged 編集\n",
-    );
-    let out = run(dir.path(), &["--staged"]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains("warning: AGENTS.md:2: [resident-annotation]"),
-        "{}",
-        stderr(&out)
-    );
+fn resident_annotations_fail_the_staged_check() {
+    assert_resident_annotation_failure("--staged");
 }
 
 #[test]
-fn resident_imports_and_rules_warn_but_records_and_unstaged_notes_do_not() {
+fn resident_annotations_fail_the_tracked_check() {
+    assert_resident_annotation_failure("--tracked");
+}
+
+#[test]
+fn resident_annotations_fail_the_range_check() {
+    assert_resident_annotation_failure("--range");
+}
+
+fn assert_resident_annotation_failure(mode: &str) {
+    let mut exit_codes = Vec::new();
+    for profile in ["default", "public-independent"] {
+        let (dir, base) = resident_annotation_fixture(profile);
+        let mut args = vec![mode];
+        let range_head;
+        if mode == "--range" {
+            git(dir.path(), &["commit", "-qm", "resident annotations"]);
+            range_head = head(dir.path());
+            args.extend([base.as_str(), range_head.as_str()]);
+        }
+        let out = run(dir.path(), &args);
+        let err = stderr(&out);
+        let locations: Vec<_> = err
+            .lines()
+            .filter_map(|line| line.split_once(": [resident-annotation]"))
+            .map(|(location, _)| {
+                location
+                    .strip_prefix("develop-docs-check: ")
+                    .expect("診断のCLI名")
+                    .trim_start_matches("warning: ")
+            })
+            .collect();
+        let mut expected = [
+            ".claude/lessons/general.md:2",
+            ".claude/rules/tests.md:2",
+            "AGENTS.md:5",
+        ]
+        .to_vec();
+        if mode == "--tracked" {
+            expected.push("GEMINI.md:2");
+        }
+        assert_eq!(locations, expected, "{mode} {profile}: {err}");
+        exit_codes.push(out.status.code());
+        if out.status.code() == Some(1) {
+            assert_eq!(
+                err.lines().count(),
+                expected.len() + 1,
+                "{mode} {profile}: {err}"
+            );
+            assert!(
+                err.lines().all(|line| !line.contains("warning:")),
+                "{mode} {profile}: {err}"
+            );
+            assert!(
+                err.contains(&format!("{} 件の問題があります", expected.len())),
+                "{mode} {profile}: {err}"
+            );
+        }
+        eprintln!("{mode} {profile} exit={:?}\n{err}", out.status.code());
+    }
+    assert_eq!(
+        exit_codes,
+        [Some(1), Some(1)],
+        "{mode} (default, public-independent)"
+    );
+}
+
+fn resident_annotation_fixture(profile: &str) -> (tempfile::TempDir, String) {
     let dir = island_repo(None);
+    if profile == "public-independent" {
+        write(
+            dir.path(),
+            ".config/develop-tools.json",
+            r#"{"docsProfile":"public-independent"}"#,
+        );
+    }
+    git(dir.path(), &["add", "."]);
+    let clean = run(dir.path(), &["--tracked"]);
+    assert_eq!(clean.status.code(), Some(0), "{}", stderr(&clean));
+    let invalid = run(dir.path(), &["--range", "HEAD", "missing-head"]);
+    assert_eq!(invalid.status.code(), Some(2), "{}", stderr(&invalid));
+    write(
+        dir.path(),
+        "GEMINI.md",
+        "# gemini\n既存の注記（2026-11-13）\n",
+    );
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "base"]);
+    let base = head(dir.path());
+    write(
+        dir.path(),
+        "AGENTS.md",
+        "# agents\n対象（HTTP 400/500）\n目安（100-200 行）\n[手順](docs/reviews/2026-11-13-record.md)\n規約（owner 決定 2026-11-13）（藤井決定）\n",
+    );
     write(
         dir.path(),
         "CLAUDE.md",
-        "# claude\n@.claude/lessons/general.md\n@TODO.md\n@docs/reviews/record.md\n@docs/adr/0001-test.md\n@CHANGELOG.md\n",
+        "# claude\n@.claude/lessons/general.md\n@TODO.md\n@docs/reviews/2026-11-13-record.md\n@docs/adr/0001-test.md\n@CHANGELOG.md\n",
     );
     write(
         dir.path(),
@@ -59,7 +133,7 @@ fn resident_imports_and_rules_warn_but_records_and_unstaged_notes_do_not() {
     );
     write(
         dir.path(),
-        "docs/reviews/record.md",
+        "docs/reviews/2026-11-13-record.md",
         "# Record\n（owner 決定 2026-11-13）\n",
     );
     write(
@@ -76,24 +150,15 @@ fn resident_imports_and_rules_warn_but_records_and_unstaged_notes_do_not() {
     write(
         dir.path(),
         "AGENTS.md",
-        "# agents\n（owner 決定 2026-11-13）\n",
+        "# agents\n別の行に入った未 staged 注記（2026-11-13）\n",
     );
-    let out = run(dir.path(), &["--staged"]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    let warnings: Vec<_> = stderr(&out)
-        .lines()
-        .filter(|line| line.contains("warning:"))
-        .map(str::to_owned)
-        .collect();
-    assert_eq!(warnings.len(), 2, "{warnings:?}");
-    assert!(
-        warnings[0].contains(".claude/lessons/general.md:2:"),
-        "{warnings:?}"
+    write(
+        dir.path(),
+        "CHANGELOG.md",
+        "# Changelog\n\n> 古い分は git 履歴に任せる。\n\n## 2026-09\n\n- **成果（2026-09-30）**: 要約（藤井決定）。\n",
     );
-    assert!(
-        warnings[1].contains(".claude/rules/tests.md:2:"),
-        "{warnings:?}"
-    );
+    git(dir.path(), &["add", "CHANGELOG.md"]);
+    (dir, base)
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -753,6 +818,7 @@ fn help_uses_the_shared_sections() {
         "Default:",
         "Writes:",
         "Exit:",
+        "1 = 問題あり（常駐文書の決定日・決定者の注記 [resident-annotation] を含む）",
         "Examples:",
     ] {
         assert!(text.contains(section), "{section}\n{text}");
@@ -770,6 +836,52 @@ fn a_mode_is_required_and_modes_are_exclusive() {
         let out = run(dir.path(), args);
         assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
     }
+}
+
+#[test]
+fn tracked_checks_archive_link_depth_and_anchor() {
+    let dir = island_repo(None);
+    write(
+        dir.path(),
+        "docs/README.md",
+        "# docs\n\n[ADR](adr/README.md)\n\n## Target\n",
+    );
+    write(
+        dir.path(),
+        "openspec/changes/archive/change/tasks.md",
+        "# Tasks\n\n[target](../../../../../docs/README.md#target)\n",
+    );
+    git(dir.path(), &["add", "."]);
+
+    let out = run(dir.path(), &["--tracked"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        "develop-docs-check: openspec/changes/archive/change/tasks.md:3: repo の外を指しています -> ../../../../../docs/README.md#target\ndevelop-docs-check: 1 件の問題があります\n",
+    );
+
+    write(
+        dir.path(),
+        "openspec/changes/archive/change/tasks.md",
+        "# Tasks\n\n[target](../../../../docs/README.md#target)\n",
+    );
+    git(dir.path(), &["add", "."]);
+    let out = run(dir.path(), &["--tracked"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stderr(&out).is_empty(), "{}", stderr(&out));
+
+    write(
+        dir.path(),
+        "openspec/changes/archive/change/tasks.md",
+        "# Tasks\n\n[target](../../../../docs/README.md#missing)\n",
+    );
+    git(dir.path(), &["add", "."]);
+    let out = run(dir.path(), &["--tracked"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        "develop-docs-check: openspec/changes/archive/change/tasks.md:3: リンク先に見出しがありません -> ../../../../docs/README.md#missing\ndevelop-docs-check: 1 件の問題があります\n",
+    );
 }
 
 #[test]
@@ -2332,7 +2444,7 @@ fn resident_links_and_approval_procedures_are_not_decision_notes() {
 }
 
 #[test]
-fn resident_numeric_ranges_are_not_dates_and_fullwidth_notes_after_links_warn() {
+fn resident_numeric_ranges_are_not_dates_and_fullwidth_notes_after_links_fail() {
     let dir = island_repo(None);
     write(
         dir.path(),
@@ -2341,15 +2453,15 @@ fn resident_numeric_ranges_are_not_dates_and_fullwidth_notes_after_links_warn() 
     );
     git(dir.path(), &["add", "."]);
     let out = run(dir.path(), &["--staged"]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    let warnings: Vec<_> = stderr(&out)
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    let findings: Vec<_> = err
         .lines()
         .filter(|line| line.contains("[resident-annotation]"))
-        .map(str::to_owned)
         .collect();
-    assert_eq!(warnings.len(), 2, "{warnings:?}");
-    assert!(warnings[0].contains("AGENTS.md:5:"), "{warnings:?}");
-    assert!(warnings[1].contains("AGENTS.md:6:"), "{warnings:?}");
+    assert_eq!(findings.len(), 2, "{err}");
+    assert!(findings[0].contains("AGENTS.md:5:"), "{err}");
+    assert!(findings[1].contains("AGENTS.md:6:"), "{err}");
 }
 
 /// 公開 CLI の同じ index が、選択した組と未宣言で異なる規則を適用する。
@@ -2388,7 +2500,7 @@ fn docs_profile_selects_public_independent_and_defaults_to_all_rules() {
 }
 
 #[test]
-fn public_docs_profile_keeps_links_index_capacity_and_resident_warnings() {
+fn public_docs_profile_keeps_links_index_capacity_and_resident_errors() {
     let dir = repo(None);
     write(
         dir.path(),

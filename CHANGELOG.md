@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.22] - 2026-11-22
+
+### Added
+
+- Record which annotated release tag adopted a verified AI release-note body. The record is appended to the Git common directory right after the tag is created; a failure to record warns and lets the release continue.
+
+### Fixed
+
+- Match monthly changelog items by title and completion date when extracting release notes, so new items next to a revised existing item are no longer dropped as edits. Only additions whose title and completion date match a removed item are treated as edits; additions that cannot be identified are still excluded with a warning.
+
 ## [0.6.21] - 2026-11-18
 
 ### Changed

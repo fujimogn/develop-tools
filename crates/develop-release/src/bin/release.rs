@@ -44,7 +44,7 @@ fn run() -> Result<(), String> {
             "Advance declared version files on the integration branch, fast-forward {release}, then create a local tag. It does not push. Publish with release push. When .config/develop-tools.json (or the legacy .develop-tools.json during migration) declares platforms, the latest release check run on HEAD must have a successful job for every declared OS; run release check first. When it declares release.notes, the tag is annotated with the release body; mode ai makes one Anthropic API request for the body and falls back to the CHANGELOG extract when that is not usable. A changelog-section body (mode or fallback) needs exactly one non-empty dated section for the version (## X.Y.Z (YYYY-MM-DD) or ## [X.Y.Z] - YYYY-MM-DD) in CHANGELOG.md at HEAD. A tagless stamped monthly changelog-additions release instead requires --first-release-base with a full commit or tree OID; the full diff must match every pending monthly item. --no-ai skips the request."
         );
         let writes = format!(
-            "files declared by release.versionFiles, and root CHANGELOG.md when release.changelogStamp is true; creates a git commit, advances {release}, and creates a tag using release.tagPrefix (default v; annotated when release.notes is declared); no remote push. With release.notes mode ai and without --no-ai, sends the scrubbed CHANGELOG items to Anthropic once and records AI fallback reasons (timestamp_unix_seconds, tag, reason_code only) in release-notes-fallback.jsonl in the common Git directory, warning with fallback_reason_unrecorded if recording fails while continuing the release; appends one row per API request to the usage ledger named by usage_ledger in ~/.config/develop-tools/llm.json (without that field, nothing is sent). A first release skips inference and uses the version section, or the fixed monthly diff when --first-release-base is supplied. Publish with release push."
+            "files declared by release.versionFiles, and root CHANGELOG.md when release.changelogStamp is true; creates a git commit, advances {release}, and creates a tag using release.tagPrefix (default v; annotated when release.notes is declared); no remote push. With release.notes mode ai and without --no-ai, sends the scrubbed CHANGELOG items to Anthropic once and records AI fallback reasons (timestamp_unix_seconds, tag, reason_code only) in release-notes-fallback.jsonl in the common Git directory, warning with fallback_reason_unrecorded if recording fails while continuing the release; appends one row per API request to the usage ledger named by usage_ledger in ~/.config/develop-tools/llm.json (without that field, nothing is sent). After creating a tag with validated AI notes, appends timestamp_unix_seconds, tag and tag_object_oid to release-notes-success.jsonl in the common Git directory. If recording fails, warns with release_notes_success_unrecorded and continues. A first release skips inference and uses the version section, or the fixed monthly diff when --first-release-base is supplied. Publish with release push."
         );
         print!(
             "{}",
@@ -158,10 +158,10 @@ fn run() -> Result<(), String> {
     }
     // **ここで失敗すると main だけ進んだ部分完了になる。** 作り直す手順を添えて止める。
     let tagged = match &body {
-        Some(body) => release_notes::annotate_tag(&root, &tag, &released, &body.text),
-        None => git(&root, &["tag", &tag, &released]).map(drop),
+        Some(body) => release_notes::annotate_release_tag(&root, &tag, &released, body),
+        None => git(&root, &["tag", &tag, &released]).map(|_| None),
     };
-    tagged.map_err(|err| {
+    let recording_warning = tagged.map_err(|err| {
         let advanced = if integration_branch == RELEASE_BRANCH {
             format!("{RELEASE_BRANCH} に版 commit {released} を作りました")
         } else {
@@ -178,6 +178,9 @@ fn run() -> Result<(), String> {
         };
         format!("{err}\n{advanced}が、tag {tag} は作れていません。{recreate}")
     })?;
+    if let Some(code) = recording_warning {
+        eprintln!("警告: {code}");
+    }
     println!(
         "✓ {integration_branch} に版 commit、{RELEASE_BRANCH} を fast-forward、同じ SHA に tag {tag} を作成"
     );

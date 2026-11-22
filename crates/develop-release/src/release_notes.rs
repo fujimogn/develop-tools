@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 /// clone 内で共有し、worktree を外しても理由を残す。usage 台帳とは分ける。
 const FALLBACK_LOG: &str = "release-notes-fallback.jsonl";
+const SUCCESS_LOG: &str = "release-notes-success.jsonl";
 
 use develop_tools_core::develop_tools_manifest::{
     self, NotesAudience, NotesLanguage, NotesMode, NotesSource, ReleaseNotes,
@@ -228,9 +229,59 @@ struct ChangelogAdditions {
     error: Option<String>,
 }
 
-/// Unchanged context or diff metadata ends a change run. If an old monthly item
-/// was removed, its replacements have no stable identity and cannot safely be
-/// called new items.
+type ItemIdentity<'a> = (&'a str, &'a str);
+
+fn item_identity(item: &str, language: NotesLanguage) -> Option<ItemIdentity<'_>> {
+    use develop_tools_core::changelog_title;
+
+    if let Some(parsed) = changelog_title::parse_with_language(item, language) {
+        return Some((parsed.title, parsed.date));
+    }
+    let rest = item.strip_prefix(crate::CHANGELOG_TITLE_PREFIX)?;
+    let title = &rest[..changelog_title::title_closing_marker(rest)?];
+    if let Some((date, _)) = changelog_title::parse_legacy_compact(item) {
+        return Some((title, date));
+    }
+    let date = changelog_title::parse_dated(item, language)?;
+    let opener = match language {
+        NotesLanguage::Ja => "（",
+        NotesLanguage::En => " (",
+    };
+    let start = title.rmatch_indices(opener).find_map(|(index, _)| {
+        title[index + opener.len()..]
+            .starts_with(date)
+            .then_some(index)
+    })?;
+    Some((&title[..start], date))
+}
+
+struct AddedItem<'a> {
+    line: &'a str,
+    identity: Option<ItemIdentity<'a>>,
+    uncertain: bool,
+}
+
+#[derive(Default)]
+struct ChangeRun {
+    additions_start: usize,
+    removed_item: bool,
+    unknown_removal: bool,
+}
+
+impl ChangeRun {
+    fn finish(&mut self, additions: &mut [AddedItem<'_>]) {
+        if self.removed_item {
+            for item in &mut additions[self.additions_start..] {
+                item.uncertain = self.unknown_removal || item.identity.is_none();
+            }
+        }
+        *self = Self {
+            additions_start: additions.len(),
+            ..Self::default()
+        };
+    }
+}
+
 #[cfg(test)]
 fn changelog_additions(diff: &str, tag: &str) -> ChangelogAdditions {
     changelog_additions_with_language(diff, tag, NotesLanguage::Ja)
@@ -244,20 +295,13 @@ fn changelog_additions_with_language(
     let mut result = ChangelogAdditions::default();
     let mut old = MonthlyItems::default();
     let mut new = MonthlyItems::default();
-    let mut pending = Vec::new();
-    let mut removed_item = false;
-    let flush = |result: &mut ChangelogAdditions, pending: &mut Vec<String>, removed: &mut bool| {
-        if *removed {
-            result.edited.append(pending);
-        } else {
-            result.items.append(pending);
-        }
-        *removed = false;
-    };
+    let mut removed = BTreeSet::new();
+    let mut additions = Vec::new();
+    let mut run = ChangeRun::default();
     let mut in_hunk = false;
     for line in diff.lines() {
         if line.starts_with("@@ ") {
-            flush(&mut result, &mut pending, &mut removed_item);
+            run.finish(&mut additions);
             in_hunk = true;
             continue;
         }
@@ -265,36 +309,61 @@ fn changelog_additions_with_language(
             continue;
         }
         let Some((prefix, content)) = line.split_at_checked(1) else {
-            flush(&mut result, &mut pending, &mut removed_item);
+            run.finish(&mut additions);
             continue;
         };
         match prefix {
-            "-" => removed_item |= old.step(content),
+            "-" => {
+                if old.step(content) {
+                    run.removed_item = true;
+                    if let Some(identity) = item_identity(content, language) {
+                        removed.insert(identity);
+                    } else {
+                        run.unknown_removal = true;
+                    }
+                }
+            }
             "+" => {
                 if new.step(content) {
                     match released_for_other_tag(content, tag, language) {
-                        Ok(false) => pending.push(content.to_owned()),
+                        Ok(false) => additions.push(AddedItem {
+                            line: content,
+                            identity: item_identity(content, language),
+                            uncertain: false,
+                        }),
                         Ok(true) => {}
                         Err(error) => result.error = Some(error),
                     }
                 }
             }
             " " => {
-                flush(&mut result, &mut pending, &mut removed_item);
+                run.finish(&mut additions);
                 old.step(content);
                 new.step(content);
             }
             // Git's no-newline marker belongs to the current change run.
             "\\" => {}
-            _ => flush(&mut result, &mut pending, &mut removed_item),
+            _ => run.finish(&mut additions),
         }
     }
-    flush(&mut result, &mut pending, &mut removed_item);
+    run.finish(&mut additions);
+    // A rewritten item can be moved to a different change run.
+    for item in additions {
+        if item.uncertain
+            || item
+                .identity
+                .is_some_and(|identity| removed.contains(&identity))
+        {
+            result.edited.push(item.line.to_owned());
+        } else {
+            result.items.push(item.line.to_owned());
+        }
+    }
     result
 }
 
 /// 全行の文脈を含む diff から、月別節に純粋に追加された項目を採る。
-/// 旧項目の削除と同じ連続変更区間にある追加は編集とみなし、警告して除く。
+/// 同じ題・完了日の編集と、同一性が不明な置換は警告して除く。
 pub fn extract_changelog_additions(diff: &str, tag: &str) -> Vec<String> {
     checked_changelog_additions(diff, tag).unwrap_or_else(|error| {
         eprintln!("{error}");
@@ -326,7 +395,7 @@ fn additions_with_language(
     }
     if !result.edited.is_empty() && human_warning {
         eprintln!(
-            "警告: 既存項目の削除を含む変更区間のため、以下を Release 本文から除外しました。新規項目が混ざっている場合は tag 注釈に補ってください。\n{}",
+            "警告: 既存項目の編集または同一性を判定できない変更のため、以下を Release 本文から除外しました。新規項目が混ざっている場合は tag 注釈に補ってください。\n{}",
             result.edited.join("\n")
         );
     } else if !result.edited.is_empty() {
@@ -1584,8 +1653,11 @@ fn section_at(
     })
 }
 
-/// 本文や環境設定を受け取らず、既存の code と対象 tag だけを保存する。
-fn record_fallback(root: &Path, tag: &str, code: &str) -> std::io::Result<()> {
+fn append_notes_record(
+    root: &Path,
+    file: &str,
+    row: impl FnOnce(u64) -> serde_json::Value,
+) -> std::io::Result<()> {
     let common = git(
         root,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -1595,18 +1667,39 @@ fn record_fallback(root: &Path, tag: &str, code: &str) -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(std::io::Error::other)?
         .as_secs();
-    let mut line = serde_json::to_vec(&serde_json::json!({
-        "timestamp_unix_seconds": timestamp,
-        "tag": tag,
-        "reason_code": code,
-    }))
-    .map_err(std::io::Error::other)?;
+    let mut line = serde_json::to_vec(&row(timestamp)).map_err(std::io::Error::other)?;
     line.push(b'\n');
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(Path::new(&common).join(FALLBACK_LOG))?
+        .open(Path::new(&common).join(file))?
         .write_all(&line)
+}
+
+/// 本文や環境設定を受け取らず、既存の code と対象 tag だけを保存する。
+fn record_fallback(root: &Path, tag: &str, code: &str) -> std::io::Result<()> {
+    append_notes_record(root, FALLBACK_LOG, |timestamp| {
+        serde_json::json!({
+            "timestamp_unix_seconds": timestamp,
+            "tag": tag,
+            "reason_code": code,
+        })
+    })
+}
+
+fn record_success(root: &Path, tag: &str) -> std::io::Result<()> {
+    let oid = git(
+        root,
+        &["rev-parse", "--verify", &format!("refs/tags/{tag}^{{tag}}")],
+    )
+    .map_err(std::io::Error::other)?;
+    append_notes_record(root, SUCCESS_LOG, |timestamp| {
+        serde_json::json!({
+            "timestamp_unix_seconds": timestamp,
+            "tag": tag,
+            "tag_object_oid": oid,
+        })
+    })
 }
 
 fn fallback_recording_failed(root: &Path, tag: &str, body: &ReleaseBody) -> bool {
@@ -1793,6 +1886,20 @@ fn ai_body(
     })
 }
 
+/// 通常 release の注釈付き tag を作り、AI 本文が採用された場合は採用記録を残す。
+/// tag 作成後に記録できなかった場合は、呼び出し側で表示する警告 code を返す。
+pub fn annotate_release_tag(
+    root: &Path,
+    tag: &str,
+    sha: &str,
+    body: &ReleaseBody,
+) -> Result<Option<&'static str>, String> {
+    annotate_tag(root, tag, sha, &body.text)?;
+    let recording_failed =
+        matches!(body.source, BodySource::Ai { .. }) && record_success(root, tag).is_err();
+    Ok(recording_failed.then_some("release_notes_success_unrecorded"))
+}
+
 /// `sha` に注釈付き tag を作る。本文は stdin で渡し、`#` の行も消さない（`--cleanup=verbatim`）。
 pub fn annotate_tag(root: &Path, tag: &str, sha: &str, body: &str) -> Result<(), String> {
     use std::io::Write;
@@ -1852,6 +1959,20 @@ mod rewritten_item_tests {
         assert_eq!(
             result.edited,
             ["- **renamed**: short", "- **ambiguous new**"]
+        );
+    }
+
+    #[test]
+    fn moved_item_is_compared_across_change_runs_and_stamp_formats() {
+        let diff = "@@ -1,3 +1,4 @@\n ## 2026-10\n-- **Existing item** 2026-10-20 ⏳: Old summary\n ### Details\n+- **Existing item (2026-10-20/v1.0.0)**: Updated summary\n+- **New item (2026-10-20/⏳)**: New summary\n";
+        let result = changelog_additions_with_language(diff, "v1.0.0", NotesLanguage::En);
+        assert_eq!(
+            result.edited,
+            ["- **Existing item (2026-10-20/v1.0.0)**: Updated summary"]
+        );
+        assert_eq!(
+            result.items,
+            ["- **New item (2026-10-20/⏳)**: New summary"]
         );
     }
 

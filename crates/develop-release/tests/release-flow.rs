@@ -1,5 +1,5 @@
 use develop_release::release_notes::{
-    AiRuntime, BodySource, DeclaredNotes, FixedNotes, NotesPlan, ReleaseBody, annotate_tag,
+    AiRuntime, BodySource, DeclaredNotes, FixedNotes, NotesPlan, ReleaseBody, annotate_release_tag,
     extract_release, prepare_notes, release_body,
 };
 use develop_tools_core::develop_tools_manifest::{NotesLanguage, NotesSource};
@@ -2037,6 +2037,18 @@ fn tag_contents(root: &Path, tag: &str) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn success_log(root: &Path) -> std::path::PathBuf {
+    // Fixture の主 checkout が Git 共通管理領域を持つ。
+    root.join(".git/release-notes-success.jsonl")
+}
+
 #[test]
 fn ai_notes_become_the_annotated_tag_body_after_exactly_one_request() {
     let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
@@ -2076,13 +2088,115 @@ fn ai_notes_become_the_annotated_tag_body_after_exactly_one_request() {
     );
     let root = fixture.path();
     let head = git(root, &["rev-parse", "HEAD"]);
-    annotate_tag(root, "v1.2.4", &head, &body.text).unwrap();
+    let log = success_log(root);
+    assert!(!log.exists());
+    let before = unix_seconds();
+    assert_eq!(annotate_release_tag(root, "v1.2.4", &head, &body), Ok(None));
     assert_eq!(git(root, &["cat-file", "-t", "v1.2.4"]), "tag");
+    let record = std::fs::read_to_string(&log).expect("AI tag の成功記録が必要");
+    assert!(record.ends_with('\n'));
+    assert_eq!(record.lines().count(), 1);
+    let row: serde_json::Value = serde_json::from_str(&record).unwrap();
+    let timestamp = row["timestamp_unix_seconds"].as_u64().unwrap();
+    assert!((before..=unix_seconds()).contains(&timestamp));
+    let tag_object_oid = git(root, &["rev-parse", "refs/tags/v1.2.4"]);
+    assert_ne!(tag_object_oid, head);
+    assert_eq!(
+        row,
+        serde_json::json!({
+            "timestamp_unix_seconds": timestamp,
+            "tag": "v1.2.4",
+            "tag_object_oid": tag_object_oid,
+        })
+    );
     assert_eq!(git(root, &["rev-parse", "v1.2.4^{commit}"]), head);
     assert_eq!(
         tag_contents(root, "v1.2.4").trim_end(),
         body.text.trim_end()
     );
+    assert!(!fallback_log(root).exists());
+}
+
+#[test]
+fn ai_tag_in_a_linked_worktree_appends_to_the_common_success_log() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let root = fixture.path();
+    let linked = fixture._temp.path().join("linked");
+    let head = git(root, &["rev-parse", "HEAD"]);
+    git(
+        root,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().unwrap(),
+            &head,
+        ],
+    );
+    let log = success_log(root);
+    let first = "{\"timestamp_unix_seconds\":1,\"tag\":\"v1.2.3\",\"tag_object_oid\":\"0000000000000000000000000000000000000001\"}\n";
+    std::fs::write(&log, first).unwrap();
+    let body = ReleaseBody {
+        text: "検証済みの本文".to_owned(),
+        source: BodySource::Ai {
+            dictionary_missing: true,
+        },
+    };
+
+    assert_eq!(
+        annotate_release_tag(&linked, "v1.2.4", &head, &body),
+        Ok(None)
+    );
+
+    let appended = std::fs::read_to_string(&log).unwrap();
+    assert!(appended.starts_with(first));
+    assert_eq!(appended.lines().count(), 2);
+    let worktree_git_dir = git(&linked, &["rev-parse", "--absolute-git-dir"]);
+    assert!(
+        !Path::new(&worktree_git_dir)
+            .join("release-notes-success.jsonl")
+            .exists()
+    );
+}
+
+#[test]
+fn ai_tag_creation_failure_leaves_no_success_record() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let root = fixture.path();
+    let head = git(root, &["rev-parse", "HEAD"]);
+    let body = ReleaseBody {
+        text: "検証済みの本文".to_owned(),
+        source: BodySource::Ai {
+            dictionary_missing: false,
+        },
+    };
+    reject_tag_refs(root);
+
+    assert!(annotate_release_tag(root, "v1.2.4", &head, &body).is_err());
+    assert_eq!(git(root, &["tag", "-l", "v1.2.4"]), "");
+    assert!(!success_log(root).exists());
+}
+
+#[test]
+fn ai_tag_survives_a_success_recording_failure_with_a_warning() {
+    let fixture = notes_fixture(Some(AI_PRIVATE), Some(NOTES_ITEM));
+    let root = fixture.path();
+    let head = git(root, &["rev-parse", "HEAD"]);
+    let body = ReleaseBody {
+        text: "検証済みの本文".to_owned(),
+        source: BodySource::Ai {
+            dictionary_missing: false,
+        },
+    };
+    std::fs::create_dir(success_log(root)).unwrap();
+
+    assert_eq!(
+        annotate_release_tag(root, "v1.2.4", &head, &body),
+        Ok(Some("release_notes_success_unrecorded"))
+    );
+    assert_eq!(git(root, &["cat-file", "-t", "refs/tags/v1.2.4"]), "tag");
+    assert_eq!(tag_contents(root, "v1.2.4").trim_end(), body.text);
+    assert!(success_log(root).is_dir());
 }
 
 /// 台帳の欄が無い古い設定では、費用の記録が残らないので送らずに fallback にする。
@@ -2329,6 +2443,7 @@ fn ai_release_without_settings_annotates_with_the_fallback_and_its_reason() {
     let rows = fallback_rows(root);
     assert_eq!(rows.len(), 1);
     assert_fallback_row(&rows[0], "key_missing");
+    assert!(!success_log(root).exists());
     assert!(
         contents.contains("予定を一覧で選べるようにした"),
         "{contents}"
@@ -2505,6 +2620,8 @@ fn fixed_render_ai_success_returns_body_and_terminal_diagnostic() {
     assert_eq!(render_json_field(&rendered, "source"), "ai");
     assert!(rendered.diagnostic["reason_code"].is_null());
     assert_eq!(env.ledger_rows().len(), 1);
+    assert_eq!(git(fixture.path(), &["tag", "-l", "v1.2.4"]), "");
+    assert!(!success_log(fixture.path()).exists());
 }
 
 /// JSON の形が正しくても入力番号を越える sources は拒否し、推論は 1 回だけにする。

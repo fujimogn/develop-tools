@@ -1991,12 +1991,61 @@ fn render_reports_fallback_and_no_ai_without_exposing_body_in_stderr() {
 }
 
 #[test]
+fn render_keeps_new_items_next_to_a_rewritten_item() {
+    let dir = fixture();
+    let root = dir.path();
+    let heading = "# Changelog\n\n## 2026-11\n";
+    commit(
+        root,
+        &format!("{heading}- **既存の項目（2026-11-20、旧補足）**: 旧本文\n"),
+        "previous release",
+    );
+    git(root, &["tag", "v0.1.0"]);
+    fixed_manifest(
+        root,
+        ".config/develop-tools.json",
+        r#"{"mode":"changelog-additions"}"#,
+    );
+    let edited = "- **既存の項目（2026-11-20/v0.3.0、補足）**: 改訂本文";
+    let new = "- **新しい項目（2026-11-21/⏳）**: 新規本文";
+    let same_title_new_date = "- **既存の項目（2026-11-21/⏳）**: 翌日の成果";
+    let ambiguous = "- **日付のない項目**: 同一性不明";
+    commit(
+        root,
+        &format!("{heading}{edited}\n{new}\n{same_title_new_date}\n{ambiguous}\n"),
+        "release work",
+    );
+
+    let end = git(root, &["rev-parse", "HEAD"]);
+    let mut args = render_args(&end);
+    args.push("--no-ai");
+    let output = notes_args(root, &args);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("- **"))
+            .collect::<Vec<_>>(),
+        [new, same_title_new_date]
+    );
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == "edited_items_excluded: 2")
+    );
+    assert!(!stderr.contains("同一性不明"));
+    assert_eq!(diagnostic(&output)["source"], "changelog");
+}
+
+#[test]
 fn render_redacts_edited_items_and_structural_errors() {
     let (dir, _) = fixed_fixture();
     let root = dir.path();
     commit(
         root,
-        "# Changelog\n\n## 2026-09\n- **secret edited body**\n",
+        "# Changelog\n\n## 2026-09\n- **secret edited body（2026-09-29/⏳）**: 本文\n",
         "edit",
     );
     let end = git(root, &["rev-parse", "HEAD"]);

@@ -137,6 +137,8 @@ stdout は全検証と必須 usage 記録後の本文だけ、stderr の最後�
 
 AI は日付・SHA・URL・刻印メタデータを scrub し、番号付き入力で1回だけ送信します。Release 本文の commit link は AI 出力の URL ではなく、Git で確認した入力項目の番号から付けます。commit link として扱うのは先頭の成果行の末尾の link だけで、項目の途中や継続行の commit への link は通常の参照です。`release <bump> --no-ai` も推論を抑止します。fallback 理由は `key_missing`、`config_invalid`、`dictionary_missing`、`input_rejected`、`budget_exceeded`、`api_timeout`、`api_failed`、`response_rejected`、`output_rejected:<position>.<kind>`、`usage_unrecorded`、`unknown_purpose` です。既存 `release` は tag 作成後に本文と出所を表示します。`release push` 前に確認してください。本文を変えるときは `git tag -f -a <tag> <commit>` で注釈 tag を作り直します。既存 tag の変更は人の承認と運用規約に従ってください。`language:ja/en` で推論の指示言語を切り替え、JSON 出力と検証の契約は共通です。fallback JSONL は clone 内の linked worktree で共有され、push されません。記録行は tag 作成の証明にはなりません。初回 release・changelog・`--no-ai`・AI 成功では fallback 行を追記しません。ログは `cat "$(git rev-parse --path-format=absolute --git-common-dir)/release-notes-fallback.jsonl"` で読めます。
 
+通常の `release` が検証済みの AI 本文を使って注釈 tag を作成した直後、Git common dir（`git rev-parse --path-format=absolute --git-common-dir`）の `release-notes-success.jsonl` に 1 行追記します。欄は記録時刻（UTC Unix 秒）の `timestamp_unix_seconds`、`tag`、注釈付き tag object の OID を示す `tag_object_oid` の 3 つです。記録できない場合は `release_notes_success_unrecorded` を警告し、作成済みの tag を保持して release を続行します。
+
 ### Environment settings
 
 The API key reference, the forbidden terms and the internal names are not stored in this package or in the repository declaration. `release` and `release-notes render` read them from `~/.config/develop-tools/llm.json` in the user's environment; keep the file readable only by the user.

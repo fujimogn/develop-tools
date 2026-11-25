@@ -1,4 +1,5 @@
 //! The repository-local tool pin has one schema and two distribution forms.
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -143,6 +144,34 @@ pub struct RustCi {
     pub fetch_history: bool,
     /// 区画の Rust job の最後に `run:` へそのまま置く 1 行の command。
     pub extra_steps: Vec<String>,
+    /// 省略時は従来の単一 job。
+    pub jobs: Option<Vec<RustCiJob>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RustCiJob {
+    pub name: String,
+    pub checks: Vec<RustCheck>,
+    pub extra_steps: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RustCheck {
+    Fmt,
+    Clippy,
+    Test,
+}
+
+impl RustCheck {
+    pub const ALL: [Self; 3] = [Self::Fmt, Self::Clippy, Self::Test];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Fmt => "fmt",
+            Self::Clippy => "clippy",
+            Self::Test => "test",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -318,6 +347,7 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
                     "testRunner",
                     "cacheToolchain",
                     "fetchHistory",
+                    "jobs",
                 ],
             )?;
             let test_runner = match rust.get("testRunner") {
@@ -337,12 +367,18 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
                 Some(Value::Bool(value)) => *value,
                 Some(_) => return Err("ci.rust.fetchHistory は真偽値でなければなりません".into()),
             };
+            let extra_steps = extra_steps(rust)?;
+            let jobs = rust
+                .get("jobs")
+                .map(|value| rust_jobs(value, extra_steps.len()))
+                .transpose()?;
             Some(RustCi {
                 workspaces: directories(rust, "ci.rust", "workspaces")?,
                 test_runner: test_runner.to_owned(),
                 cache_toolchain,
                 fetch_history,
-                extra_steps: extra_steps(rust)?,
+                extra_steps,
+                jobs,
             })
         }
     };
@@ -369,6 +405,9 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
     };
     let record_only_skip = flag("recordOnlySkip")?;
     let skip_docs_only_push = flag("skipDocsOnlyPush")?;
+    if record_only_skip && rust.as_ref().is_some_and(|rust| rust.jobs.is_some()) {
+        return Err("ci.rust.jobs と ci.recordOnlySkip は併用できません".into());
+    }
     if record_only_skip && skip_docs_only_push {
         return Err("ci.skipDocsOnlyPush と ci.recordOnlySkip は同時にtrueにできません".into());
     }
@@ -378,6 +417,85 @@ pub fn ci_declaration(value: &Value) -> Result<Option<CiDeclaration>, String> {
         rust,
         bun,
     }))
+}
+
+fn rust_jobs(value: &Value, extra_step_count: usize) -> Result<Vec<RustCiJob>, String> {
+    let jobs = value
+        .as_array()
+        .filter(|jobs| jobs.len() >= 2)
+        .ok_or("ci.rust.jobs は 2 要素以上の配列でなければなりません")?;
+    let mut names = BTreeSet::new();
+    let mut checks_seen = BTreeSet::new();
+    let mut extra_steps_seen = BTreeSet::new();
+    let mut result = Vec::with_capacity(jobs.len());
+    for (index, entry) in jobs.iter().enumerate() {
+        let path = format!("ci.rust.jobs[{index}]");
+        let job = stack(entry, &path, &["name", "checks", "extraSteps"])?;
+        let raw_name = job.get("name").unwrap_or(&Value::Null);
+        let name = raw_name
+            .as_str()
+            .filter(|name| {
+                let alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+                name.bytes().next().is_some_and(alphanumeric)
+                    && name.bytes().all(|byte| alphanumeric(byte) || byte == b'-')
+            })
+            .ok_or_else(|| format!("{path}.name が不正です: {raw_name}"))?;
+        if !names.insert(name) {
+            return Err(format!("{path}.name {name} が重複しています"));
+        }
+        let array = |key| match job.get(key) {
+            None => Ok(&[][..]),
+            Some(value) => value
+                .as_array()
+                .map(Vec::as_slice)
+                .ok_or_else(|| format!("{path}.{key} は配列でなければなりません")),
+        };
+        let mut checks = Vec::new();
+        for value in array("checks")? {
+            let check = RustCheck::ALL
+                .into_iter()
+                .find(|check| value.as_str() == Some(check.name()))
+                .ok_or_else(|| format!("{path}.checks の検査名が不明です: {value}"))?;
+            if !checks_seen.insert(check) {
+                return Err(format!(
+                    "{path}.checks の {} が重複しています",
+                    check.name()
+                ));
+            }
+            checks.push(check);
+        }
+        let mut extra_steps = Vec::new();
+        for value in array("extraSteps")? {
+            let number = value
+                .as_u64()
+                .ok_or_else(|| format!("{path}.extraSteps は 0 以上の整数にする: {value}"))?;
+            let step = usize::try_from(number)
+                .ok()
+                .filter(|step| *step < extra_step_count)
+                .ok_or_else(|| format!("{path}.extraSteps[{number}] は範囲外です"))?;
+            if !extra_steps_seen.insert(step) {
+                return Err(format!("{path}.extraSteps[{step}] が重複しています"));
+            }
+            extra_steps.push(step);
+        }
+        if checks.is_empty() && extra_steps.is_empty() {
+            return Err(format!("{path} の割り当てが空です"));
+        }
+        result.push(RustCiJob {
+            name: name.to_owned(),
+            checks,
+            extra_steps,
+        });
+    }
+    for check in RustCheck::ALL {
+        if !checks_seen.contains(&check) {
+            return Err(format!("ci.rust.jobs: {} が未割り当てです", check.name()));
+        }
+    }
+    if let Some(step) = (0..extra_step_count).find(|step| !extra_steps_seen.contains(step)) {
+        return Err(format!("ci.rust.jobs: extraSteps[{step}] が未割り当てです"));
+    }
+    Ok(result)
 }
 
 fn bun_test(value: &Value) -> Result<BunTest, String> {
@@ -1184,6 +1302,60 @@ mod tests {
     }
 
     #[test]
+    fn rust_jobs_form_an_exact_partition() {
+        let manifest = |jobs: Value, record_only_skip: bool| {
+            json!({"ci": {"recordOnlySkip": record_only_skip, "rust": {
+                "workspaces": ["."], "extraSteps": ["cargo xtask first", "cargo xtask second"],
+                "jobs": jobs
+            }}})
+        };
+        let valid = json!([
+            {"name": "integration", "extraSteps": [1]},
+            {"name": "nextest", "checks": ["test"]},
+            {"name": "lint", "checks": ["clippy", "fmt"], "extraSteps": [0]}
+        ]);
+        assert!(ci_declaration(&manifest(valid.clone(), false)).is_ok());
+
+        for (job, key, value, expected) in [
+            (0, "extraSteps", json!([]), "空"),
+            (0, "extraSteps", json!([0]), "extraSteps[0] が重複"),
+            (0, "extraSteps", json!([2]), "extraSteps[2] は範囲外"),
+            (0, "extraSteps", json!([-1]), "0 以上"),
+            (0, "extraSteps", json!(["1"]), "0 以上"),
+            (1, "checks", json!(["fmt"]), "fmt が重複"),
+            (1, "checks", json!(["miri"]), "miri"),
+            (1, "name", json!("integration"), "integration が重複"),
+            (1, "name", json!("-nextest"), "-nextest"),
+            (1, "name", json!("Nextest"), "Nextest"),
+            (1, "name", json!("next_est"), "next_est"),
+            (1, "name", json!(""), "name"),
+            (1, "unknown", json!(true), "未知"),
+            (2, "checks", json!(["clippy"]), "fmt が未割り当て"),
+            (2, "extraSteps", json!([]), "extraSteps[0] が未割り当て"),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[job][key] = value;
+            let error = ci_declaration(&manifest(invalid, false)).unwrap_err();
+            assert!(
+                error.contains("ci.rust.jobs") && error.contains(expected),
+                "{error}"
+            );
+        }
+        for invalid in [json!([]), json!([valid[0].clone()]), json!({}), Value::Null] {
+            let error = ci_declaration(&manifest(invalid, false)).unwrap_err();
+            assert!(
+                error.contains("ci.rust.jobs") && error.contains("2"),
+                "{error}"
+            );
+        }
+        let error = ci_declaration(&manifest(valid, true)).unwrap_err();
+        assert!(
+            error.contains("ci.rust.jobs") && error.contains("ci.recordOnlySkip"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn ci_declaration_reads_rust_and_bun_stacks() {
         let declared = declaration(&json!({"ci": {
             "rust": {
@@ -1204,6 +1376,7 @@ mod tests {
                     cache_toolchain: false,
                     fetch_history: false,
                     extra_steps: vec!["cargo xtask record-root".into()],
+                    jobs: None,
                 }),
                 bun: Some(BunCi {
                     dirs: vec![".".into()],

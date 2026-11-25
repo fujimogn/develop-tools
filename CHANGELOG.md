@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.23] - 2026-11-25
+
+### Added
+
+- Accept an optional `ci.rust.jobs` declaration that splits the Rust CI checks into several parallel jobs. Each job names built-in checks (`fmt`, `clippy`, `test`) and `ci.rust.extraSteps` indexes; every check and extra step must be assigned to exactly one job. The declaration is rejected when it has a single job, an empty job, an invalid or duplicate name, an unknown check, an out-of-range index, or when it is combined with `ci.recordOnlySkip`.
+
 ## [0.6.22] - 2026-11-22
 
 ### Added
